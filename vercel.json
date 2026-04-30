@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "backend/main.py": {
+      "runtime": "python3.12",
+      "excludeFiles": "{frontend/**,.venv/**,node_modules/**,**/*.md,**/__pycache__/**,**/*.pyc}"
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "backend/main.py"
+    }
+  ]
+}
