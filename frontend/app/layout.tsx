@@ -5,6 +5,7 @@ import Navigation from "@/components/Navigation";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import { AnimatedBackground } from "@/components/AnimatedBackground";
 import { Footer } from "@/components/Footer";
+import { AuthProvider } from "@/components/AuthProvider";
 
 const inter = Inter({ 
   subsets: ["latin"],
@@ -51,12 +52,14 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange={false}
         >
-          <AnimatedBackground />
-          <div className="relative z-10 flex flex-col min-h-screen">
-            <Navigation />
-            <main className="flex-1">{children}</main>
-            <Footer />
-          </div>
+          <AuthProvider>
+            <AnimatedBackground />
+            <div className="relative z-10 flex flex-col min-h-screen">
+              <Navigation />
+              <main className="flex-1">{children}</main>
+              <Footer />
+            </div>
+          </AuthProvider>
         </ThemeProvider>
       </body>
     </html>

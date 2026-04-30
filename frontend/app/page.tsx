@@ -10,10 +10,14 @@ export default function HomePage() {
   return (
     <div className="relative">
       <HeroSection />
-      <FeaturesSection />
+      <section id="about">
+        <FeaturesSection />
+      </section>
       <StatsSection />
       <HowItWorksSection />
-      <CTASection />
+      <section id="pricing">
+        <CTASection />
+      </section>
     </div>
   );
 }

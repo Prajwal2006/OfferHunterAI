@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 import { GitBranch, ExternalLink, Search } from "lucide-react";
 import { MOCK_COMPANIES } from "@/lib/mockData";
 import { Company } from "@/lib/types";
+import { RequireAuth } from "@/components/RequireAuth";
 
 type StatusFilter = "all" | Company["status"];
 
@@ -42,7 +43,8 @@ export default function PipelinePage() {
   });
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <RequireAuth>
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       {/* Header */}
       <motion.div
         initial={{ opacity: 0, y: -10 }}
@@ -272,6 +274,7 @@ export default function PipelinePage() {
           )}
         </div>
       )}
-    </div>
+      </div>
+    </RequireAuth>
   );
 }

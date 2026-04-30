@@ -28,6 +28,9 @@ class EmailWriterAgent:
         skills: list[str],
         job_title: str,
         insights: dict[str, Any] | None = None,
+        resume_text: str | None = None,
+        resume_skills: list[str] | None = None,
+        resume_version_id: str | None = None,
         **kwargs: Any,
     ) -> dict:
         company_name = company.get("name", "Unknown")
@@ -65,9 +68,18 @@ class EmailWriterAgent:
             await asyncio.sleep(0.3)
 
         # Generate email (in production: call OpenAI GPT-4)
-        email = self._generate_email(company, skills, job_title, insights)
+        email = self._generate_email(
+            company=company,
+            skills=skills,
+            job_title=job_title,
+            insights=insights,
+            resume_text=resume_text,
+            resume_skills=resume_skills,
+        )
         email["id"] = email_id
         email["status"] = "pending_approval"  # HUMAN REVIEW REQUIRED
+        email["resume_version_id"] = resume_version_id
+        email["resume_skills"] = resume_skills or []
 
         # Store in DB (best-effort)
         try:
@@ -96,6 +108,8 @@ class EmailWriterAgent:
         skills: list[str],
         job_title: str,
         insights: dict | None,
+        resume_text: str | None,
+        resume_skills: list[str] | None,
     ) -> dict:
         """
         Generate personalized email.
@@ -105,7 +119,13 @@ class EmailWriterAgent:
         domain = company.get("domain", "")
         industry = company.get("industry", "tech")
 
-        skills_str = ", ".join(skills[:4])
+        resolved_skills = resume_skills[:6] if resume_skills else skills[:4]
+        skills_str = ", ".join(resolved_skills) if resolved_skills else ", ".join(skills[:4])
+        resume_reference = (
+            "My attached resume highlights projects in " + ", ".join(resolved_skills[:4]) + "."
+            if resolved_skills
+            else ""
+        )
         subject = f"Experienced {job_title} — Excited About {name}'s Mission"
 
         body = f"""Hi [Hiring Manager],
@@ -113,6 +133,7 @@ class EmailWriterAgent:
 I've been following {name}'s work in {industry} closely, and I'm genuinely excited about the problems you're solving.
 
 I'm a {job_title} with deep expertise in {skills_str}. I've spent the past few years building production systems at scale, and I believe my background aligns well with what {name} is working on.
+{resume_reference}
 
 A few highlights from my experience:
 • Built and deployed ML pipelines serving 100k+ daily predictions
@@ -131,4 +152,5 @@ Best,
             "subject": subject,
             "body": body,
             "recipient_email": f"careers@{domain}",
+            "resume_excerpt": (resume_text or "")[:2000],
         }

@@ -3,12 +3,13 @@ OfferHunter AI — FastAPI Backend
 """
 import asyncio
 import json
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncGenerator, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -58,6 +59,8 @@ class RunAgentsRequest(BaseModel):
     job_title: str
     company_count: int = 10
     resume_text: Optional[str] = None
+    resume_version_id: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class ExecuteAgentRequest(BaseModel):
@@ -72,6 +75,7 @@ class EmailApprovalRequest(BaseModel):
 class EmailUpdateRequest(BaseModel):
     subject: Optional[str] = None
     body: Optional[str] = None
+    resume_version_id: Optional[str] = None
 
 
 # ─── Agent Event Endpoints ────────────────────────────────────────────────────
@@ -132,11 +136,30 @@ async def run_agents(request: RunAgentsRequest):
 
     async def run_pipeline():
         try:
+            resume_text = request.resume_text
+            resume_skills = _extract_skills(resume_text) if resume_text else []
+            resume_version_id = request.resume_version_id
+
+            if not resume_text and request.resume_version_id:
+                resume = await supabase_client.get_resume(request.resume_version_id)
+                if resume:
+                    resume_text = resume.get("extracted_text")
+                    resume_skills = resume.get("extracted_skills") or []
+
+            if not resume_text and request.user_id:
+                active_resume = await supabase_client.get_active_resume(request.user_id)
+                if active_resume:
+                    resume_text = active_resume.get("extracted_text")
+                    resume_skills = active_resume.get("extracted_skills") or []
+                    resume_version_id = active_resume.get("id")
+
+            effective_skills = request.skills or resume_skills
+
             # 1. Company Finder
             company_agent = CompanyFinderAgent(logger=logger)
             companies = await company_agent.run(
                 task_id=task_id,
-                skills=request.skills,
+                skills=effective_skills,
                 job_title=request.job_title,
                 count=request.company_count,
             )
@@ -155,8 +178,11 @@ async def run_agents(request: RunAgentsRequest):
                 await email_writer.run(
                     task_id=str(uuid.uuid4()),
                     company=company,
-                    skills=request.skills,
+                    skills=effective_skills,
                     job_title=request.job_title,
+                    resume_text=resume_text,
+                    resume_skills=resume_skills,
+                    resume_version_id=resume_version_id,
                 )
 
         except Exception as e:
@@ -269,6 +295,69 @@ async def send_email(email_id: str):
     return {"email_id": email_id, "task_id": task_id, "status": "sending"}
 
 
+# ─── Resume Endpoints ────────────────────────────────────────────────────────
+
+@app.post("/resumes/upload")
+async def upload_resume(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+):
+    """Upload a resume version and extract text/skills for agent knowledge base."""
+    try:
+        content = await file.read()
+        extracted_text = _extract_resume_text(file.filename or "resume", content)
+        extracted_skills = _extract_skills(extracted_text)
+
+        resume = await supabase_client.insert_resume(
+            {
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "file_name": file.filename,
+                "version_label": f"{file.filename} ({datetime.utcnow().strftime('%Y-%m-%d %H:%M')})",
+                "extracted_text": extracted_text,
+                "extracted_skills": extracted_skills,
+                "is_active": False,
+            }
+        )
+
+        # First upload for this user becomes active.
+        if resume.get("id"):
+            existing = await supabase_client.get_resumes(user_id)
+            if len(existing) == 1:
+                await supabase_client.set_active_resume(user_id, resume["id"])
+
+        return {"resume": resume}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/resumes")
+async def get_resumes(user_id: str):
+    try:
+        resumes = await supabase_client.get_resumes(user_id)
+        return {"resumes": resumes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/resumes/{resume_id}/activate")
+async def activate_resume(resume_id: str, user_id: str):
+    try:
+        result = await supabase_client.set_active_resume(user_id=user_id, resume_id=resume_id)
+        return {"resume": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/resumes/{resume_id}")
+async def delete_resume(resume_id: str, user_id: str):
+    try:
+        result = await supabase_client.delete_resume(user_id=user_id, resume_id=resume_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── Pipeline Endpoints ───────────────────────────────────────────────────────
 
 @app.get("/pipeline")
@@ -292,6 +381,71 @@ async def health_check():
 
 
 # ─── Mock data helpers ────────────────────────────────────────────────────────
+
+
+def _extract_resume_text(file_name: str, content: bytes) -> str:
+    lower_name = file_name.lower()
+
+    if lower_name.endswith(".txt") or lower_name.endswith(".md"):
+        return content.decode("utf-8", errors="ignore").strip()
+
+    if lower_name.endswith(".pdf"):
+        try:
+            from io import BytesIO
+            from pypdf import PdfReader
+
+            reader = PdfReader(BytesIO(content))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            return "\n".join(pages).strip()
+        except Exception:
+            return content.decode("utf-8", errors="ignore").strip()
+
+    if lower_name.endswith(".docx"):
+        try:
+            from io import BytesIO
+            import docx
+
+            doc = docx.Document(BytesIO(content))
+            return "\n".join([p.text for p in doc.paragraphs]).strip()
+        except Exception:
+            return content.decode("utf-8", errors="ignore").strip()
+
+    return content.decode("utf-8", errors="ignore").strip()
+
+
+def _extract_skills(text: str | None) -> list[str]:
+    if not text:
+        return []
+
+    skill_keywords = [
+        "python",
+        "fastapi",
+        "django",
+        "flask",
+        "javascript",
+        "typescript",
+        "react",
+        "next.js",
+        "node.js",
+        "sql",
+        "postgres",
+        "supabase",
+        "aws",
+        "gcp",
+        "docker",
+        "kubernetes",
+        "machine learning",
+        "deep learning",
+        "pytorch",
+        "tensorflow",
+        "langchain",
+        "openai",
+    ]
+
+    normalized = re.sub(r"\s+", " ", text.lower())
+    found = [skill for skill in skill_keywords if skill in normalized]
+    return list(dict.fromkeys(found))
+
 
 def _mock_events() -> list[dict]:
     now = datetime.utcnow()

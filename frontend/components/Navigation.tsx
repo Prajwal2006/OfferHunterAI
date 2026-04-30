@@ -3,21 +3,36 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
-import { Activity, LayoutDashboard, Mail, GitBranch, Menu, X } from "lucide-react";
+import { Activity, LayoutDashboard, Mail, GitBranch, Menu, X, FileText, LogOut } from "lucide-react";
 import { ThemeToggle } from "./ThemeToggle";
 import { useState } from "react";
 import Image from "next/image";
+import { useAuth } from "@/components/AuthProvider";
 
-const navItems = [
+const privateNavItems = [
   { href: "/", label: "Home", icon: LayoutDashboard },
   { href: "/agents", label: "Agents", icon: Activity },
   { href: "/review", label: "Review", icon: Mail },
   { href: "/pipeline", label: "Pipeline", icon: GitBranch },
+  { href: "/resume", label: "Resumes", icon: FileText },
+];
+
+const publicNavItems = [
+  { href: "/", label: "Home", icon: LayoutDashboard },
+  { href: "/#about", label: "About", icon: Activity },
+  { href: "/#pricing", label: "Pricing", icon: Mail },
 ];
 
 export default function Navigation() {
   const pathname = usePathname();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const { session, signOut } = useAuth();
+  const navItems = session ? privateNavItems : publicNavItems;
+
+  const handleSignOut = async () => {
+    await signOut();
+    setMobileMenuOpen(false);
+  };
 
   return (
     <motion.nav
@@ -89,18 +104,36 @@ export default function Navigation() {
 
           {/* Right side */}
           <div className="flex items-center gap-3">
-            {/* Status indicator */}
-            <motion.div
-              initial={{ opacity: 0, scale: 0.8 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: 0.3 }}
-              className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 dark:bg-emerald-500/20 border border-emerald-500/30"
-            >
-              <div className="w-2 h-2 rounded-full bg-emerald-500 pulse-neon" />
-              <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium">
-                Online
-              </span>
-            </motion.div>
+            {session && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.8 }}
+                animate={{ opacity: 1, scale: 1 }}
+                transition={{ delay: 0.3 }}
+                className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 dark:bg-emerald-500/20 border border-emerald-500/30"
+              >
+                <div className="w-2 h-2 rounded-full bg-emerald-500 pulse-neon" />
+                <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium">
+                  Signed in
+                </span>
+              </motion.div>
+            )}
+
+            {session ? (
+              <button
+                onClick={handleSignOut}
+                className="hidden md:flex items-center gap-2 px-3 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground hover:border-primary/30 transition-all"
+              >
+                <LogOut className="w-4 h-4" />
+                Logout
+              </button>
+            ) : (
+              <Link
+                href="/login"
+                className="hidden md:flex items-center gap-2 px-3 py-2 rounded-xl border border-primary/30 text-sm text-primary hover:bg-primary/10 transition-all"
+              >
+                Login
+              </Link>
+            )}
 
             <ThemeToggle />
 
@@ -159,6 +192,22 @@ export default function Navigation() {
                   </motion.div>
                 );
               })}
+              {session ? (
+                <button
+                  onClick={handleSignOut}
+                  className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium text-red-500 hover:bg-red-500/10 transition-all"
+                >
+                  <LogOut className="w-5 h-5" />
+                  <span>Logout</span>
+                </button>
+              ) : (
+                <Link href="/login" onClick={() => setMobileMenuOpen(false)}>
+                  <div className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium text-primary hover:bg-primary/10 transition-all">
+                    <LayoutDashboard className="w-5 h-5" />
+                    <span>Login</span>
+                  </div>
+                </Link>
+              )}
             </div>
           </motion.div>
         )}

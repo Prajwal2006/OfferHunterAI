@@ -10,6 +10,8 @@ export async function runAgents(payload: {
   skills: string[];
   job_title: string;
   company_count?: number;
+  resume_text?: string;
+  resume_version_id?: string;
 }) {
   const res = await fetch(`${API_URL}/agents/run`, {
     method: "POST",
@@ -62,7 +64,11 @@ export async function rejectEmail(emailId: string, reason?: string) {
 
 export async function editEmail(
   emailId: string,
-  updates: { subject?: string; body?: string }
+  updates: {
+    subject?: string;
+    body?: string;
+    resume_version_id?: string;
+  }
 ) {
   const res = await fetch(`${API_URL}/emails/${emailId}`, {
     method: "PATCH",
@@ -83,4 +89,41 @@ export function createEventSource(onMessage: (event: MessageEvent) => void) {
   const es = new EventSource(`${API_URL}/agent-events/stream`);
   es.onmessage = onMessage;
   return es;
+}
+
+export async function uploadResume(formData: FormData) {
+  const res = await fetch(`${API_URL}/resumes/upload`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) throw new Error("Failed to upload resume");
+  return res.json();
+}
+
+export async function fetchResumes(userId: string) {
+  const res = await fetch(`${API_URL}/resumes?user_id=${encodeURIComponent(userId)}`);
+  if (!res.ok) throw new Error("Failed to fetch resumes");
+  return res.json();
+}
+
+export async function activateResume(resumeId: string, userId: string) {
+  const res = await fetch(
+    `${API_URL}/resumes/${resumeId}/activate?user_id=${encodeURIComponent(userId)}`,
+    {
+      method: "POST",
+    }
+  );
+  if (!res.ok) throw new Error("Failed to activate resume");
+  return res.json();
+}
+
+export async function deleteResume(resumeId: string, userId: string) {
+  const res = await fetch(
+    `${API_URL}/resumes/${resumeId}?user_id=${encodeURIComponent(userId)}`,
+    {
+      method: "DELETE",
+    }
+  );
+  if (!res.ok) throw new Error("Failed to delete resume");
+  return res.json();
 }

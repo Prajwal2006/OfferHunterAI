@@ -10,6 +10,10 @@ import EventStream from "@/components/EventStream";
 import OrchestrationFlow from "@/components/OrchestrationFlow";
 import TaskTimeline from "@/components/TaskTimeline";
 import { MOCK_PIPELINE } from "@/lib/mockData";
+import { RequireAuth } from "@/components/RequireAuth";
+import { fetchResumes, runAgents } from "@/lib/api";
+import { useAuth } from "@/components/AuthProvider";
+import { ResumeVersion } from "@/lib/types";
 
 function useSimulatedEvents(initial: AgentEvent[]) {
   const [events, setEvents] = useState<AgentEvent[]>(initial);
@@ -86,7 +90,9 @@ function useSimulatedEvents(initial: AgentEvent[]) {
 
 export default function AgentsPage() {
   const { events, agents, isRunning, startSimulation } = useSimulatedEvents(MOCK_EVENTS);
+  const { session } = useAuth();
   const [filterAgent, setFilterAgent] = useState<string>("all");
+  const [activeResume, setActiveResume] = useState<ResumeVersion | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
   const activeAgent = agents.find((a) => a.status === "running");
@@ -102,6 +108,40 @@ export default function AgentsPage() {
     }
   }, [events]);
 
+  useEffect(() => {
+    async function loadActiveResume() {
+      const userId = session?.user?.id;
+      if (!userId) return;
+
+      try {
+        const result = await fetchResumes(userId);
+        const resumes = (result.resumes || []) as ResumeVersion[];
+        const active = resumes.find((resume) => resume.is_active) || null;
+        setActiveResume(active);
+      } catch {
+        setActiveResume(null);
+      }
+    }
+
+    loadActiveResume();
+  }, [session?.user?.id]);
+
+  async function handleRun() {
+    startSimulation();
+
+    try {
+      await runAgents({
+        skills: activeResume?.extracted_skills?.slice(0, 6) || ["python", "fastapi"],
+        job_title: "Software Engineer",
+        company_count: 10,
+        resume_text: activeResume?.extracted_text,
+        resume_version_id: activeResume?.id,
+      });
+    } catch {
+      // UI simulation still runs in demo mode.
+    }
+  }
+
   const agentNames = [...new Set(MOCK_EVENTS.map((e) => e.agent_name))];
 
   const runningCount = agents.filter((a) => a.status === "running").length;
@@ -110,7 +150,8 @@ export default function AgentsPage() {
   const errorCount = agents.filter((a) => a.status === "error").length;
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <RequireAuth>
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       {/* Header */}
       <motion.div
         initial={{ opacity: 0, y: -10 }}
@@ -143,7 +184,7 @@ export default function AgentsPage() {
           <motion.button
             whileHover={{ scale: 1.03 }}
             whileTap={{ scale: 0.97 }}
-            onClick={startSimulation}
+            onClick={handleRun}
             disabled={isRunning}
             className="btn-futuristic flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm bg-gradient-to-r from-primary to-secondary text-primary-foreground shadow-lg shadow-primary/20 disabled:opacity-50 transition-all"
           >
@@ -155,7 +196,7 @@ export default function AgentsPage() {
             ) : (
               <>
                 <Play className="w-4 h-4" fill="currentColor" />
-                Simulate Run
+                Run Agents
               </>
             )}
           </motion.button>
@@ -271,6 +312,7 @@ export default function AgentsPage() {
         </div>
         <TaskTimeline items={MOCK_PIPELINE} />
       </motion.div>
-    </div>
+      </div>
+    </RequireAuth>
   );
 }

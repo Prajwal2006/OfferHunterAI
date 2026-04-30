@@ -1,10 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Mail, CheckCircle, XCircle, Edit3, Send, Shield, ChevronDown, ChevronUp } from "lucide-react";
-import { Email } from "@/lib/types";
+import { Email, ResumeVersion } from "@/lib/types";
 import { MOCK_EMAILS } from "@/lib/mockData";
+import { RequireAuth } from "@/components/RequireAuth";
+import { editEmail, fetchResumes } from "@/lib/api";
+import { useAuth } from "@/components/AuthProvider";
 
 type ReviewStatus = "pending" | "approved" | "rejected" | "sent";
 
@@ -15,6 +18,7 @@ interface EmailWithLocalStatus extends Email {
 }
 
 export default function ReviewPage() {
+  const { session } = useAuth();
   const [emails, setEmails] = useState<EmailWithLocalStatus[]>(
     MOCK_EMAILS.map((e) => ({
       ...e,
@@ -28,6 +32,23 @@ export default function ReviewPage() {
   );
   const [expandedId, setExpandedId] = useState<string | null>(emails[0]?.id ?? null);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [resumes, setResumes] = useState<ResumeVersion[]>([]);
+
+  useEffect(() => {
+    async function loadResumes() {
+      const userId = session?.user?.id;
+      if (!userId) return;
+
+      try {
+        const result = await fetchResumes(userId);
+        setResumes(result.resumes ?? []);
+      } catch {
+        setResumes([]);
+      }
+    }
+
+    loadResumes();
+  }, [session?.user?.id]);
 
   const pending = emails.filter((e) => e.localStatus === "pending");
   const approved = emails.filter((e) => e.localStatus === "approved");
@@ -70,6 +91,18 @@ export default function ReviewPage() {
     setEditingId(null);
   }
 
+  async function setResumeVersion(id: string, resumeVersionId: string) {
+    setEmails((prev) =>
+      prev.map((e) => (e.id === id ? { ...e, resume_version_id: resumeVersionId } : e))
+    );
+
+    try {
+      await editEmail(id, { resume_version_id: resumeVersionId });
+    } catch {
+      // Keep optimistic UI state even if backend is in demo mode.
+    }
+  }
+
   const statusColor = {
     pending: "border-amber-500/30 bg-amber-500/5",
     approved: "border-emerald-500/30 bg-emerald-500/5",
@@ -85,7 +118,8 @@ export default function ReviewPage() {
   };
 
   return (
-    <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <RequireAuth>
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       {/* Header */}
       <motion.div
         initial={{ opacity: 0, y: -10 }}
@@ -208,10 +242,14 @@ export default function ReviewPage() {
                         ) : (
                           <EmailViewer
                             email={email}
+                            resumes={resumes}
                             onApprove={() => approve(email.id)}
                             onReject={() => reject(email.id)}
                             onEdit={() => startEdit(email.id)}
                             onSend={() => markSent(email.id)}
+                            onResumeChange={(resumeVersionId) =>
+                              setResumeVersion(email.id, resumeVersionId)
+                            }
                           />
                         )}
                       </div>
@@ -223,22 +261,27 @@ export default function ReviewPage() {
           })}
         </AnimatePresence>
       </div>
-    </div>
+      </div>
+    </RequireAuth>
   );
 }
 
 function EmailViewer({
   email,
+  resumes,
   onApprove,
   onReject,
   onEdit,
   onSend,
+  onResumeChange,
 }: {
   email: EmailWithLocalStatus;
+  resumes: ResumeVersion[];
   onApprove: () => void;
   onReject: () => void;
   onEdit: () => void;
   onSend: () => void;
+  onResumeChange: (resumeVersionId: string) => void;
 }) {
   const displaySubject = email.editedSubject ?? email.subject;
   const displayBody = email.editedBody ?? email.body;
@@ -257,6 +300,24 @@ function EmailViewer({
         <div className="bg-muted/30 rounded-xl p-4 text-sm text-foreground/90 whitespace-pre-wrap font-mono leading-relaxed border border-border">
           {displayBody}
         </div>
+      </div>
+
+      <div>
+        <div className="text-xs text-muted-foreground uppercase tracking-wider mb-1">
+          Resume Version For This Email
+        </div>
+        <select
+          value={email.resume_version_id ?? ""}
+          onChange={(e) => onResumeChange(e.target.value)}
+          className="w-full sm:w-auto bg-muted/30 border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
+        >
+          <option value="">No resume selected</option>
+          {resumes.map((resume) => (
+            <option key={resume.id} value={resume.id}>
+              {resume.version_label}{resume.is_active ? " (active)" : ""}
+            </option>
+          ))}
+        </select>
       </div>
 
       {/* Action buttons */}

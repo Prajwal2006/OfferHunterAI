@@ -99,6 +99,86 @@ class SupabaseClient:
         )
         return result.data[0] if result.data else {}
 
+    # ─── Resume Versions ─────────────────────────────────────────────────────
+
+    async def insert_resume(self, resume: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return resume
+        result = client.table("resume_versions").insert(resume).execute()
+        return result.data[0] if result.data else resume
+
+    async def get_resumes(self, user_id: str) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("resume_versions")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return result.data or []
+
+    async def get_resume(self, resume_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("resume_versions")
+            .select("*")
+            .eq("id", resume_id)
+            .single()
+            .execute()
+        )
+        return result.data
+
+    async def set_active_resume(self, user_id: str, resume_id: str) -> dict:
+        client = self._get_client()
+        if not client:
+            return {"id": resume_id, "is_active": True}
+
+        client.table("resume_versions").update({"is_active": False}).eq(
+            "user_id", user_id
+        ).execute()
+        result = (
+            client.table("resume_versions")
+            .update({"is_active": True})
+            .eq("id", resume_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return result.data[0] if result.data else {}
+
+    async def get_active_resume(self, user_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("resume_versions")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        data = result.data or []
+        return data[0] if data else None
+
+    async def delete_resume(self, user_id: str, resume_id: str) -> dict:
+        client = self._get_client()
+        if not client:
+            return {"id": resume_id, "deleted": True}
+        result = (
+            client.table("resume_versions")
+            .delete()
+            .eq("id", resume_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return {"deleted": True, "data": result.data or []}
+
     # ─── Companies ────────────────────────────────────────────────────────────
 
     async def insert_company(self, company: dict[str, Any]) -> dict:

@@ -41,6 +41,19 @@ export interface Email {
   created_at: string;
   sent_at?: string;
   recipient_email?: string;
+  resume_version_id?: string | null;
+  resume_skills?: string[];
+}
+
+export interface ResumeVersion {
+  id: string;
+  user_id: string;
+  file_name: string;
+  version_label: string;
+  extracted_text: string;
+  extracted_skills: string[];
+  is_active: boolean;
+  created_at: string;
 }
 
 export interface PipelineItem {
