@@ -1,6 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { useEffect, useState } from "react";
 import { AgentEvent } from "@/lib/types";
 
 const agentColors: Record<string, string> = {
@@ -33,12 +34,11 @@ interface EventStreamProps {
 
 function formatTime(isoString: string) {
   const date = new Date(isoString);
-  return date.toLocaleTimeString("en-US", {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+  // Use UTC-based formatting to avoid hydration mismatches
+  const hours = date.getUTCHours().toString().padStart(2, "0");
+  const minutes = date.getUTCMinutes().toString().padStart(2, "0");
+  const seconds = date.getUTCSeconds().toString().padStart(2, "0");
+  return `${hours}:${minutes}:${seconds}`;
 }
 
 export default function EventStream({ events }: EventStreamProps) {
