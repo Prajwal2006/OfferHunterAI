@@ -108,11 +108,17 @@ pip install -r requirements.txt
 
 ```bash
 # Root .env
-cp .env.example .env
+# Windows:
+copy .env.example .env
+# macOS/Linux:
+# cp .env.example .env
 # Fill in: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY, GMAIL_*
 
 # Frontend .env.local
-cp frontend/.env.example frontend/.env.local
+# Windows:
+copy frontend\.env.example frontend\.env.local
+# macOS/Linux:
+# cp frontend/.env.example frontend/.env.local
 # Fill in: NEXT_PUBLIC_API_URL, NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY
 ```
 
@@ -140,7 +146,10 @@ Open [http://localhost:3000](http://localhost:3000)
 ### 5. Docker Compose (alternative)
 
 ```bash
-cp .env.example .env  # fill in values
+# Windows:
+copy .env.example .env  # fill in values
+# macOS/Linux:
+# cp .env.example .env  # fill in values
 docker compose up
 ```
 

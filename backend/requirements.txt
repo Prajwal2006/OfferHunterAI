@@ -7,8 +7,8 @@ pydantic==2.10.3
 pydantic-settings==2.6.1
 python-multipart==0.0.22
 sse-starlette==2.1.3
-crewai==0.86.0
-crewai-tools==0.17.0
+crewai==0.86.0; python_version < "3.13"
+crewai-tools==0.17.0; python_version < "3.13"
 langchain==0.3.13
 langchain-openai==0.2.14
 google-auth==2.37.0
