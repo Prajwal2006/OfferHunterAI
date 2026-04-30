@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Activity, Play, RefreshCw, Filter } from "lucide-react";
+import { Activity, Play, RefreshCw, Filter, Bot, Zap } from "lucide-react";
 import { AgentEvent, AgentInfo } from "@/lib/types";
 import { MOCK_AGENTS, MOCK_EVENTS } from "@/lib/mockData";
 import AgentCard from "@/components/AgentCard";
@@ -54,7 +54,6 @@ function useSimulatedEvents(initial: AgentEvent[]) {
 
       setEvents((prev) => [...prev, newEvent]);
 
-      // Update agent status
       setAgents((prev) =>
         prev.map((a) =>
           a.name === sim.agent
@@ -97,7 +96,6 @@ export default function AgentsPage() {
       ? events
       : events.filter((e) => e.agent_name === filterAgent);
 
-  // Auto-scroll logs
   useEffect(() => {
     if (logRef.current) {
       logRef.current.scrollTop = 0;
@@ -120,32 +118,38 @@ export default function AgentsPage() {
         className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8"
       >
         <div>
-          <h1 className="text-2xl font-bold text-slate-100 flex items-center gap-2">
-            <Activity className="w-6 h-6 text-blue-400" />
-            Agent Activity Dashboard
-          </h1>
-          <p className="text-sm text-slate-500 mt-1">
+          <div className="flex items-center gap-3 mb-2">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-secondary flex items-center justify-center">
+              <Bot className="w-5 h-5 text-primary-foreground" />
+            </div>
+            <h1 className="text-2xl font-bold text-foreground">
+              Agent Activity Dashboard
+            </h1>
+          </div>
+          <p className="text-sm text-muted-foreground">
             Real-time orchestration monitoring &amp; live agent events
           </p>
         </div>
 
         <div className="flex items-center gap-3">
-          <button
+          <motion.button
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
             onClick={() => window.location.reload()}
-            className="p-2 rounded-lg glass border border-[var(--border-color)] text-slate-400 hover:text-slate-200 transition-colors"
+            className="p-2.5 rounded-xl glass border border-border text-muted-foreground hover:text-foreground hover:border-primary/30 transition-all"
           >
             <RefreshCw className="w-4 h-4" />
-          </button>
+          </motion.button>
           <motion.button
             whileHover={{ scale: 1.03 }}
             whileTap={{ scale: 0.97 }}
             onClick={startSimulation}
             disabled={isRunning}
-            className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white shadow-lg shadow-blue-500/20 disabled:opacity-50 transition-all"
+            className="btn-futuristic flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm bg-gradient-to-r from-primary to-secondary text-primary-foreground shadow-lg shadow-primary/20 disabled:opacity-50 transition-all"
           >
             {isRunning ? (
               <>
-                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                <RefreshCw className="w-4 h-4 animate-spin" />
                 Simulating...
               </>
             ) : (
@@ -161,19 +165,22 @@ export default function AgentsPage() {
       {/* Status summary bar */}
       <div className="grid grid-cols-4 gap-3 mb-6">
         {[
-          { label: "Running", count: runningCount, color: "text-emerald-400", bg: "bg-emerald-500/10", border: "border-emerald-500/30" },
-          { label: "Completed", count: completedCount, color: "text-blue-400", bg: "bg-blue-500/10", border: "border-blue-500/30" },
-          { label: "Idle", count: idleCount, color: "text-amber-400", bg: "bg-amber-500/10", border: "border-amber-500/30" },
-          { label: "Error", count: errorCount, color: "text-red-400", bg: "bg-red-500/10", border: "border-red-500/30" },
-        ].map((item) => (
+          { label: "Running", count: runningCount, color: "text-emerald-500", bgGradient: "from-emerald-500/20 to-emerald-500/5", border: "border-emerald-500/30" },
+          { label: "Completed", count: completedCount, color: "text-primary", bgGradient: "from-primary/20 to-primary/5", border: "border-primary/30" },
+          { label: "Idle", count: idleCount, color: "text-amber-500", bgGradient: "from-amber-500/20 to-amber-500/5", border: "border-amber-500/30" },
+          { label: "Error", count: errorCount, color: "text-red-500", bgGradient: "from-red-500/20 to-red-500/5", border: "border-red-500/30" },
+        ].map((item, i) => (
           <motion.div
             key={item.label}
             initial={{ opacity: 0, scale: 0.9 }}
             animate={{ opacity: 1, scale: 1 }}
-            className={`glass border ${item.border} rounded-xl p-3 text-center`}
+            transition={{ delay: i * 0.05 }}
+            whileHover={{ scale: 1.02, y: -2 }}
+            className={`glass border ${item.border} rounded-xl p-4 text-center relative overflow-hidden group`}
           >
-            <div className={`text-2xl font-bold ${item.color}`}>{item.count}</div>
-            <div className="text-xs text-slate-500">{item.label}</div>
+            <div className={`absolute inset-0 bg-gradient-to-br ${item.bgGradient} opacity-0 group-hover:opacity-100 transition-opacity`} />
+            <div className={`relative z-10 text-2xl font-bold ${item.color}`}>{item.count}</div>
+            <div className="relative z-10 text-xs text-muted-foreground">{item.label}</div>
           </motion.div>
         ))}
       </div>
@@ -183,11 +190,14 @@ export default function AgentsPage() {
         initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.1 }}
-        className="glass border border-[var(--border-color)] rounded-xl p-6 mb-6"
+        className="glass border border-border rounded-2xl p-6 mb-6"
       >
-        <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">
-          Orchestration Flow
-        </h2>
+        <div className="flex items-center gap-2 mb-4">
+          <Zap className="w-4 h-4 text-primary" />
+          <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+            Orchestration Flow
+          </h2>
+        </div>
         <OrchestrationFlow
           activeStep={activeAgent?.name.replace("Agent", "") ?? "EmailWriter"}
           currentTask={activeAgent?.currentTask}
@@ -196,30 +206,36 @@ export default function AgentsPage() {
 
       {/* Main panels */}
       <div className="grid lg:grid-cols-5 gap-6 mb-6">
-        {/* Agent Cards — 3 cols */}
+        {/* Agent Cards */}
         <div className="lg:col-span-3">
-          <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
-            Live Agent Status
-          </h2>
-          <div className="grid sm:grid-cols-2 gap-3">
+          <div className="flex items-center gap-2 mb-4">
+            <Activity className="w-4 h-4 text-secondary" />
+            <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+              Live Agent Status
+            </h2>
+          </div>
+          <div className="grid sm:grid-cols-2 gap-4">
             {agents.map((agent, i) => (
               <AgentCard key={agent.name} agent={agent} index={i} />
             ))}
           </div>
         </div>
 
-        {/* Event Stream — 2 cols */}
+        {/* Event Stream */}
         <div className="lg:col-span-2">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">
-              Event Stream
-            </h2>
+          <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
-              <Filter className="w-3 h-3 text-slate-500" />
+              <Activity className="w-4 h-4 text-accent" />
+              <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+                Event Stream
+              </h2>
+            </div>
+            <div className="flex items-center gap-2">
+              <Filter className="w-3 h-3 text-muted-foreground" />
               <select
                 value={filterAgent}
                 onChange={(e) => setFilterAgent(e.target.value)}
-                className="text-xs bg-transparent border border-[var(--border-color)] rounded px-2 py-1 text-slate-400 focus:outline-none focus:border-blue-500/50"
+                className="text-xs bg-card border border-border rounded-lg px-2 py-1.5 text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50 transition-all"
               >
                 <option value="all">All agents</option>
                 {agentNames.map((n) => (
@@ -232,7 +248,7 @@ export default function AgentsPage() {
           </div>
           <div
             ref={logRef}
-            className="glass border border-[var(--border-color)] rounded-xl p-4 h-[480px] overflow-y-auto"
+            className="glass border border-border rounded-2xl p-4 h-[480px] overflow-y-auto"
           >
             <AnimatePresence>
               <EventStream events={filteredEvents} />
@@ -247,9 +263,12 @@ export default function AgentsPage() {
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.3 }}
       >
-        <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
-          Task Timeline — Per Company
-        </h2>
+        <div className="flex items-center gap-2 mb-4">
+          <Activity className="w-4 h-4 text-primary" />
+          <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+            Task Timeline — Per Company
+          </h2>
+        </div>
         <TaskTimeline items={MOCK_PIPELINE} />
       </motion.div>
     </div>

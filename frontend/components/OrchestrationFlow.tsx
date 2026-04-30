@@ -38,22 +38,22 @@ const steps: OrchestrationStep[] = [
 
 const statusStyles = {
   completed: {
-    node: "bg-blue-500/30 border-blue-400 text-blue-300",
-    glow: "shadow-blue-500/50",
-    connector: "bg-blue-500/60",
-    label: "text-blue-300",
+    node: "bg-primary/20 border-primary text-primary",
+    glow: "shadow-primary/30",
+    connector: "bg-primary/50",
+    label: "text-primary",
   },
   active: {
-    node: "bg-emerald-500/30 border-emerald-400 text-emerald-300",
-    glow: "shadow-emerald-500/50",
-    connector: "bg-slate-700",
-    label: "text-emerald-300",
+    node: "bg-emerald-500/20 border-emerald-500 text-emerald-500",
+    glow: "shadow-emerald-500/30",
+    connector: "bg-border",
+    label: "text-emerald-500",
   },
   pending: {
-    node: "bg-slate-800 border-slate-600 text-slate-500",
+    node: "bg-muted border-border text-muted-foreground",
     glow: "",
-    connector: "bg-slate-700",
-    label: "text-slate-500",
+    connector: "bg-border",
+    label: "text-muted-foreground",
   },
 };
 
@@ -112,7 +112,7 @@ export default function OrchestrationFlow({
                   <div className={`text-xs font-semibold ${styles.label} whitespace-nowrap`}>
                     {step.label}
                   </div>
-                  <div className="text-xs text-slate-600 whitespace-nowrap hidden sm:block">
+                  <div className="text-xs text-muted-foreground whitespace-nowrap hidden sm:block">
                     {step.description}
                   </div>
                 </div>
@@ -121,7 +121,7 @@ export default function OrchestrationFlow({
                   <motion.div
                     initial={{ opacity: 0, y: 4 }}
                     animate={{ opacity: 1, y: 0 }}
-                    className="text-xs text-emerald-400 text-center max-w-[120px] truncate bg-emerald-500/10 px-2 py-1 rounded-md border border-emerald-500/20"
+                    className="text-xs text-emerald-500 text-center max-w-[120px] truncate bg-emerald-500/10 px-2 py-1 rounded-lg border border-emerald-500/20"
                   >
                     {currentTask}
                   </motion.div>
@@ -132,17 +132,17 @@ export default function OrchestrationFlow({
               {index < resolvedSteps.length - 1 && (
                 <div className="flex items-center flex-shrink-0 mb-8">
                   <div className="relative w-8 h-0.5">
-                    <div className={`absolute inset-0 ${styles.connector}`} />
+                    <div className={`absolute inset-0 ${styles.connector} rounded-full`} />
                     {/* Animated particle for active connector */}
                     {resolvedSteps[index].status === "completed" && (
                       <motion.div
-                        className="absolute top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-blue-400"
+                        className="absolute top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-primary"
                         animate={{ x: [0, 28, 0] }}
                         transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
                       />
                     )}
                   </div>
-                  <div className="w-0 h-0 border-t-4 border-t-transparent border-b-4 border-b-transparent border-l-4 border-l-slate-600 flex-shrink-0" />
+                  <div className="w-0 h-0 border-t-4 border-t-transparent border-b-4 border-b-transparent border-l-4 border-l-border flex-shrink-0" />
                 </div>
               )}
             </div>
