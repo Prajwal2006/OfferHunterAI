@@ -74,14 +74,14 @@ export default function ReviewPage() {
     pending: "border-amber-500/30 bg-amber-500/5",
     approved: "border-emerald-500/30 bg-emerald-500/5",
     rejected: "border-red-500/30 bg-red-500/5",
-    sent: "border-blue-500/30 bg-blue-500/5",
+    sent: "border-primary/30 bg-primary/5",
   };
 
   const statusBadge = {
-    pending: "bg-amber-500/20 text-amber-300 border-amber-500/30",
-    approved: "bg-emerald-500/20 text-emerald-300 border-emerald-500/30",
-    rejected: "bg-red-500/20 text-red-300 border-red-500/30",
-    sent: "bg-blue-500/20 text-blue-300 border-blue-500/30",
+    pending: "bg-amber-500/20 text-amber-500 border-amber-500/30",
+    approved: "bg-emerald-500/20 text-emerald-500 border-emerald-500/30",
+    rejected: "bg-red-500/20 text-red-500 border-red-500/30",
+    sent: "bg-primary/20 text-primary border-primary/30",
   };
 
   return (
@@ -94,19 +94,23 @@ export default function ReviewPage() {
       >
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold text-slate-100 flex items-center gap-2">
-              <Mail className="w-6 h-6 text-blue-400" />
-              Email Review
-            </h1>
-            <p className="text-sm text-slate-500 mt-1">
+            <div className="flex items-center gap-3 mb-2">
+              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-secondary flex items-center justify-center">
+                <Mail className="w-5 h-5 text-primary-foreground" />
+              </div>
+              <h1 className="text-2xl font-bold text-foreground">
+                Email Review
+              </h1>
+            </div>
+            <p className="text-sm text-muted-foreground">
               Review and approve AI-drafted emails before sending
             </p>
           </div>
 
           {/* HITL Notice */}
-          <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-purple-500/10 border border-purple-500/30">
-            <Shield className="w-4 h-4 text-purple-400 flex-shrink-0" />
-            <span className="text-xs text-purple-300 font-medium">
+          <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-secondary/10 border border-secondary/30">
+            <Shield className="w-4 h-4 text-secondary flex-shrink-0" />
+            <span className="text-xs text-secondary font-medium">
               Human-in-the-Loop Required
             </span>
           </div>
@@ -115,18 +119,23 @@ export default function ReviewPage() {
         {/* Stats */}
         <div className="grid grid-cols-4 gap-3 mt-6">
           {[
-            { label: "Pending", count: pending.length, color: "text-amber-400" },
-            { label: "Approved", count: approved.length, color: "text-emerald-400" },
-            { label: "Sent", count: sent.length, color: "text-blue-400" },
-            { label: "Rejected", count: rejected.length, color: "text-red-400" },
-          ].map((s) => (
-            <div
+            { label: "Pending", count: pending.length, color: "text-amber-500", gradient: "from-amber-500/20 to-amber-500/5" },
+            { label: "Approved", count: approved.length, color: "text-emerald-500", gradient: "from-emerald-500/20 to-emerald-500/5" },
+            { label: "Sent", count: sent.length, color: "text-primary", gradient: "from-primary/20 to-primary/5" },
+            { label: "Rejected", count: rejected.length, color: "text-red-500", gradient: "from-red-500/20 to-red-500/5" },
+          ].map((s, i) => (
+            <motion.div
               key={s.label}
-              className="glass border border-[var(--border-color)] rounded-xl p-3 text-center"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: i * 0.05 }}
+              whileHover={{ scale: 1.02, y: -2 }}
+              className="glass border border-border rounded-xl p-4 text-center relative overflow-hidden group"
             >
-              <div className={`text-2xl font-bold ${s.color}`}>{s.count}</div>
-              <div className="text-xs text-slate-500">{s.label}</div>
-            </div>
+              <div className={`absolute inset-0 bg-gradient-to-br ${s.gradient} opacity-0 group-hover:opacity-100 transition-opacity`} />
+              <div className={`relative z-10 text-2xl font-bold ${s.color}`}>{s.count}</div>
+              <div className="relative z-10 text-xs text-muted-foreground">{s.label}</div>
+            </motion.div>
           ))}
         </div>
       </motion.div>
@@ -144,19 +153,19 @@ export default function ReviewPage() {
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: index * 0.05 }}
-                className={`glass border rounded-xl overflow-hidden ${statusColor[email.localStatus]}`}
+                className={`glass border rounded-2xl overflow-hidden ${statusColor[email.localStatus]}`}
               >
                 {/* Header row */}
                 <button
                   onClick={() => setExpandedId(isExpanded ? null : email.id)}
-                  className="w-full flex items-center gap-4 p-4 text-left hover:bg-white/5 transition-colors"
+                  className="w-full flex items-center gap-4 p-4 text-left hover:bg-muted/30 transition-colors"
                 >
-                  <div className="w-10 h-10 rounded-xl bg-white/10 flex items-center justify-center text-lg font-bold text-slate-300 flex-shrink-0">
+                  <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-primary/20 to-secondary/20 border border-border flex items-center justify-center text-lg font-bold text-foreground flex-shrink-0">
                     {email.company_name[0]}
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="text-sm font-semibold text-slate-200">
+                      <span className="text-sm font-semibold text-foreground">
                         {email.company_name}
                       </span>
                       <span
@@ -165,16 +174,16 @@ export default function ReviewPage() {
                         {email.localStatus.charAt(0).toUpperCase() + email.localStatus.slice(1)}
                       </span>
                     </div>
-                    <div className="text-xs text-slate-400 mt-0.5 truncate">
+                    <div className="text-xs text-muted-foreground mt-0.5 truncate">
                       {email.editedSubject ?? email.subject}
                     </div>
                     {email.recipient_email && (
-                      <div className="text-xs text-slate-600 mt-0.5">
+                      <div className="text-xs text-muted-foreground/70 mt-0.5">
                         To: {email.recipient_email}
                       </div>
                     )}
                   </div>
-                  <div className="text-slate-600 flex-shrink-0">
+                  <div className="text-muted-foreground flex-shrink-0">
                     {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                   </div>
                 </button>
@@ -189,7 +198,7 @@ export default function ReviewPage() {
                       transition={{ duration: 0.2 }}
                       className="overflow-hidden"
                     >
-                      <div className="px-4 pb-4 border-t border-white/5">
+                      <div className="px-4 pb-4 border-t border-border/50">
                         {isEditing ? (
                           <EmailEditor
                             email={email}
@@ -238,14 +247,14 @@ function EmailViewer({
     <div className="mt-4 space-y-4">
       {/* Subject */}
       <div>
-        <div className="text-xs text-slate-500 uppercase tracking-wider mb-1">Subject</div>
-        <div className="text-sm text-slate-200 font-medium">{displaySubject}</div>
+        <div className="text-xs text-muted-foreground uppercase tracking-wider mb-1">Subject</div>
+        <div className="text-sm text-foreground font-medium">{displaySubject}</div>
       </div>
 
       {/* Body */}
       <div>
-        <div className="text-xs text-slate-500 uppercase tracking-wider mb-2">Email Body</div>
-        <div className="bg-black/30 rounded-lg p-4 text-sm text-slate-300 whitespace-pre-wrap font-mono leading-relaxed border border-white/5">
+        <div className="text-xs text-muted-foreground uppercase tracking-wider mb-2">Email Body</div>
+        <div className="bg-muted/30 rounded-xl p-4 text-sm text-foreground/90 whitespace-pre-wrap font-mono leading-relaxed border border-border">
           {displayBody}
         </div>
       </div>
@@ -257,7 +266,7 @@ function EmailViewer({
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
             onClick={onApprove}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-sm font-medium hover:bg-emerald-500/30 transition-colors"
+            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 text-emerald-500 text-sm font-medium hover:bg-emerald-500/30 transition-colors"
           >
             <CheckCircle className="w-4 h-4" />
             Approve
@@ -266,7 +275,7 @@ function EmailViewer({
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
             onClick={onEdit}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-500/20 border border-blue-500/40 text-blue-300 text-sm font-medium hover:bg-blue-500/30 transition-colors"
+            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary/20 border border-primary/30 text-primary text-sm font-medium hover:bg-primary/30 transition-colors"
           >
             <Edit3 className="w-4 h-4" />
             Edit
@@ -275,7 +284,7 @@ function EmailViewer({
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
             onClick={onReject}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-red-500/20 border border-red-500/40 text-red-300 text-sm font-medium hover:bg-red-500/30 transition-colors"
+            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-red-500/20 border border-red-500/30 text-red-500 text-sm font-medium hover:bg-red-500/30 transition-colors"
           >
             <XCircle className="w-4 h-4" />
             Reject
@@ -289,26 +298,26 @@ function EmailViewer({
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
             onClick={onSend}
-            className="flex items-center gap-2 px-5 py-2 rounded-lg bg-gradient-to-r from-blue-600 to-purple-600 text-white text-sm font-semibold shadow-lg shadow-blue-500/20 hover:from-blue-500 hover:to-purple-500 transition-all"
+            className="btn-futuristic flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-primary to-secondary text-primary-foreground text-sm font-semibold shadow-lg shadow-primary/20"
           >
             <Send className="w-4 h-4" />
             Send via Gmail
           </motion.button>
-          <span className="text-xs text-emerald-400">
-            ✓ Approved — ready to send
+          <span className="text-xs text-emerald-500 font-medium">
+            Approved — ready to send
           </span>
         </div>
       )}
 
       {email.localStatus === "sent" && (
-        <div className="flex items-center gap-2 pt-2 text-sm text-blue-400">
+        <div className="flex items-center gap-2 pt-2 text-sm text-primary">
           <Send className="w-4 h-4" />
           Sent{email.sent_at ? ` at ${new Date(email.sent_at).toLocaleString()}` : ""}
         </div>
       )}
 
       {email.localStatus === "rejected" && (
-        <div className="flex items-center gap-2 pt-2 text-sm text-red-400">
+        <div className="flex items-center gap-2 pt-2 text-sm text-red-500">
           <XCircle className="w-4 h-4" />
           Rejected — email will not be sent
         </div>
@@ -332,24 +341,24 @@ function EmailEditor({
   return (
     <div className="mt-4 space-y-4">
       <div>
-        <label className="block text-xs text-slate-500 uppercase tracking-wider mb-1">
+        <label className="block text-xs text-muted-foreground uppercase tracking-wider mb-1">
           Subject
         </label>
         <input
           value={subject}
           onChange={(e) => setSubject(e.target.value)}
-          className="w-full bg-black/40 border border-[var(--border-color)] rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500/50 transition-colors"
+          className="w-full bg-muted/30 border border-border rounded-xl px-4 py-2.5 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50 transition-all"
         />
       </div>
       <div>
-        <label className="block text-xs text-slate-500 uppercase tracking-wider mb-1">
+        <label className="block text-xs text-muted-foreground uppercase tracking-wider mb-1">
           Body
         </label>
         <textarea
           value={body}
           onChange={(e) => setBody(e.target.value)}
           rows={12}
-          className="w-full bg-black/40 border border-[var(--border-color)] rounded-lg px-3 py-2 text-sm text-slate-300 font-mono leading-relaxed focus:outline-none focus:border-blue-500/50 transition-colors resize-none"
+          className="w-full bg-muted/30 border border-border rounded-xl px-4 py-3 text-sm text-foreground font-mono leading-relaxed focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50 transition-all resize-none"
         />
       </div>
       <div className="flex items-center gap-3">
@@ -357,13 +366,13 @@ function EmailEditor({
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.98 }}
           onClick={() => onSave(subject, body)}
-          className="px-4 py-2 rounded-lg bg-blue-500/20 border border-blue-500/40 text-blue-300 text-sm font-medium hover:bg-blue-500/30 transition-colors"
+          className="px-4 py-2 rounded-xl bg-primary/20 border border-primary/30 text-primary text-sm font-medium hover:bg-primary/30 transition-colors"
         >
           Save Changes
         </motion.button>
         <button
           onClick={onCancel}
-          className="px-4 py-2 rounded-lg text-slate-500 text-sm hover:text-slate-300 transition-colors"
+          className="px-4 py-2 rounded-xl text-muted-foreground text-sm hover:text-foreground transition-colors"
         >
           Cancel
         </button>
