@@ -4,9 +4,11 @@ OfferHunter AI — FastAPI Backend
 import asyncio
 import json
 import re
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -14,15 +16,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from .db.supabase import supabase_client
-from .agents.event_logger import AgentEventLogger
-from .agents.company_finder import CompanyFinderAgent
-from .agents.personalization import PersonalizationAgent
-from .agents.email_writer import EmailWriterAgent
-from .agents.resume_tailor import ResumeTailorAgent
-from .agents.email_sender import EmailSenderAgent
-from .agents.follow_up import FollowUpAgent
-from .agents.response_classifier import ResponseClassifierAgent
+try:
+    from .db.supabase import supabase_client
+    from .agents.event_logger import AgentEventLogger
+    from .agents.company_finder import CompanyFinderAgent
+    from .agents.personalization import PersonalizationAgent
+    from .agents.email_writer import EmailWriterAgent
+    from .agents.resume_tailor import ResumeTailorAgent
+    from .agents.email_sender import EmailSenderAgent
+    from .agents.follow_up import FollowUpAgent
+    from .agents.response_classifier import ResponseClassifierAgent
+except ImportError:
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from backend.db.supabase import supabase_client
+    from backend.agents.event_logger import AgentEventLogger
+    from backend.agents.company_finder import CompanyFinderAgent
+    from backend.agents.personalization import PersonalizationAgent
+    from backend.agents.email_writer import EmailWriterAgent
+    from backend.agents.resume_tailor import ResumeTailorAgent
+    from backend.agents.email_sender import EmailSenderAgent
+    from backend.agents.follow_up import FollowUpAgent
+    from backend.agents.response_classifier import ResponseClassifierAgent
 
 # In-memory event queue for SSE streaming
 _event_queue: asyncio.Queue = asyncio.Queue()
