@@ -1,82 +1,110 @@
-"use client";
+﻿"use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Activity, Play, RefreshCw, Filter, Bot, Zap } from "lucide-react";
+import { Activity, Play, RefreshCw, Filter, Bot, Zap, Building2, ArrowRight, Info } from "lucide-react";
 import { AgentEvent, AgentInfo } from "@/lib/types";
-import { MOCK_AGENTS, MOCK_EVENTS } from "@/lib/mockData";
+import { MOCK_AGENTS } from "@/lib/mockData";
 import AgentCard from "@/components/AgentCard";
 import EventStream from "@/components/EventStream";
 import OrchestrationFlow from "@/components/OrchestrationFlow";
 import TaskTimeline from "@/components/TaskTimeline";
 import { MOCK_PIPELINE } from "@/lib/mockData";
 import { RequireAuth } from "@/components/RequireAuth";
-import { fetchResumes, runAgents } from "@/lib/api";
+import { fetchResumes, createEventSource } from "@/lib/api";
 import { useAuth } from "@/components/AuthProvider";
 import { ResumeVersion } from "@/lib/types";
+import Link from "next/link";
 
-function useSimulatedEvents(initial: AgentEvent[]) {
-  const [events, setEvents] = useState<AgentEvent[]>(initial);
+// Map agent name tokens â†’ orchestration step IDs
+const AGENT_TO_STEP: Record<string, string> = {
+  CompanyFinderAgent: "CompanyFinder",
+  PersonalizationAgent: "Personalization",
+  EmailWriterAgent: "EmailWriter",
+  ReviewAgent: "Review",
+  EmailSenderAgent: "Sender",
+};
+
+function useAgentState() {
+  const [events, setEvents] = useState<AgentEvent[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>(MOCK_AGENTS);
   const [isRunning, setIsRunning] = useState(false);
+  const [demoMode, setDemoMode] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // â”€â”€ Apply a real SSE event to agent state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const applyEvent = useCallback((ev: AgentEvent) => {
+    setEvents((prev) => {
+      // deduplicate by id
+      if (prev.some((e) => e.id === ev.id)) return prev;
+      return [ev, ...prev];
+    });
+
+    setAgents((prev) =>
+      prev.map((a) => {
+        if (a.name !== ev.agent_name) return a;
+        const next = { ...a };
+        if (ev.status === "running" || ev.status === "started") {
+          next.status = "running";
+          next.currentTask = ev.message;
+        } else if (ev.status === "completed") {
+          next.status = "completed";
+          next.currentTask = ev.message;
+        } else if (ev.status === "failed" || ev.status === "error") {
+          next.status = "error";
+          next.currentTask = ev.message;
+        }
+        return next;
+      })
+    );
+  }, []);
+
+  // â”€â”€ Demo simulation (used when user clicks "Demo") â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const simulatedMessages = [
-    { agent: "CompanyFinderAgent", msg: "Scanning LinkedIn for ML Engineer roles", status: "running" as const },
-    { agent: "PersonalizationAgent", msg: "Extracting tech stack from Anthropic careers page", status: "running" as const },
-    { agent: "EmailWriterAgent", msg: "Generating email draft for Anthropic", status: "running" as const },
-    { agent: "ResumeTailorAgent", msg: "Tailoring resume bullets for AI/ML focus", status: "running" as const },
-    { agent: "PersonalizationAgent", msg: "Completed analysis for Anthropic", status: "completed" as const },
-    { agent: "EmailWriterAgent", msg: "Email draft complete for Anthropic — pending review", status: "completed" as const },
-    { agent: "CompanyFinderAgent", msg: "Found 3 new companies: Cohere, Mistral, Together AI", status: "completed" as const },
-    { agent: "FollowUpAgent", msg: "Checking response status for Supabase outreach", status: "running" as const },
-    { agent: "ResponseClassifierAgent", msg: "No response detected — follow-up scheduled in 3 days", status: "completed" as const },
+    { agent: "CompanyFinderAgent", msg: "Scanning HackerNews 'Who's Hiring' posts...", status: "running" as const },
+    { agent: "CompanyFinderAgent", msg: "Querying RemoteOK API for matching roles...", status: "running" as const },
+    { agent: "CompanyFinderAgent", msg: "Asking AI to suggest companies based on your profile...", status: "running" as const },
+    { agent: "CompanyFinderAgent", msg: "Ranking 28 discovered companies by match score...", status: "running" as const },
+    { agent: "CompanyFinderAgent", msg: "Finding contact emails for top 10 companies...", status: "running" as const },
+    { agent: "CompanyFinderAgent", msg: "Found 18 companies Â· Top match: Anthropic (94%)", status: "completed" as const },
+    { agent: "PersonalizationAgent", msg: "Fetching Anthropic careers page & engineering blog...", status: "running" as const },
+    { agent: "PersonalizationAgent", msg: "Extracted key themes: safety-focused, research-heavy, Python/PyTorch", status: "completed" as const },
+    { agent: "EmailWriterAgent", msg: "Generating cold email for Anthropic â€” highlighting ML background...", status: "running" as const },
+    { agent: "EmailWriterAgent", msg: "Email drafted for Anthropic. Awaiting your approval in Review.", status: "completed" as const },
+    { agent: "ResumeTailorAgent", msg: "Tailoring resume bullets for Anthropic job descriptions...", status: "running" as const },
+    { agent: "ResumeTailorAgent", msg: "Resume tailored. Added 3 bullets matching safety/alignment focus.", status: "completed" as const },
   ];
 
-  function startSimulation() {
+  function startDemo() {
     if (isRunning) return;
     setIsRunning(true);
+    setDemoMode(true);
+    // Reset agents to idle first
+    setAgents(MOCK_AGENTS.map((a) => ({ ...a, status: "idle" as const, currentTask: undefined })));
+    setEvents([]);
 
     let i = 0;
     intervalRef.current = setInterval(() => {
       if (i >= simulatedMessages.length) {
-        if (intervalRef.current) clearInterval(intervalRef.current);
+        clearInterval(intervalRef.current!);
         setIsRunning(false);
         return;
       }
 
       const sim = simulatedMessages[i];
       const newEvent: AgentEvent = {
-        id: `sim-${Date.now()}-${i}`,
+        id: `demo-${Date.now()}-${i}`,
         agent_name: sim.agent,
-        task_id: `task-sim-${i}`,
+        task_id: `task-demo-${i}`,
         status: sim.status,
         message: sim.msg,
         metadata: {},
         created_at: new Date().toISOString(),
       };
 
-      setEvents((prev) => [...prev, newEvent]);
-
-      setAgents((prev) =>
-        prev.map((a) =>
-          a.name === sim.agent
-            ? {
-                ...a,
-                status:
-                  sim.status === "running"
-                    ? "running"
-                    : sim.status === "completed"
-                    ? "completed"
-                    : "error",
-                currentTask: sim.status === "running" ? sim.msg : a.currentTask,
-              }
-            : a
-        )
-      );
-
+      applyEvent(newEvent);
       i++;
-    }, 1500);
+    }, 1800);
   }
 
   useEffect(() => {
@@ -85,17 +113,20 @@ function useSimulatedEvents(initial: AgentEvent[]) {
     };
   }, []);
 
-  return { events, agents, isRunning, startSimulation };
+  return { events, agents, isRunning, demoMode, startDemo, applyEvent };
 }
 
 export default function AgentsPage() {
-  const { events, agents, isRunning, startSimulation } = useSimulatedEvents(MOCK_EVENTS);
+  const { events, agents, isRunning, demoMode, startDemo, applyEvent } = useAgentState();
   const { session } = useAuth();
   const [filterAgent, setFilterAgent] = useState<string>("all");
   const [activeResume, setActiveResume] = useState<ResumeVersion | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
+  const esRef = useRef<EventSource | null>(null);
 
-  const activeAgent = agents.find((a) => a.status === "running");
+  // Derive active step from agent states
+  const runningAgent = agents.find((a) => a.status === "running");
+  const activeStep = runningAgent ? AGENT_TO_STEP[runningAgent.name] : undefined;
 
   const filteredEvents =
     filterAgent === "all"
@@ -108,46 +139,56 @@ export default function AgentsPage() {
     }
   }, [events]);
 
+  // â”€â”€ Connect to real SSE stream â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  useEffect(() => {
+    esRef.current?.close();
+
+    const es = createEventSource((ev: MessageEvent) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data.type === "connected") return;
+        const event: AgentEvent = {
+          id: data.id ?? `sse-${Date.now()}`,
+          agent_name: data.agent_name ?? "Unknown",
+          task_id: data.task_id ?? "",
+          status: data.status ?? "running",
+          message: data.message ?? "",
+          metadata: data.metadata ?? {},
+          created_at: data.created_at ?? new Date().toISOString(),
+        };
+        applyEvent(event);
+      } catch {
+        // ignore malformed
+      }
+    });
+    esRef.current = es;
+
+    return () => es.close();
+  }, [applyEvent]);
+
   useEffect(() => {
     async function loadActiveResume() {
       const userId = session?.user?.id;
       if (!userId) return;
-
       try {
         const result = await fetchResumes(userId);
         const resumes = (result.resumes || []) as ResumeVersion[];
-        const active = resumes.find((resume) => resume.is_active) || null;
+        const active = resumes.find((r) => r.is_active) || null;
         setActiveResume(active);
       } catch {
         setActiveResume(null);
       }
     }
-
     loadActiveResume();
   }, [session?.user?.id]);
 
-  async function handleRun() {
-    startSimulation();
-
-    try {
-      await runAgents({
-        skills: activeResume?.extracted_skills?.slice(0, 6) || ["python", "fastapi"],
-        job_title: "Software Engineer",
-        company_count: 10,
-        resume_text: activeResume?.extracted_text,
-        resume_version_id: activeResume?.id,
-      });
-    } catch {
-      // UI simulation still runs in demo mode.
-    }
-  }
-
-  const agentNames = [...new Set(MOCK_EVENTS.map((e) => e.agent_name))];
+  const agentNames = [...new Set(agents.map((a) => a.name))];
 
   const runningCount = agents.filter((a) => a.status === "running").length;
   const completedCount = agents.filter((a) => a.status === "completed").length;
   const idleCount = agents.filter((a) => a.status === "idle").length;
   const errorCount = agents.filter((a) => a.status === "error").length;
+  const allIdle = agents.every((a) => a.status === "idle");
 
   return (
     <RequireAuth>
@@ -160,7 +201,7 @@ export default function AgentsPage() {
       >
         <div>
           <div className="flex items-center gap-3 mb-2">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-secondary flex items-center justify-center">
+            <div className="w-10 h-10 rounded-xl bg-linear-to-br from-primary to-secondary flex items-center justify-center">
               <Bot className="w-5 h-5 text-primary-foreground" />
             </div>
             <h1 className="text-2xl font-bold text-foreground">
@@ -178,30 +219,68 @@ export default function AgentsPage() {
             whileTap={{ scale: 0.95 }}
             onClick={() => window.location.reload()}
             className="p-2.5 rounded-xl glass border border-border text-muted-foreground hover:text-foreground hover:border-primary/30 transition-all"
+            title="Refresh"
           >
             <RefreshCw className="w-4 h-4" />
           </motion.button>
+
+          {/* Demo mode button */}
           <motion.button
             whileHover={{ scale: 1.03 }}
             whileTap={{ scale: 0.97 }}
-            onClick={handleRun}
+            onClick={startDemo}
             disabled={isRunning}
-            className="btn-futuristic flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm bg-gradient-to-r from-primary to-secondary text-primary-foreground shadow-lg shadow-primary/20 disabled:opacity-50 transition-all"
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground hover:border-primary/30 disabled:opacity-40 transition-all"
+            title="Preview a simulated agent run"
           >
-            {isRunning ? (
+            {isRunning && demoMode ? (
               <>
                 <RefreshCw className="w-4 h-4 animate-spin" />
                 Simulating...
               </>
             ) : (
               <>
-                <Play className="w-4 h-4" fill="currentColor" />
-                Run Agents
+                <Play className="w-4 h-4" />
+                Demo
               </>
             )}
           </motion.button>
+
+          {/* Real entry point */}
+          <Link href="/company-finder">
+            <motion.div
+              whileHover={{ scale: 1.03 }}
+              whileTap={{ scale: 0.97 }}
+              className="btn-futuristic flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm bg-linear-to-r from-primary to-secondary text-primary-foreground shadow-lg shadow-primary/20 cursor-pointer"
+            >
+              <Building2 className="w-4 h-4" />
+              Run Company Finder
+              <ArrowRight className="w-4 h-4" />
+            </motion.div>
+          </Link>
         </div>
       </motion.div>
+
+      {/* Idle state info banner */}
+      <AnimatePresence>
+        {allIdle && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            className="flex items-start gap-3 px-4 py-3 mb-6 bg-primary/5 border border-primary/20 rounded-xl text-sm"
+          >
+            <Info className="w-4 h-4 text-primary mt-0.5 shrink-0" />
+            <div>
+              <p className="text-foreground font-medium">No agents running</p>
+              <p className="text-muted-foreground text-xs mt-0.5">
+                Click <strong>Run Company Finder</strong> to start the pipeline â€” the agent will discover companies, rank them by match score, and find contact emails.
+                Or click <strong>Demo</strong> to preview a simulated run.
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Status summary bar */}
       <div className="grid grid-cols-4 gap-3 mb-6">
@@ -219,7 +298,7 @@ export default function AgentsPage() {
             whileHover={{ scale: 1.02, y: -2 }}
             className={`glass border ${item.border} rounded-xl p-4 text-center relative overflow-hidden group`}
           >
-            <div className={`absolute inset-0 bg-gradient-to-br ${item.bgGradient} opacity-0 group-hover:opacity-100 transition-opacity`} />
+            <div className={`absolute inset-0 bg-linear-to-br ${item.bgGradient} opacity-0 group-hover:opacity-100 transition-opacity`} />
             <div className={`relative z-10 text-2xl font-bold ${item.color}`}>{item.count}</div>
             <div className="relative z-10 text-xs text-muted-foreground">{item.label}</div>
           </motion.div>
@@ -240,8 +319,8 @@ export default function AgentsPage() {
           </h2>
         </div>
         <OrchestrationFlow
-          activeStep={activeAgent?.name.replace("Agent", "") ?? "EmailWriter"}
-          currentTask={activeAgent?.currentTask}
+          activeStep={activeStep}
+          currentTask={runningAgent?.currentTask}
         />
       </motion.div>
 
@@ -289,10 +368,26 @@ export default function AgentsPage() {
           </div>
           <div
             ref={logRef}
-            className="glass border border-border rounded-2xl p-4 h-[480px] overflow-y-auto"
+            className="glass border border-border rounded-2xl p-4 h-120 overflow-y-auto"
           >
             <AnimatePresence>
-              <EventStream events={filteredEvents} />
+              {filteredEvents.length === 0 ? (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="flex flex-col items-center justify-center h-full gap-3 text-center"
+                >
+                  <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center opacity-40">
+                    <Activity className="w-6 h-6 text-muted-foreground" />
+                  </div>
+                  <p className="text-sm text-muted-foreground">No events yet</p>
+                  <p className="text-xs text-muted-foreground opacity-60">
+                    Events will appear here when agents are running
+                  </p>
+                </motion.div>
+              ) : (
+                <EventStream events={filteredEvents} />
+              )}
             </AnimatePresence>
           </div>
         </div>
@@ -307,7 +402,7 @@ export default function AgentsPage() {
         <div className="flex items-center gap-2 mb-4">
           <Activity className="w-4 h-4 text-primary" />
           <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
-            Task Timeline — Per Company
+            Task Timeline â€” Per Company
           </h2>
         </div>
         <TaskTimeline items={MOCK_PIPELINE} />
@@ -316,3 +411,4 @@ export default function AgentsPage() {
     </RequireAuth>
   );
 }
+

@@ -1,5 +1,5 @@
-"""
-OfferHunter AI — FastAPI Backend
+﻿"""
+OfferHunter AI â€” FastAPI Backend
 """
 import asyncio
 import json
@@ -26,6 +26,7 @@ try:
     from .agents.email_sender import EmailSenderAgent
     from .agents.follow_up import FollowUpAgent
     from .agents.response_classifier import ResponseClassifierAgent
+    from .services.resume_parser import ResumeParserService
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from backend.db.supabase import supabase_client
@@ -37,9 +38,35 @@ except ImportError:
     from backend.agents.email_sender import EmailSenderAgent
     from backend.agents.follow_up import FollowUpAgent
     from backend.agents.response_classifier import ResponseClassifierAgent
+    from backend.services.resume_parser import ResumeParserService
 
-# In-memory event queue for SSE streaming
-_event_queue: asyncio.Queue = asyncio.Queue()
+# In-memory company results cache (user_id -> companies list)
+# Used as fallback when Supabase is not configured or rankings table is empty
+_user_companies_cache: dict[str, list] = {}
+
+# â”€â”€â”€ SSE Broadcast â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Each SSE connection gets its own queue so every subscriber receives every event.
+_sse_subscribers: list[asyncio.Queue] = []
+
+
+class _BroadcastQueue:
+    """
+    Drop-in replacement for asyncio.Queue that broadcasts put_nowait() calls
+    to all active SSE subscriber queues instead of a single consumer.
+    """
+    def put_nowait(self, event: dict) -> None:  # type: ignore[override]
+        for q in list(_sse_subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    async def get(self) -> dict:  # pragma: no cover
+        await asyncio.sleep(3600)
+        return {}
+
+
+_broadcast_queue = _BroadcastQueue()
 
 
 @asynccontextmanager
@@ -66,7 +93,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Models ───────────────────────────────────────────────────────────────────
+# â”€â”€â”€ Models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class RunAgentsRequest(BaseModel):
     skills: list[str]
@@ -92,7 +119,34 @@ class EmailUpdateRequest(BaseModel):
     resume_version_id: Optional[str] = None
 
 
-# ─── Agent Event Endpoints ────────────────────────────────────────────────────
+# â”€â”€â”€ Company Finder Models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class CompanyFinderRunRequest(BaseModel):
+    user_id: str
+    resume_text: Optional[str] = None
+    resume_version_id: Optional[str] = None
+    preferences: Optional[dict[str, Any]] = None
+    count: int = 25
+
+
+class PreferenceChatRequest(BaseModel):
+    user_id: str
+    message: str
+    history: list[dict[str, str]] = []
+    current_prefs: Optional[dict[str, Any]] = None
+
+
+class SavePreferencesRequest(BaseModel):
+    user_id: str
+    preferences: dict[str, Any]
+
+
+class ParseResumeRequest(BaseModel):
+    user_id: str
+    resume_version_id: Optional[str] = None
+
+
+# â”€â”€â”€ Agent Event Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/agent-events")
 async def get_agent_events(
@@ -114,21 +168,30 @@ async def get_agent_events(
 @app.get("/agent-events/stream")
 async def stream_agent_events():
     """Server-Sent Events endpoint for real-time agent event streaming."""
+    subscriber_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+    _sse_subscribers.append(subscriber_queue)
 
     async def event_generator() -> AsyncGenerator[str, None]:
         # Send initial heartbeat
         yield f"data: {json.dumps({'type': 'connected', 'timestamp': datetime.utcnow().isoformat()})}\n\n"
 
-        while True:
+        try:
+            while True:
+                try:
+                    # Wait for new event (with timeout for keep-alive)
+                    event = await asyncio.wait_for(subscriber_queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send keep-alive comment
+                    yield ": keepalive\n\n"
+                except Exception:
+                    break
+        finally:
+            # Remove subscriber when client disconnects
             try:
-                # Wait for new event (with timeout for keep-alive)
-                event = await asyncio.wait_for(_event_queue.get(), timeout=30.0)
-                yield f"data: {json.dumps(event)}\n\n"
-            except asyncio.TimeoutError:
-                # Send keep-alive comment
-                yield ": keepalive\n\n"
-            except Exception:
-                break
+                _sse_subscribers.remove(subscriber_queue)
+            except ValueError:
+                pass
 
     return StreamingResponse(
         event_generator(),
@@ -140,13 +203,13 @@ async def stream_agent_events():
     )
 
 
-# ─── Agent Execution Endpoints ────────────────────────────────────────────────
+# â”€â”€â”€ Agent Execution Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.post("/agents/run")
 async def run_agents(request: RunAgentsRequest):
     """Trigger the full multi-agent pipeline."""
     task_id = str(uuid.uuid4())
-    logger = AgentEventLogger(event_queue=_event_queue)
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
 
     async def run_pipeline():
         try:
@@ -217,7 +280,7 @@ async def run_agents(request: RunAgentsRequest):
 async def execute_agent(agent_name: str, request: ExecuteAgentRequest):
     """Execute a specific agent by name."""
     task_id = request.task_id or str(uuid.uuid4())
-    logger = AgentEventLogger(event_queue=_event_queue)
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
 
     agent_map = {
         "company-finder": CompanyFinderAgent,
@@ -242,7 +305,7 @@ async def execute_agent(agent_name: str, request: ExecuteAgentRequest):
     return {"task_id": task_id, "agent": agent_name, "status": "started"}
 
 
-# ─── Email Endpoints ──────────────────────────────────────────────────────────
+# â”€â”€â”€ Email Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/emails")
 async def get_emails(status: Optional[str] = None):
@@ -274,12 +337,12 @@ async def approve_email(email_id: str):
         result = await supabase_client.update_email(
             email_id=email_id, updates={"status": "approved"}
         )
-        logger = AgentEventLogger(event_queue=_event_queue)
+        logger = AgentEventLogger(event_queue=_broadcast_queue)
         await logger.emit(
             agent_name="EmailSenderAgent",
             task_id=email_id,
             status="started",
-            message=f"Email {email_id} approved by user — ready to send",
+            message=f"Email {email_id} approved by user â€” ready to send",
             metadata={"email_id": email_id},
         )
         return {"email_id": email_id, "status": "approved"}
@@ -302,14 +365,14 @@ async def reject_email(email_id: str, request: EmailApprovalRequest):
 @app.post("/emails/{email_id}/send")
 async def send_email(email_id: str):
     """Send an approved email via Gmail API."""
-    logger = AgentEventLogger(event_queue=_event_queue)
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
     sender = EmailSenderAgent(logger=logger)
     task_id = str(uuid.uuid4())
     asyncio.create_task(sender.run(task_id=task_id, email_id=email_id))
     return {"email_id": email_id, "task_id": task_id, "status": "sending"}
 
 
-# ─── Resume Endpoints ────────────────────────────────────────────────────────
+# â”€â”€â”€ Resume Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.post("/resumes/upload")
 async def upload_resume(
@@ -372,7 +435,7 @@ async def delete_resume(resume_id: str, user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Pipeline Endpoints ───────────────────────────────────────────────────────
+# â”€â”€â”€ Pipeline Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/pipeline")
 async def get_pipeline():
@@ -394,7 +457,333 @@ async def health_check():
     }
 
 
-# ─── Mock data helpers ────────────────────────────────────────────────────────
+# â”€â”€â”€ Company Finder Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.post("/company-finder/run")
+async def run_company_finder(request: CompanyFinderRunRequest):
+    """
+    Run the full Company Finder pipeline for a user.
+    Parses resume, collects preferences, discovers companies, ranks them, finds contacts.
+    Returns a task_id for SSE tracking.
+    """
+    task_id = str(uuid.uuid4())
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
+    agent = CompanyFinderAgent(logger=logger)
+
+    # Resolve resume text
+    resume_text = request.resume_text
+    if not resume_text and request.resume_version_id:
+        resume = await supabase_client.get_resume(request.resume_version_id)
+        if resume:
+            resume_text = resume.get("extracted_text", "")
+    if not resume_text:
+        active = await supabase_client.get_active_resume(request.user_id)
+        if active:
+            resume_text = active.get("extracted_text", "")
+
+    if not resume_text:
+        raise HTTPException(status_code=400, detail="No resume found. Please upload a resume first.")
+
+    async def run_pipeline():
+        try:
+            result = await agent.run_full_pipeline(
+                task_id=task_id,
+                user_id=request.user_id,
+                resume_text=resume_text,
+                preferences=request.preferences,
+                count=request.count,
+            )
+            # Cache companies in memory so the GET endpoint can serve them
+            # even when Supabase is not configured
+            if result and result.get("companies"):
+                _user_companies_cache[request.user_id] = result["companies"]
+        except Exception as e:
+            await logger.emit(
+                agent_name="CompanyFinderAgent",
+                task_id=task_id,
+                status="failed",
+                message=f"Pipeline failed: {str(e)}",
+            )
+
+    asyncio.create_task(run_pipeline())
+    return {"task_id": task_id, "status": "started"}
+
+
+@app.post("/company-finder/discover")
+async def discover_companies(request: CompanyFinderRunRequest):
+    """
+    Run discovery only (no resume parse) using an existing profile + preferences.
+    """
+    task_id = str(uuid.uuid4())
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
+    agent = CompanyFinderAgent(logger=logger)
+
+    profile = await supabase_client.get_parsed_profile(request.user_id) or {}
+    preferences = (
+        request.preferences
+        or await supabase_client.get_user_preferences(request.user_id)
+        or {}
+    )
+
+    async def run_discovery():
+        try:
+            companies = await agent.run_discovery_only(
+                task_id=task_id,
+                profile=profile,
+                preferences=preferences,
+                count=request.count,
+                user_id=request.user_id,
+            )
+            if companies:
+                _user_companies_cache[request.user_id] = companies
+        except Exception as e:
+            await logger.emit(
+                agent_name="CompanyFinderAgent",
+                task_id=task_id,
+                status="failed",
+                message=f"Discovery failed: {str(e)}",
+            )
+
+    asyncio.create_task(run_discovery())
+    return {"task_id": task_id, "status": "started"}
+
+
+@app.post("/company-finder/preferences/chat")
+async def preference_chat(request: PreferenceChatRequest):
+    """
+    Single turn of the preference collection conversation.
+    """
+    profile = await supabase_client.get_parsed_profile(request.user_id) or {}
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
+    agent = CompanyFinderAgent(logger=logger)
+
+    task_id = str(uuid.uuid4())
+    result = await agent.run_preference_chat(
+        task_id=task_id,
+        user_id=request.user_id,
+        user_message=request.message,
+        history=request.history,
+        profile=profile,
+        current_prefs=request.current_prefs,
+    )
+
+    # Save conversation messages
+    await supabase_client.insert_conversation_message(
+        request.user_id, "user", request.message
+    )
+    await supabase_client.insert_conversation_message(
+        request.user_id, "assistant", result["reply"]
+    )
+
+    return result
+
+
+@app.get("/company-finder/preferences/opener")
+async def preference_opener(user_id: str):
+    """
+    Get the initial message to start the preference collection conversation.
+    """
+    profile = await supabase_client.get_parsed_profile(user_id) or {}
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
+    agent = CompanyFinderAgent(logger=logger)
+    opener = agent.get_preference_opener(profile)
+    return {"message": opener}
+
+
+@app.post("/company-finder/preferences")
+async def save_preferences(request: SavePreferencesRequest):
+    """Save user preferences directly (for bulk updates)."""
+    try:
+        result = await supabase_client.upsert_user_preferences({
+            "user_id": request.user_id,
+            **request.preferences,
+        })
+        return {"preferences": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/company-finder/preferences/{user_id}")
+async def get_preferences(user_id: str):
+    """Get user preferences."""
+    try:
+        result = await supabase_client.get_user_preferences(user_id)
+        return {"preferences": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/company-finder/conversation/{user_id}")
+async def get_conversation_history(user_id: str, context: str = "preferences"):
+    """Get the conversation history for a user."""
+    try:
+        history = await supabase_client.get_conversation_history(user_id, context)
+        return {"history": history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/company-finder/parse-resume")
+async def parse_resume_profile(request: ParseResumeRequest):
+    """
+    Parse (or re-parse) the active resume for a user and store the structured profile.
+    """
+    resume_text = ""
+    if request.resume_version_id:
+        resume = await supabase_client.get_resume(request.resume_version_id)
+        resume_text = (resume or {}).get("extracted_text", "")
+    if not resume_text:
+        active = await supabase_client.get_active_resume(request.user_id)
+        resume_text = (active or {}).get("extracted_text", "")
+
+    if not resume_text:
+        raise HTTPException(status_code=400, detail="No resume found for this user.")
+
+    parser = ResumeParserService()
+    profile = await parser.parse(resume_text)
+
+    saved = await supabase_client.upsert_parsed_profile({
+        "user_id": request.user_id,
+        **{k: v for k, v in profile.items() if k != "raw_text"},
+        "raw_text": resume_text,
+    })
+    return {"profile": saved}
+
+
+@app.get("/company-finder/profile/{user_id}")
+async def get_parsed_profile(user_id: str):
+    """Get the AI-parsed resume profile for a user."""
+    try:
+        result = await supabase_client.get_parsed_profile(user_id)
+        return {"profile": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/company-finder/companies")
+async def get_discovered_companies(
+    user_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    min_score: float = Query(0.0, ge=0.0, le=1.0),
+):
+    """
+    Get discovered and ranked companies for a user.
+    Includes rankings and contacts.
+    """
+    try:
+        # Try Supabase first
+        rankings = await supabase_client.get_company_rankings(user_id, limit=limit)
+
+        if rankings:
+            # Flatten: merge company data with ranking data
+            companies = []
+            for row in rankings:
+                company = row.get("companies") or {}
+                company["ranking"] = {
+                    k: v for k, v in row.items()
+                    if k not in ("id", "companies", "company_id", "user_id", "created_at", "updated_at")
+                }
+                company["match_score"] = row.get("match_score", 0)
+                if company.get("id") and min_score <= row.get("match_score", 0):
+                    companies.append(company)
+            if companies:
+                return {"companies": companies, "total": len(companies)}
+
+        # Fall back to in-memory cache (populated by the most recent agent run)
+        cached = _user_companies_cache.get(user_id, [])
+        if cached:
+            filtered = [c for c in cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
+            return {"companies": filtered[:limit], "total": len(filtered)}
+
+        return {"companies": [], "total": 0}
+    except Exception as e:
+        # Fall back to in-memory cache on any DB error
+        cached = _user_companies_cache.get(user_id, [])
+        if cached:
+            filtered = [c for c in cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
+            return {"companies": filtered[:limit], "total": len(filtered)}
+        return {"companies": [], "total": 0, "error": str(e)}
+
+
+@app.get("/company-finder/companies/{company_id}")
+async def get_company_detail(company_id: str):
+    """Get full company detail including contacts, jobs, and ranking."""
+    try:
+        company = await supabase_client.get_company_detail(company_id)
+        if not company:
+            raise HTTPException(status_code=404, detail="Company not found")
+        return {"company": company}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/company-finder/companies/{company_id}/handoff")
+async def handoff_to_agent(
+    company_id: str,
+    target_agent: str = Query(..., description="Agent to hand off to: personalizer, email-writer, resume-tailor"),
+    user_id: str = Query(...),
+):
+    """
+    Hand off a company to another agent (Personalizer, Email Writer, etc).
+    Packages and sends complete context to the target agent.
+    """
+    task_id = str(uuid.uuid4())
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
+
+    company = await supabase_client.get_company_detail(company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    profile = await supabase_client.get_parsed_profile(user_id) or {}
+    ranking = (await supabase_client.get_company_rankings(user_id, limit=1)) or [{}]
+
+    # Structured handoff context
+    handoff_context = {
+        "company": company,
+        "user_profile": profile,
+        "ranking": ranking[0] if ranking else {},
+        "contacts": company.get("company_contacts", []),
+        "matched_skills": profile.get("skills", []),
+        "relevant_projects": profile.get("projects", []),
+    }
+
+    agent_map = {
+        "personalizer": PersonalizationAgent,
+        "email-writer": EmailWriterAgent,
+        "resume-tailor": ResumeTailorAgent,
+    }
+
+    AgentClass = agent_map.get(target_agent.lower())
+    if not AgentClass:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown agent '{target_agent}'. Valid: {list(agent_map.keys())}",
+        )
+
+    agent = AgentClass(logger=logger)
+    asyncio.create_task(agent.run(task_id=task_id, **handoff_context))
+
+    return {
+        "task_id": task_id,
+        "status": "started",
+        "target_agent": target_agent,
+        "company": company.get("name"),
+    }
+
+
+@app.get("/company-finder/agent-runs/{user_id}")
+async def get_agent_runs(user_id: str, agent_name: Optional[str] = None):
+    """Get AI agent run history for a user."""
+    try:
+        runs = await supabase_client.get_agent_runs(user_id, agent_name=agent_name)
+        return {"runs": runs}
+    except Exception as e:
+        return {"runs": [], "error": str(e)}
+
+
+# â”€â”€â”€ Mock data helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _extract_resume_text(file_name: str, content: bytes) -> str:
@@ -491,7 +880,7 @@ def _mock_emails(status: Optional[str] = None) -> list[dict]:
             "id": "email-001",
             "company_id": "c-001",
             "company_name": "Stripe",
-            "subject": "Experienced ML Engineer — Excited About Stripe's Infrastructure",
+            "subject": "Experienced ML Engineer â€” Excited About Stripe's Infrastructure",
             "body": "Hi,\n\nI would love to join Stripe...\n\nBest,\n[Your Name]",
             "status": "pending_approval",
             "created_at": datetime.utcnow().isoformat(),

@@ -215,6 +215,250 @@ class SupabaseClient:
         )
         return result.data or []
 
+    # ─── Parsed Profiles ──────────────────────────────────────────────────────
+
+    async def upsert_parsed_profile(self, profile: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return profile
+        result = (
+            client.table("parsed_profiles")
+            .upsert(profile, on_conflict="user_id")
+            .execute()
+        )
+        return result.data[0] if result.data else profile
+
+    async def get_parsed_profile(self, user_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("parsed_profiles")
+            .select("*")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        data = result.data or []
+        return data[0] if data else None
+
+    # ─── User Preferences ─────────────────────────────────────────────────────
+
+    async def upsert_user_preferences(self, prefs: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return prefs
+        result = (
+            client.table("user_preferences")
+            .upsert(prefs, on_conflict="user_id")
+            .execute()
+        )
+        return result.data[0] if result.data else prefs
+
+    async def get_user_preferences(self, user_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("user_preferences")
+            .select("*")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        data = result.data or []
+        return data[0] if data else None
+
+    # ─── Enhanced Companies ───────────────────────────────────────────────────
+
+    async def upsert_company(self, company: dict[str, Any]) -> dict:
+        """Upsert a company by domain + user_id."""
+        client = self._get_client()
+        if not client:
+            import uuid as _uuid
+            company.setdefault("id", str(_uuid.uuid4()))
+            return company
+
+        # Strip keys that are not columns to avoid 400 errors
+        safe_keys = {
+            "id", "user_id", "name", "domain", "industry", "size",
+            "relevance_score", "status", "metadata", "logo_url", "description",
+            "mission", "tech_stack", "funding_stage", "founded_year",
+            "hiring_status", "sponsorship_available", "remote_friendly",
+            "open_positions", "recent_news", "culture_tags", "headquarters",
+            "website_url", "linkedin_url", "glassdoor_url", "crunchbase_url",
+            "source", "source_url", "last_scraped_at",
+        }
+        clean = {k: v for k, v in company.items() if k in safe_keys}
+        clean.setdefault("status", "discovered")
+        clean.setdefault("relevance_score", 0.5)
+
+        result = (
+            client.table("companies")
+            .upsert(clean, on_conflict="domain")
+            .execute()
+        )
+        return result.data[0] if result.data else clean
+
+    async def get_companies_for_user(
+        self,
+        user_id: str,
+        limit: int = 50,
+        min_score: float = 0.0,
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("companies")
+            .select("*, company_rankings!inner(*), company_contacts(*)")
+            .eq("company_rankings.user_id", user_id)
+            .gte("company_rankings.match_score", min_score)
+            .order("company_rankings.match_score", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+
+    async def get_company_detail(self, company_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("companies")
+            .select("*, company_contacts(*), discovered_jobs(*)")
+            .eq("id", company_id)
+            .single()
+            .execute()
+        )
+        return result.data
+
+    # ─── Company Rankings ─────────────────────────────────────────────────────
+
+    async def upsert_company_ranking(self, ranking: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return ranking
+        result = (
+            client.table("company_rankings")
+            .upsert(ranking, on_conflict="user_id,company_id")
+            .execute()
+        )
+        return result.data[0] if result.data else ranking
+
+    async def get_company_rankings(
+        self, user_id: str, limit: int = 50
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("company_rankings")
+            .select("*, companies(*)")
+            .eq("user_id", user_id)
+            .order("match_score", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+
+    # ─── Company Contacts ─────────────────────────────────────────────────────
+
+    async def insert_company_contacts(
+        self, company_id: str, contacts: list[dict[str, Any]]
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return contacts
+
+        rows = [{"company_id": company_id, **c} for c in contacts]
+        result = client.table("company_contacts").insert(rows).execute()
+        return result.data or rows
+
+    async def get_company_contacts(self, company_id: str) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("company_contacts")
+            .select("*")
+            .eq("company_id", company_id)
+            .order("confidence", desc=True)
+            .execute()
+        )
+        return result.data or []
+
+    # ─── Discovered Jobs ──────────────────────────────────────────────────────
+
+    async def insert_discovered_jobs(
+        self, company_id: str, jobs: list[dict[str, Any]]
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return jobs
+        rows = [{"company_id": company_id, **j} for j in jobs]
+        result = client.table("discovered_jobs").insert(rows).execute()
+        return result.data or rows
+
+    # ─── AI Agent Runs ────────────────────────────────────────────────────────
+
+    async def insert_agent_run(self, run: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return run
+        result = client.table("ai_agent_runs").insert(run).execute()
+        return result.data[0] if result.data else run
+
+    async def get_agent_runs(
+        self, user_id: str, agent_name: Optional[str] = None, limit: int = 20
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        query = (
+            client.table("ai_agent_runs")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("started_at", desc=True)
+            .limit(limit)
+        )
+        if agent_name:
+            query = query.eq("agent_name", agent_name)
+        result = query.execute()
+        return result.data or []
+
+    # ─── Conversation History ──────────────────────────────────────────────────
+
+    async def insert_conversation_message(
+        self, user_id: str, role: str, content: str, context: str = "preferences"
+    ) -> dict:
+        client = self._get_client()
+        if not client:
+            return {"user_id": user_id, "role": role, "content": content}
+        result = (
+            client.table("conversation_history")
+            .insert({"user_id": user_id, "context": context, "role": role, "content": content})
+            .execute()
+        )
+        return result.data[0] if result.data else {}
+
+    async def get_conversation_history(
+        self, user_id: str, context: str = "preferences", limit: int = 50
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("conversation_history")
+            .select("role, content, created_at")
+            .eq("user_id", user_id)
+            .eq("context", context)
+            .order("created_at")
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+
 
 # Singleton instance
 supabase_client = SupabaseClient()

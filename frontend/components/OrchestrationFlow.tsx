@@ -8,19 +8,19 @@ const steps: OrchestrationStep[] = [
     id: "CompanyFinder",
     label: "Company Finder",
     description: "Discovers relevant companies",
-    status: "completed",
+    status: "pending",
   },
   {
     id: "Personalization",
     label: "Personalization",
     description: "Extracts company insights",
-    status: "completed",
+    status: "pending",
   },
   {
     id: "EmailWriter",
     label: "Email Writer",
     description: "Generates outreach emails",
-    status: "active",
+    status: "pending",
   },
   {
     id: "Review",
