@@ -237,14 +237,25 @@ async def run_agents(request: RunAgentsRequest):
 
             effective_skills = request.skills or resume_skills
 
-            # 1. Company Finder
+            # 1. Company Finder — full pipeline with resume + preferences
             company_agent = CompanyFinderAgent(logger=logger)
-            companies = await company_agent.run(
+            preferences: dict = {}
+            if request.user_id:
+                preferences = await supabase_client.get_user_preferences(request.user_id) or {}
+            # Inject job_title into preferences if not already set
+            if not preferences.get("preferred_roles") and request.job_title:
+                preferences["preferred_roles"] = [request.job_title]
+
+            pipeline_result = await company_agent.run_full_pipeline(
                 task_id=task_id,
-                skills=effective_skills,
-                job_title=request.job_title,
+                user_id=request.user_id or "anonymous",
+                resume_text=resume_text or " ".join(effective_skills),
+                preferences=preferences,
                 count=request.company_count,
             )
+            companies = pipeline_result.get("companies", [])
+            if companies and request.user_id:
+                _user_companies_cache[request.user_id] = companies
 
             # 2. Personalization (per company)
             personalization_agent = PersonalizationAgent(logger=logger)

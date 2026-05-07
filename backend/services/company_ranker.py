@@ -3,29 +3,52 @@ CompanyRankerService — AI-powered weighted scoring to rank companies for a use
 
 Produces a detailed ranking with per-dimension scores, explanation, strengths,
 gaps, and improvement suggestions for each company.
+
+The ranker now integrates with EmbeddingService to add a semantic similarity
+signal that captures profile↔company fit beyond keyword overlap.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
 
 import httpx
 
+# Lazy import of EmbeddingService to avoid circular imports
+_embedding_service_instance = None
+
+
+def _get_embedding_service():
+    global _embedding_service_instance
+    if _embedding_service_instance is None:
+        try:
+            from .embedding_service import EmbeddingService
+        except ImportError:
+            import sys
+            from pathlib import Path
+            sys.path.append(str(Path(__file__).resolve().parent.parent))
+            from backend.services.embedding_service import EmbeddingService
+        _embedding_service_instance = EmbeddingService()
+    return _embedding_service_instance
+
 
 # ─── Scoring Weights ──────────────────────────────────────────────────────────
+# semantic_similarity slot replaces a portion of skills_match weight
 
 WEIGHTS = {
-    "skills_match":        0.23,
-    "interests_match":     0.15,
-    "tech_stack_match":    0.15,
+    "skills_match":        0.18,
+    "interests_match":     0.13,
+    "tech_stack_match":    0.13,
     "hiring_likelihood":   0.15,
     "location_match":      0.10,
-    "compensation_match":  0.07,
+    "compensation_match":  0.06,
     "visa_compatibility":  0.07,
     "resume_match":        0.03,
     "company_size_match":  0.05,
+    "semantic_similarity": 0.10,
 }
 
 assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-6, "Weights must sum to 1.0"
@@ -150,6 +173,9 @@ class CompanyRankerService:
         """
         Score and rank companies. Returns list sorted by match_score descending.
         Each company gains a `ranking` key with scores + explanation.
+
+        Now includes semantic_similarity computed via OpenAI embeddings when
+        an API key is available (gracefully falls back to 0.5 when not).
         """
         if not companies:
             return []
@@ -159,6 +185,21 @@ class CompanyRankerService:
         preferred_roles = preferences.get("preferred_roles", [])
         preferred_tech = preferences.get("preferred_tech_stack", []) or profile.get("tech_stack", [])
         industries_of_interest = preferences.get("industries_of_interest", [])
+
+        # ── Compute profile embedding once for all companies ──────────────────
+        semantic_scores: dict[str, float] = {}
+        try:
+            emb_svc = _get_embedding_service()
+            profile_emb = await emb_svc.create_profile_embedding(profile, preferences)
+            if any(profile_emb):
+                # Batch company text → embeddings concurrently
+                company_texts = [emb_svc._company_text(c) for c in companies]
+                company_embs = await emb_svc.create_batch_embeddings(company_texts)
+                for company, c_emb in zip(companies, company_embs):
+                    domain = (company.get("domain") or "").lower()
+                    semantic_scores[domain] = emb_svc.cosine_similarity(profile_emb, c_emb)
+        except Exception:
+            pass  # Semantic scoring is best-effort
 
         ranked = []
         for company in companies:
@@ -192,6 +233,10 @@ class CompanyRankerService:
             )
             resume_match = _list_overlap_score(resume_keywords, company_text_tokens)
 
+            # Semantic similarity from embeddings (0.5 neutral when unavailable)
+            domain = (company.get("domain") or "").lower()
+            semantic_similarity = semantic_scores.get(domain, 0.5)
+
             # Weighted final score
             match_score = (
                 WEIGHTS["skills_match"] * skills_match
@@ -203,6 +248,7 @@ class CompanyRankerService:
                 + WEIGHTS["visa_compatibility"] * visa_compatibility
                 + WEIGHTS["resume_match"] * resume_match
                 + WEIGHTS["company_size_match"] * company_size_match
+                + WEIGHTS["semantic_similarity"] * semantic_similarity
             )
 
             ranking = {
@@ -216,15 +262,19 @@ class CompanyRankerService:
                 "visa_compatibility": round(visa_compatibility, 3),
                 "hiring_likelihood": round(hiring_likelihood, 3),
                 "company_size_match": round(company_size_match, 3),
+                "semantic_similarity": round(semantic_similarity, 3),
                 "match_explanation": "",
                 "strengths": [],
                 "gaps": [],
                 "suggestions": [],
+                "signal_source": "embedding+keywords" if any(semantic_scores.values()) else "keywords",
             }
 
             # Build human-readable strengths and gaps
             if skills_match >= 0.6:
                 ranking["strengths"].append("Strong tech stack alignment")
+            if semantic_similarity >= 0.70:
+                ranking["strengths"].append("High semantic profile match")
             if hiring_likelihood >= 0.8:
                 ranking["strengths"].append("Actively hiring")
             if location_match >= 0.9:
@@ -251,6 +301,23 @@ class CompanyRankerService:
             ranked.append(company)
 
         ranked.sort(key=lambda c: c["ranking"]["match_score"], reverse=True)
+
+        # Drop companies that are clearly irrelevant to the candidate.
+        # Only prune when there are more results than needed, so we don't
+        # accidentally return an empty list when discovery is sparse.
+        has_industry_prefs = bool(
+            preferences.get("preferred_roles")
+            or preferences.get("industries_of_interest")
+            or profile.get("preferred_domains")
+        )
+        if has_industry_prefs and len(ranked) > 5:
+            ranked = [
+                c for c in ranked
+                if not (
+                    c["ranking"]["interests_match"] < 0.05
+                    and c["ranking"]["match_score"] < 0.45
+                )
+            ]
 
         # Enrich top 15 with AI explanations (batch for efficiency)
         if enrich_with_ai and self._api_key:

@@ -1,12 +1,17 @@
 """
-CompanyDiscoveryService — Multi-source company discovery engine.
+CompanyDiscoveryService — Multi-source company intelligence discovery engine.
 
-Sources:
-1. Hacker News "Who's Hiring" thread (free, via Algolia HN API)
-2. RemoteOK public API (free)
-3. YC Companies directory (public scrape)
-4. GitHub organization search (public API, no auth required for basic search)
-5. AI-powered discovery based on user profile
+Sources (via pluggable CompanySource connectors):
+1. Hacker News "Who's Hiring" thread (Algolia API)
+2. RemoteOK public API
+3. Work at a Startup (YC job board)
+4. Wellfound / AngelList
+5. YCombinator company directory (Algolia API)
+6. AI-powered discovery (GPT)
+
+Pipeline:
+  query_expansion → parallel source search → dedup → quality check →
+  optional second pass → priority sort → return top N
 """
 
 from __future__ import annotations
@@ -21,6 +26,31 @@ from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+
+# ─── New service imports ───────────────────────────────────────────────────────
+try:
+    from .query_expansion import QueryExpansionService
+    from .company_sources import (
+        HackerNewsSource,
+        RemoteOKSource,
+        WorkAtAStartupSource,
+        WellfoundSource,
+        YCCompaniesSource,
+        AIDiscoverySource,
+    )
+except ImportError:
+    import sys
+    from pathlib import Path
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from backend.services.query_expansion import QueryExpansionService
+    from backend.services.company_sources import (
+        HackerNewsSource,
+        RemoteOKSource,
+        WorkAtAStartupSource,
+        WellfoundSource,
+        YCCompaniesSource,
+        AIDiscoverySource,
+    )
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -112,13 +142,32 @@ def _startup_priority_score(company: dict[str, Any]) -> tuple[float, float]:
 
 class CompanyDiscoveryService:
     """
-    Discovers companies from multiple sources and returns deduplicated results.
+    Multi-source company intelligence discovery engine.
+
+    Orchestrates pluggable CompanySource connectors, AI query expansion,
+    deduplication, and an iterative feedback loop to ensure quality and
+    diversity of results.
     """
+
+    # Quality thresholds for the feedback loop
+    _MIN_DIVERSITY_SOURCES = 3      # At least N distinct sources represented
+    _MIN_COMPANIES = 10             # Re-search if fewer than N unique companies found
+    _MAX_FEEDBACK_ROUNDS = 1        # How many additional search rounds to run
 
     def __init__(self) -> None:
         self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self._github_token = os.getenv("GITHUB_TOKEN", "")
+        # Service dependencies
+        self._query_expander = QueryExpansionService()
+        self._sources: list = [
+            HackerNewsSource(),
+            RemoteOKSource(),
+            WorkAtAStartupSource(),
+            WellfoundSource(),
+            YCCompaniesSource(),
+            AIDiscoverySource(api_key=self._api_key, model=self._model),
+        ]
 
     async def discover(
         self,
@@ -128,46 +177,234 @@ class CompanyDiscoveryService:
         progress_callback: Any = None,
     ) -> list[dict[str, Any]]:
         """
-        Run all discovery sources in parallel and return deduplicated companies.
+        Discover companies via multi-source parallel search with query expansion
+        and an iterative feedback loop.
 
-        progress_callback: async callable(source_name, message)
+        Args:
+            profile:           Parsed resume profile.
+            preferences:       User job preferences.
+            target_count:      Target number of unique companies to return.
+            progress_callback: async callable(source_name, message) for SSE.
+
+        Returns:
+            Deduplicated, priority-sorted list of company dicts.
         """
-        tasks = [
-            self._discover_from_hn(profile, preferences),
-            self._discover_from_remoteok(profile, preferences),
-            self._discover_from_workatastartup(profile, preferences),
-            self._discover_from_wellfound(profile, preferences),
-            self._discover_from_yc(profile, preferences),
-            self._discover_via_ai(profile, preferences, target_count),
+        # ── Phase 1: Expand queries ───────────────────────────────────────────
+        if progress_callback:
+            await progress_callback("QueryExpansion", "Expanding search queries with AI...")
+        try:
+            queries = await self._query_expander.expand_queries(profile, preferences)
+        except Exception:
+            queries = self._query_expander._base_queries(profile, preferences)
+
+        if progress_callback:
+            await progress_callback(
+                "QueryExpansion",
+                f"Generated {len(queries)} search queries: {', '.join(queries[:5])}{'...' if len(queries) > 5 else ''}",
+            )
+
+        # ── Phase 2: Run all sources in parallel ──────────────────────────────
+        if progress_callback:
+            await progress_callback(
+                "Discovery",
+                "Searching Hacker News, RemoteOK, Work at a Startup, Wellfound, YC, and AI sources...",
+            )
+        companies = await self._run_all_sources(profile, preferences, queries, progress_callback)
+
+        # ── Phase 3: Dedup ────────────────────────────────────────────────────
+        companies = self._deduplicate(companies)
+        if progress_callback:
+            await progress_callback("Discovery", f"Deduplicated to {len(companies)} unique companies")
+
+        # ── Phase 4: Feedback loop (second pass if quality is low) ────────────
+        companies = await self._feedback_loop(
+            companies, profile, preferences, queries, target_count, progress_callback
+        )
+
+        # ── Phase 4.5: Filter clearly irrelevant industries ───────────────────
+        companies = self._filter_industry_mismatch(companies, profile, preferences)
+
+        # ── Phase 5: Sort by startup priority + relevance ─────────────────────
+        companies.sort(key=_startup_priority_score, reverse=True)
+        return companies[:target_count]
+
+    # ─── Internal Pipeline Helpers ────────────────────────────────────────────
+
+    # ── Industry exclusion lists ──────────────────────────────────────────────
+    _TECH_INDICATORS = {
+        "software", "developer", "engineer", "ml", "ai", "data", "cloud",
+        "devops", "backend", "frontend", "fullstack", "full-stack", "saas",
+        "platform", "infrastructure", "security", "cybersecurity", "fintech",
+        "edtech", "healthtech", "deep learning", "machine learning",
+    }
+
+    # Industries that are unambiguously non-tech when user is targeting tech roles
+    _OFF_DOMAIN_INDUSTRIES = {
+        "travel", "hospitality", "hotel", "tourism", "restaurant", "food service",
+        "retail", "fashion", "apparel", "beauty", "cosmetics",
+        "construction", "real estate", "property",
+        "transportation", "logistics", "trucking", "freight",
+        "agriculture", "farming",
+        "manufacturing", "automotive",
+        "staffing", "recruitment", "temp agency",
+    }
+
+    def _filter_industry_mismatch(
+        self,
+        companies: list[dict[str, Any]],
+        profile: dict[str, Any],
+        preferences: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Remove companies in clearly unrelated industries when the user has
+        explicit tech/software role preferences.
+
+        Only activates when the user's target roles/skills indicate a tech background;
+        otherwise returns companies unchanged to avoid over-filtering.
+        """
+        all_roles = [
+            r.lower()
+            for r in (
+                preferences.get("preferred_roles", [])
+                + profile.get("preferred_domains", [])
+                + profile.get("skills", [])[:5]
+            )
+        ]
+        industries_pref = [
+            i.lower() for i in preferences.get("industries_of_interest", [])
         ]
 
-        if progress_callback:
-            await progress_callback("Discovery", "Searching Hacker News, RemoteOK, Work at a Startup, Wellfound, YC, and AI sources...")
+        # Only apply if user has clear tech signals
+        user_is_tech = any(
+            ind in " ".join(all_roles) for ind in self._TECH_INDICATORS
+        ) or any(ind in " ".join(industries_pref) for ind in self._TECH_INDICATORS)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if not user_is_tech:
+            return companies
 
+        filtered: list[dict[str, Any]] = []
+        for company in companies:
+            industry = (company.get("industry") or "").lower()
+            name = (company.get("name") or "").lower()
+            culture_tags = [t.lower() for t in company.get("culture_tags", [])]
+
+            # If the company explicitly opts into tech, keep it regardless
+            company_text = f"{industry} {name} {' '.join(culture_tags)}"
+            if any(ind in company_text for ind in self._TECH_INDICATORS):
+                filtered.append(company)
+                continue
+
+            # Reject companies whose industry is unambiguously off-domain
+            if any(off in company_text for off in self._OFF_DOMAIN_INDUSTRIES):
+                continue
+
+            # Keep anything else (industry unknown / neutral)
+            filtered.append(company)
+
+        return filtered
+
+    async def _run_all_sources(
+        self,
+        profile: dict[str, Any],
+        preferences: dict[str, Any],
+        queries: list[str],
+        progress_callback: Any,
+    ) -> list[dict[str, Any]]:
+        """
+        Run all CompanySource connectors in parallel with individual timeouts.
+        Each source gets a dedicated progress callback so SSE updates are per-source.
+        """
+        async def _run_source(source) -> list[dict[str, Any]]:
+            try:
+                return await asyncio.wait_for(
+                    source.search(profile, preferences, queries, progress_callback),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                if progress_callback:
+                    await progress_callback(source.SOURCE_NAME, f"{source.SOURCE_NAME} timed out")
+                return []
+            except Exception:
+                return []
+
+        results = await asyncio.gather(*[_run_source(s) for s in self._sources])
         all_companies: list[dict[str, Any]] = []
-        source_names = ["HackerNews", "RemoteOK", "WorkAtAStartup", "Wellfound", "YCombinator", "AI Discovery"]
-        for source_name, result in zip(source_names, results):
-            if isinstance(result, list):
+        for source, result in zip(self._sources, results):
+            if result:
                 all_companies.extend(result)
                 if progress_callback:
-                    await progress_callback(source_name, f"Found {len(result)} companies from {source_name}")
+                    await progress_callback(
+                        source.SOURCE_NAME,
+                        f"{source.SOURCE_NAME}: +{len(result)} companies",
+                    )
+        return all_companies
 
-        # Deduplicate by domain (case-insensitive)
-        seen_domains: set[str] = set()
+    async def _feedback_loop(
+        self,
+        companies: list[dict[str, Any]],
+        profile: dict[str, Any],
+        preferences: dict[str, Any],
+        base_queries: list[str],
+        target_count: int,
+        progress_callback: Any,
+    ) -> list[dict[str, Any]]:
+        """
+        Iterative quality improvement: if results are sparse or lack diversity,
+        run additional passes with expanded queries.
+        """
+        sources_present = len({c.get("source", "") for c in companies})
+
+        if (
+            len(companies) >= self._MIN_COMPANIES
+            and sources_present >= self._MIN_DIVERSITY_SOURCES
+        ):
+            return companies  # Quality is good, skip feedback rounds
+
+        for round_num in range(self._MAX_FEEDBACK_ROUNDS):
+            if len(companies) >= target_count:
+                break
+
+            if progress_callback:
+                await progress_callback(
+                    "Discovery",
+                    f"Quality check: {len(companies)} companies from {sources_present} sources. "
+                    f"Running additional discovery pass ({round_num + 1}/{self._MAX_FEEDBACK_ROUNDS})...",
+                )
+
+            # Use the AI source with more variation on the second pass
+            try:
+                ai_source = AIDiscoverySource(api_key=self._api_key, model=self._model)
+                additional = await asyncio.wait_for(
+                    ai_source.search(
+                        profile, preferences, base_queries[3:] + base_queries[:3],  # shifted queries
+                        progress_callback, count=target_count - len(companies) + 5
+                    ),
+                    timeout=45.0,
+                )
+                companies.extend(additional)
+                companies = self._deduplicate(companies)
+            except Exception:
+                break
+
+        return companies
+
+    @staticmethod
+    def _deduplicate(companies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove duplicate companies by domain (case-insensitive)."""
+        seen: set[str] = set()
         unique: list[dict[str, Any]] = []
-        for company in all_companies:
-            domain_key = company.get("domain", "").lower()
-            if domain_key and domain_key not in seen_domains:
-                seen_domains.add(domain_key)
+        for company in companies:
+            domain = (company.get("domain") or "").lower().strip()
+            if domain and domain not in seen:
+                seen.add(domain)
                 unique.append(company)
-
-        if progress_callback:
-            await progress_callback("Discovery", f"Deduplicated to {len(unique)} unique companies")
-
-        unique.sort(key=_startup_priority_score, reverse=True)
-        return unique[:target_count]
+            elif not domain:
+                # No domain — use name as dedup key
+                name_key = (company.get("name") or "").lower().strip()
+                if name_key and name_key not in seen:
+                    seen.add(name_key)
+                    unique.append(company)
+        return unique
 
     async def profile_company_website(self, website_url: str) -> dict[str, Any]:
         """Build a company profile from a user-supplied company website."""

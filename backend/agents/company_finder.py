@@ -4,10 +4,12 @@ CompanyFinderAgent — Full production orchestrator for company discovery.
 Orchestrates:
 1. Resume parsing (if not already done)
 2. Preference collection (conversational)
-3. Multi-source company discovery (HN, RemoteOK, YC, AI)
-4. Company ranking + scoring
-5. Contact discovery per company
-6. Persistence to Supabase
+3. AI query expansion
+4. Multi-source company discovery (HN, RemoteOK, YC, Wellfound, WorkAtAStartup, AI)
+5. Company enrichment (GitHub signals, hiring velocity, tech stack)
+6. Intelligent ranking with semantic embeddings
+7. Contact discovery per company
+8. Persistence to Supabase
 
 All steps emit real-time events via AgentEventLogger.
 """
@@ -27,6 +29,8 @@ try:
     from ..services.preference_collector import PreferenceCollectorService
     from ..services.company_discovery import CompanyDiscoveryService
     from ..services.company_ranker import CompanyRankerService
+    from ..services.company_enrichment import CompanyEnrichmentService
+    from ..services.company_scoring import CompanyScoringService
     from ..services.contact_finder import ContactFinderService
     from ..db.supabase import supabase_client
 except ImportError:
@@ -36,6 +40,8 @@ except ImportError:
     from backend.services.preference_collector import PreferenceCollectorService
     from backend.services.company_discovery import CompanyDiscoveryService
     from backend.services.company_ranker import CompanyRankerService
+    from backend.services.company_enrichment import CompanyEnrichmentService
+    from backend.services.company_scoring import CompanyScoringService
     from backend.services.contact_finder import ContactFinderService
     from backend.db.supabase import supabase_client
 
@@ -58,6 +64,8 @@ class CompanyFinderAgent:
         self._preference_collector = PreferenceCollectorService()
         self._discovery = CompanyDiscoveryService()
         self._ranker = CompanyRankerService()
+        self._enricher = CompanyEnrichmentService()
+        self._scorer = CompanyScoringService()
         self._contact_finder = ContactFinderService()
 
     # ─── Public Entry Points ──────────────────────────────────────────────────
@@ -272,12 +280,23 @@ class CompanyFinderAgent:
         preferences: dict[str, Any],
         count: int,
     ) -> list[dict[str, Any]]:
+        """
+        Full discovery pipeline:
+          1. Query expansion
+          2. Multi-source parallel discovery
+          3. Company enrichment (top N, non-blocking)
+          4. Semantic + weighted ranking
+          5. Extended scoring (growth, funding recency, AI adoption)
+        """
         async def progress_cb(source: str, message: str) -> None:
             await self._emit("running", task_id, message, {"source": source})
 
-        await self._emit("running", task_id,
-            "Searching across HackerNews, RemoteOK, Work at a Startup, Wellfound, YCombinator, and AI-powered discovery...")
+        await self._emit(
+            "running", task_id,
+            "Expanding search queries with AI and searching across all sources...",
+        )
 
+        # ── Multi-source discovery with query expansion + feedback loop ────────
         companies = await self._discovery.discover(
             profile=profile,
             preferences=preferences,
@@ -285,14 +304,76 @@ class CompanyFinderAgent:
             progress_callback=progress_cb,
         )
 
-        await self._emit("running", task_id,
-            f"Ranking {len(companies)} companies by match score...")
+        await self._emit(
+            "running", task_id,
+            f"Discovered {len(companies)} unique companies — starting enrichment...",
+            {"discovered_count": len(companies)},
+        )
+
+        # ── Enrich top companies with hiring signals + GitHub stats ────────────
+        enriched_count = min(len(companies), 20)
+        try:
+            companies = await self._enricher.batch_enrich(
+                companies, profile=profile, max_concurrent=5, top_n=enriched_count
+            )
+            await self._emit(
+                "running", task_id,
+                f"Enriched top {enriched_count} companies with hiring signals and tech data",
+                {"enriched_count": enriched_count},
+            )
+        except Exception as exc:
+            await self._emit("running", task_id, f"Enrichment partial: {exc}")
+
+        # ── Semantic + weighted ranking ────────────────────────────────────────
+        await self._emit(
+            "running", task_id,
+            f"Ranking {len(companies)} companies using semantic embeddings + {len(profile.get('skills', []))} skill signals...",
+        )
 
         companies = await self._ranker.rank(
             companies=companies,
             profile=profile,
             preferences=preferences,
         )
+
+        # ── Extended scoring (growth velocity, funding recency) ────────────────
+        # Build map of base signal scores for the extended scorer
+        base_rankings = {
+            (c.get("domain") or "").lower(): c.get("ranking", {})
+            for c in companies
+        }
+        semantic_scores = {
+            (c.get("domain") or "").lower(): c.get("ranking", {}).get("semantic_similarity", 0.5)
+            for c in companies
+        }
+
+        companies = self._scorer.score_companies(
+            companies=companies,
+            profile=profile,
+            preferences=preferences,
+            semantic_scores=semantic_scores,
+            base_rankings=base_rankings,
+        )
+
+        # Emit ranking transparency for top 3
+        top3 = companies[:3]
+        for company in top3:
+            ext = company.get("extended_ranking", {})
+            strengths = ext.get("strengths", [])
+            score = ext.get("weighted_total", company.get("relevance_score", 0))
+            await self._emit(
+                "running", task_id,
+                f"Ranked: {company.get('name', '?')} — score {score:.2f} "
+                f"({', '.join(strengths[:2]) if strengths else 'no strong signals'})",
+                {
+                    "source": "Ranking",
+                    "company": company.get("name"),
+                    "score": score,
+                    "strengths": strengths[:3],
+                    "semantic_similarity": ext.get("semantic_similarity", 0),
+                    "growth_velocity": ext.get("growth_velocity", 0),
+                },
+            )
 
         return companies
 
