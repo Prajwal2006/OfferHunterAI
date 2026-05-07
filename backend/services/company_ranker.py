@@ -17,14 +17,15 @@ import httpx
 # ─── Scoring Weights ──────────────────────────────────────────────────────────
 
 WEIGHTS = {
-    "skills_match":        0.25,
+    "skills_match":        0.23,
     "interests_match":     0.15,
     "tech_stack_match":    0.15,
     "hiring_likelihood":   0.15,
     "location_match":      0.10,
-    "compensation_match":  0.08,
+    "compensation_match":  0.07,
     "visa_compatibility":  0.07,
-    "resume_match":        0.05,
+    "resume_match":        0.03,
+    "company_size_match":  0.05,
 }
 
 assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-6, "Weights must sum to 1.0"
@@ -82,7 +83,21 @@ def _score_location(company: dict[str, Any], prefs: dict[str, Any]) -> float:
 def _score_company_size(company: dict[str, Any], prefs: dict[str, Any]) -> float:
     size_prefs = prefs.get("company_size_pref", [])
     company_size = company.get("size", "")
-    if not size_prefs or not company_size:
+    if not company_size:
+        return 0.7
+
+    if not size_prefs:
+        size_lower = company_size.lower()
+        if any(x in size_lower for x in ["<50", "1-10", "10-50", "11-50", "seed", "pre-seed"]):
+            return 1.0
+        if any(x in size_lower for x in ["50-200", "51-200", "small"]):
+            return 0.9
+        if any(x in size_lower for x in ["200-1000", "201-1000", "mid"]):
+            return 0.7
+        if any(x in size_lower for x in ["1000-5000", "1001-5000", "large"]):
+            return 0.45
+        if "5000" in size_lower or "enterprise" in size_lower:
+            return 0.3
         return 0.7
 
     size_lower = company_size.lower()
@@ -161,6 +176,7 @@ class CompanyRankerService:
             hiring_likelihood = _score_hiring_likelihood(company)
             location_match = _score_location(company, preferences)
             visa_compatibility = _score_visa(company, preferences)
+            company_size_match = _score_company_size(company, preferences)
 
             # Compensation: rough heuristic based on company size/stage
             salary_min = preferences.get("salary_min") or 0
@@ -186,6 +202,7 @@ class CompanyRankerService:
                 + WEIGHTS["compensation_match"] * compensation_match
                 + WEIGHTS["visa_compatibility"] * visa_compatibility
                 + WEIGHTS["resume_match"] * resume_match
+                + WEIGHTS["company_size_match"] * company_size_match
             )
 
             ranking = {
@@ -198,6 +215,7 @@ class CompanyRankerService:
                 "tech_stack_match": round(tech_stack_match, 3),
                 "visa_compatibility": round(visa_compatibility, 3),
                 "hiring_likelihood": round(hiring_likelihood, 3),
+                "company_size_match": round(company_size_match, 3),
                 "match_explanation": "",
                 "strengths": [],
                 "gaps": [],
@@ -215,6 +233,8 @@ class CompanyRankerService:
                 ranking["strengths"].append("Likely sponsors visas")
             if interests_match >= 0.6:
                 ranking["strengths"].append("Industry/domain match")
+            if company_size_match >= 0.85:
+                ranking["strengths"].append("Smaller-company opportunity match")
 
             if skills_match < 0.3:
                 ranking["gaps"].append("Limited tech stack overlap")

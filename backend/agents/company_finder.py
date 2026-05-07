@@ -228,6 +228,37 @@ class CompanyFinderAgent:
 
         return result
 
+    async def add_manual_company(
+        self,
+        task_id: str,
+        user_id: str,
+        website_url: str,
+        profile: dict[str, Any],
+        preferences: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Build a company profile from a user-supplied website, rank it for the user,
+        discover contacts, and persist it so the normal handoff flow can use it.
+        """
+        await self._emit("started", task_id, f"Profiling company website {website_url}")
+        await self._emit("running", task_id, "Scraping company website and extracting profile...")
+
+        company = await self._discovery.profile_company_website(website_url)
+
+        await self._emit("running", task_id, f"Ranking {company.get('name', 'company')} against your profile...")
+        ranked = await self._ranker.rank([company], profile=profile, preferences=preferences)
+        ranked = await self._run_contact_discovery(task_id, ranked)
+        ranked = await self._persist_companies(task_id, user_id, ranked)
+
+        result = ranked[0]
+        await self._emit(
+            "completed",
+            task_id,
+            f"Added {result.get('name', 'company')} to your company list",
+            {"companies": [result], "total": 1},
+        )
+        return result
+
     def get_preference_opener(self, profile: dict[str, Any]) -> str:
         """Return the initial preference collection message for a user."""
         return self._preference_collector.get_initial_message(profile)
@@ -245,7 +276,7 @@ class CompanyFinderAgent:
             await self._emit("running", task_id, message, {"source": source})
 
         await self._emit("running", task_id,
-            "Searching across HackerNews, RemoteOK, YCombinator, and AI-powered discovery...")
+            "Searching across HackerNews, RemoteOK, Work at a Startup, Wellfound, YCombinator, and AI-powered discovery...")
 
         companies = await self._discovery.discover(
             profile=profile,

@@ -177,6 +177,43 @@ export async function fetchCompanyDetail(companyId: string) {
   return res.json() as Promise<{ company: import("./types").Company }>;
 }
 
+export async function addManualCompany(payload: {
+  user_id: string;
+  website_url: string;
+}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 90_000); // 90 s — scraping 4 pages at 15s each
+  try {
+    const res = await fetch(`${API_URL}/company-finder/companies/manual`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      let detail = "Failed to add company";
+      try {
+        const data = await res.json();
+        detail = data.detail || detail;
+      } catch {
+        // keep fallback message
+      }
+      throw new Error(detail);
+    }
+    return res.json() as Promise<{ company: import("./types").Company; task_id: string }>;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("Request timed out. The site may be slow — try again.");
+    }
+    if (err instanceof TypeError && err.message === "Failed to fetch") {
+      throw new Error("Could not reach the backend. Is the server running?");
+    }
+    throw err;
+  }
+}
+
 export async function handoffToAgent(
   companyId: string,
   targetAgent: string,

@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   CheckCircle2,
@@ -197,6 +197,7 @@ function OptionButton({
 }) {
   return (
     <motion.button
+      type="button"
       whileTap={{ scale: 0.97 }}
       onClick={onClick}
       className={`flex items-center gap-2 px-4 py-2.5 rounded-xl border text-sm font-medium transition-all ${
@@ -228,6 +229,7 @@ function PrioritySlider({
         {[1, 2, 3, 4, 5].map((n) => (
           <button
             key={n}
+            type="button"
             onClick={() => onChange(n)}
             className={`w-8 h-8 rounded-lg border text-xs font-bold transition-all ${
               n <= value
@@ -266,15 +268,10 @@ export default function PreferenceWizard({
   const [answers, setAnswers] = useState<Record<string, Answer>>({});
   const [otherInputs, setOtherInputs] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
 
   const step = stepIndex >= 0 ? STEPS[stepIndex] : null;
   const isLast = stepIndex === STEPS.length - 1;
   const progress = stepIndex < 0 ? 0 : Math.round(((stepIndex + 1) / STEPS.length) * 100);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [stepIndex]);
 
   // â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -546,6 +543,7 @@ export default function PreferenceWizard({
                         className="flex-1 bg-muted border border-border rounded-xl px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none transition-colors"
                       />
                       <button
+                        type="button"
                         onClick={() => addOther(step.id)}
                         className="px-3 py-2 rounded-xl border border-border text-sm hover:bg-muted transition-colors"
                       >
@@ -660,12 +658,12 @@ export default function PreferenceWizard({
             </motion.div>
           ) : null}
         </AnimatePresence>
-        <div ref={bottomRef} />
       </div>
 
       {/* Navigation footer */}
       <div className="px-5 py-4 border-t border-border flex items-center justify-between gap-3">
         <button
+          type="button"
           onClick={handleBack}
           disabled={stepIndex === -1}
           className="flex items-center gap-1.5 px-3 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-30 transition-all"
@@ -681,6 +679,7 @@ export default function PreferenceWizard({
         </div>
 
         <button
+          type="button"
           onClick={handleNext}
           disabled={!canProceed() || saving}
           className="flex items-center gap-2 px-5 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-40 transition-all"

@@ -63,6 +63,7 @@ export interface CompanyRanking {
   tech_stack_match: number;
   visa_compatibility: number;
   hiring_likelihood: number;
+  company_size_match?: number;
   match_explanation: string;
   strengths: string[];
   gaps: string[];

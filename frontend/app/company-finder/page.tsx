@@ -27,6 +27,7 @@ import {
   runCompanyFinder,
   fetchResumes,
   handoffToAgent,
+  addManualCompany,
 } from "@/lib/api";
 import {
   Company,
@@ -220,6 +221,9 @@ function CompanyFinderContent() {
     minScore: 0,
   });
   const [showPrefsPane, setShowPrefsPane] = useState(false);
+  const [manualWebsiteUrl, setManualWebsiteUrl] = useState("");
+  const [manualCompanyError, setManualCompanyError] = useState<string | null>(null);
+  const [manualCompanyLoading, setManualCompanyLoading] = useState(false);
   const esRef = useRef<EventSource | null>(null);
 
   // ── Initial load ────────────────────────────────────────────────────────────
@@ -356,6 +360,32 @@ function CompanyFinderContent() {
     [userId]
   );
 
+  const onAddManualCompany = useCallback(async () => {
+    const websiteUrl = manualWebsiteUrl.trim();
+    if (!websiteUrl) return;
+
+    setManualCompanyLoading(true);
+    setManualCompanyError(null);
+    try {
+      const result = await addManualCompany({ user_id: userId, website_url: websiteUrl });
+      setCompanies((prev) => {
+        const deduped = prev.filter(
+          (company) =>
+            company.id !== result.company.id &&
+            company.domain.toLowerCase() !== result.company.domain.toLowerCase()
+        );
+        return [result.company, ...deduped];
+      });
+      setManualWebsiteUrl("");
+      setSelectedCompany(result.company);
+      setStep("results");
+    } catch (err) {
+      setManualCompanyError(err instanceof Error ? err.message : "Failed to add company");
+    } finally {
+      setManualCompanyLoading(false);
+    }
+  }, [manualWebsiteUrl, userId]);
+
   // ── Filter companies ───────────────────────────────────────────────────────
   const filteredCompanies = companies.filter((c) => {
     if (filters.search) {
@@ -491,7 +521,7 @@ function CompanyFinderContent() {
             Discovering Companies For You
           </h2>
           <p className="text-sm text-muted-foreground">
-            Scanning HackerNews, RemoteOK, YCombinator, and more...
+            Scanning HackerNews, RemoteOK, Work at a Startup, Wellfound, YCombinator, and more...
           </p>
         </motion.div>
 
@@ -574,6 +604,53 @@ function CompanyFinderContent() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      <div className="glass border border-border rounded-2xl p-4 sm:p-5 space-y-3">
+        <div className="flex flex-col gap-1">
+          <h3 className="text-sm font-semibold text-foreground">Add A Company Yourself</h3>
+          <p className="text-xs text-muted-foreground max-w-3xl">
+            Paste a company homepage or careers URL. The bot will scrape the site, build a company profile,
+            rank it against your resume and preferences, and make it available for email drafting like any
+            discovered company.
+          </p>
+        </div>
+        <div className="flex flex-col sm:flex-row gap-3">
+          <input
+            type="url"
+            value={manualWebsiteUrl}
+            onChange={(e) => setManualWebsiteUrl(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void onAddManualCompany();
+              }
+            }}
+            placeholder="https://company.com or https://company.com/careers"
+            className="flex-1 px-4 py-2.5 bg-muted border border-border rounded-xl text-sm text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none transition-colors"
+          />
+          <button
+            type="button"
+            onClick={() => void onAddManualCompany()}
+            disabled={!manualWebsiteUrl.trim() || manualCompanyLoading}
+            className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {manualCompanyLoading ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Scraping...
+              </>
+            ) : (
+              <>
+                <Building2 className="w-4 h-4" />
+                Add Company
+              </>
+            )}
+          </button>
+        </div>
+        {manualCompanyError && (
+          <p className="text-xs text-destructive">{manualCompanyError}</p>
+        )}
+      </div>
 
       {/* Filter bar */}
       <FilterBar

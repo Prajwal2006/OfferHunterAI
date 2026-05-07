@@ -17,7 +17,7 @@ import os
 import re
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -29,6 +29,8 @@ HN_ALGOLIA_URL = "https://hn.algolia.com/api/v1/search"
 REMOTEOK_URL = "https://remoteok.com/api"
 YC_COMPANIES_URL = "https://www.ycombinator.com/companies"
 GITHUB_API_URL = "https://api.github.com"
+WELLFOUND_JOBS_URL = "https://wellfound.com/jobs"
+WORK_AT_A_STARTUP_URL = "https://www.workatastartup.com/jobs"
 
 DEFAULT_HEADERS = {
     "User-Agent": "OfferHunterAI/1.0 (job-discovery-bot; contact: support@offerhunterai.com)",
@@ -47,6 +49,14 @@ def _slugify_domain(company_name: str) -> str:
 def _extract_domain_from_url(url: str) -> str:
     match = re.search(r"(?:https?://)?(?:www\.)?([^/\s]+)", url or "")
     return match.group(1) if match else ""
+
+
+def _normalize_url(url: str) -> str:
+    if not url:
+        return ""
+    if url.startswith(("http://", "https://")):
+        return url
+    return f"https://{url}"
 
 
 def _normalize_company(raw: dict[str, Any], source: str) -> dict[str, Any]:
@@ -76,6 +86,28 @@ def _normalize_company(raw: dict[str, Any], source: str) -> dict[str, Any]:
     }
 
 
+def _startup_priority_score(company: dict[str, Any]) -> tuple[float, float]:
+    size = (company.get("size") or "").lower()
+    stage = (company.get("funding_stage") or "").lower()
+    source = (company.get("source") or "").lower()
+
+    score = 0.0
+    if any(token in size for token in ["<50", "1-10", "10-50", "11-50", "50-200", "51-200", "small"]):
+        score += 1.2
+    elif any(token in size for token in ["200-1000", "201-1000", "mid"]):
+        score += 0.6
+    elif any(token in size for token in ["1000", "5000", "enterprise"]):
+        score += 0.1
+
+    if any(token in stage for token in ["pre-seed", "seed", "series a", "yc", "series b"]):
+        score += 0.8
+
+    if source in {"wellfound", "workatastartup", "hackernews"}:
+        score += 0.5
+
+    return (score, float(company.get("relevance_score", 0.5) or 0.5))
+
+
 # ─── Service ──────────────────────────────────────────────────────────────────
 
 class CompanyDiscoveryService:
@@ -103,17 +135,19 @@ class CompanyDiscoveryService:
         tasks = [
             self._discover_from_hn(profile, preferences),
             self._discover_from_remoteok(profile, preferences),
+            self._discover_from_workatastartup(profile, preferences),
+            self._discover_from_wellfound(profile, preferences),
             self._discover_from_yc(profile, preferences),
             self._discover_via_ai(profile, preferences, target_count),
         ]
 
         if progress_callback:
-            await progress_callback("Discovery", "Searching Hacker News, RemoteOK, YC, and AI sources...")
+            await progress_callback("Discovery", "Searching Hacker News, RemoteOK, Work at a Startup, Wellfound, YC, and AI sources...")
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_companies: list[dict[str, Any]] = []
-        source_names = ["HackerNews", "RemoteOK", "YCombinator", "AI Discovery"]
+        source_names = ["HackerNews", "RemoteOK", "WorkAtAStartup", "Wellfound", "YCombinator", "AI Discovery"]
         for source_name, result in zip(source_names, results):
             if isinstance(result, list):
                 all_companies.extend(result)
@@ -132,7 +166,109 @@ class CompanyDiscoveryService:
         if progress_callback:
             await progress_callback("Discovery", f"Deduplicated to {len(unique)} unique companies")
 
+        unique.sort(key=_startup_priority_score, reverse=True)
         return unique[:target_count]
+
+    async def profile_company_website(self, website_url: str) -> dict[str, Any]:
+        """Build a company profile from a user-supplied company website."""
+        normalized_url = _normalize_url(website_url.strip())
+        if not normalized_url:
+            raise ValueError("A company website URL is required")
+
+        domain = _extract_domain_from_url(normalized_url)
+        if not domain:
+            raise ValueError("Invalid company website URL")
+
+        page_urls = [normalized_url]
+        page_urls.extend(
+            [
+                urljoin(normalized_url, "/about"),
+                urljoin(normalized_url, "/careers"),
+                urljoin(normalized_url, "/jobs"),
+            ]
+        )
+
+        pages: list[tuple[str, str]] = []
+        async with httpx.AsyncClient(timeout=15.0, headers=DEFAULT_HEADERS, follow_redirects=True) as client:
+            for page_url in page_urls:
+                try:
+                    response = await client.get(page_url)
+                    if response.status_code == 200 and "text/html" in response.headers.get("content-type", ""):
+                        pages.append((page_url, response.text))
+                except Exception:
+                    continue
+
+        if not pages:
+            raise ValueError("Could not scrape the company website")
+
+        home_url, home_html = pages[0]
+        soup = BeautifulSoup(home_html, "html.parser")
+        meta_description = (
+            (soup.find("meta", attrs={"name": "description"}) or {}).get("content", "")
+            or (soup.find("meta", attrs={"property": "og:description"}) or {}).get("content", "")
+        )
+        title = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+        site_name = ((soup.find("meta", attrs={"property": "og:site_name"}) or {}).get("content", "") or "").strip()
+
+        text_chunks: list[str] = []
+        careers_links: list[dict[str, str]] = []
+        linkedin_url = ""
+
+        for page_url, html in pages:
+            page_soup = BeautifulSoup(html, "html.parser")
+            for script in page_soup(["script", "style", "noscript"]):
+                script.decompose()
+            text = re.sub(r"\s+", " ", page_soup.get_text(" ", strip=True))
+            if text:
+                text_chunks.append(text[:4000])
+
+            for anchor in page_soup.find_all("a", href=True):
+                href = urljoin(page_url, anchor["href"])
+                label = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True))
+                href_lower = href.lower()
+                label_lower = label.lower()
+                if not linkedin_url and "linkedin.com/company/" in href_lower:
+                    linkedin_url = href
+                if any(token in href_lower for token in ["/careers", "/jobs", "greenhouse.io", "lever.co", "ashbyhq.com", "workable.com"]):
+                    careers_links.append({"title": label or "Open roles", "url": href})
+                elif any(token in label_lower for token in ["careers", "jobs", "join us", "open roles", "we're hiring"]):
+                    careers_links.append({"title": label or "Open roles", "url": href})
+
+        combined_text = " ".join(text_chunks)
+        name = site_name or self._infer_company_name(title, domain)
+        description = meta_description or self._extract_description_from_text(combined_text)
+        remote_friendly = any(token in combined_text.lower() for token in ["remote", "distributed", "work from anywhere"])
+        hiring_status = "actively_hiring" if careers_links or any(token in combined_text.lower() for token in ["join us", "we're hiring", "open roles", "careers"]) else "unknown"
+
+        company = {
+            "name": name,
+            "domain": domain,
+            "website_url": home_url,
+            "source_url": normalized_url,
+            "source": "Website Submission",
+            "description": description,
+            "mission": self._extract_mission_from_text(combined_text),
+            "industry": self._infer_industry(combined_text),
+            "size": self._infer_company_size(combined_text),
+            "tech_stack": self._infer_tech_stack(combined_text),
+            "funding_stage": self._infer_funding_stage(combined_text),
+            "headquarters": self._infer_headquarters(combined_text),
+            "linkedin_url": linkedin_url,
+            "hiring_status": hiring_status,
+            "remote_friendly": remote_friendly,
+            "open_positions": careers_links[:8],
+            "culture_tags": self._infer_culture_tags(combined_text),
+        }
+
+        # If key fields are sparse (SPA / CSR site), enrich with AI
+        sparse = (not description or len(description) < 80) and not company["tech_stack"]
+        if sparse and self._api_key:
+            try:
+                company = await self._ai_enrich_company(company, combined_text)
+            except Exception:
+                pass
+
+        return _normalize_company(company, "Website Submission")
 
     # ─── HackerNews Who's Hiring ──────────────────────────────────────────────
 
@@ -299,6 +435,300 @@ class CompanyDiscoveryService:
 
         companies = [_normalize_company(c, "RemoteOK") for c in seen_companies.values()]
         return companies[:15]
+
+    async def _discover_from_workatastartup(
+        self, profile: dict[str, Any], preferences: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Scrape Work at a Startup for smaller YC-backed companies and roles."""
+        role = quote((preferences.get("preferred_roles") or profile.get("preferred_domains") or ["software-engineer"])[0].lower().replace(" ", "-"))
+        remote_only = (preferences.get("work_mode") or "").lower() == "remote"
+        target_url = f"{WORK_AT_A_STARTUP_URL}/r/{role}" if remote_only else f"{WORK_AT_A_STARTUP_URL}/l/{role}"
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0, headers=DEFAULT_HEADERS, follow_redirects=True) as client:
+                response = await client.get(target_url)
+                if response.status_code != 200:
+                    response = await client.get(WORK_AT_A_STARTUP_URL)
+                if response.status_code != 200:
+                    return []
+                soup = BeautifulSoup(response.text, "html.parser")
+        except Exception:
+            return []
+
+        companies: dict[str, dict[str, Any]] = {}
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"]
+            if "/companies/" not in href:
+                continue
+
+            line = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True))
+            if not line:
+                continue
+
+            company_name, descriptor = self._parse_workatastartup_company_line(line)
+            company_url = urljoin(WORK_AT_A_STARTUP_URL, href)
+            job_anchor = anchor.find_next("a", href=re.compile(r"/jobs/\d+"))
+            job_title = job_anchor.get_text(" ", strip=True) if job_anchor else ""
+            job_url = urljoin(WORK_AT_A_STARTUP_URL, job_anchor["href"]) if job_anchor else company_url
+
+            company = companies.setdefault(company_name, {
+                "name": company_name,
+                "domain": _slugify_domain(company_name),
+                "description": descriptor,
+                "industry": self._infer_industry(descriptor),
+                "size": "Startup (< 50)",
+                "funding_stage": "YC-backed",
+                "hiring_status": "actively_hiring",
+                "remote_friendly": "remote" in line.lower(),
+                "website_url": "",
+                "source_url": company_url,
+                "open_positions": [],
+                "culture_tags": ["startup", "yc"],
+            })
+            if job_title:
+                company["open_positions"].append({
+                    "title": job_title,
+                    "url": job_url,
+                    "work_mode": "remote" if "remote" in line.lower() else "hybrid_or_onsite",
+                })
+
+        return [_normalize_company(c, "WorkAtAStartup") for c in companies.values()][:15]
+
+    async def _discover_from_wellfound(
+        self, profile: dict[str, Any], preferences: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Best-effort scrape for Wellfound startup listings. Returns [] if blocked."""
+        role_terms = preferences.get("preferred_roles") or profile.get("preferred_domains") or ["software engineer"]
+        query = quote(role_terms[0])
+        target_url = f"{WELLFOUND_JOBS_URL}?query={query}"
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=20.0,
+                follow_redirects=True,
+                headers={
+                    **DEFAULT_HEADERS,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://wellfound.com/",
+                },
+            ) as client:
+                response = await client.get(target_url)
+                if response.status_code != 200:
+                    return []
+                soup = BeautifulSoup(response.text, "html.parser")
+        except Exception:
+            return []
+
+        companies: dict[str, dict[str, Any]] = {}
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"]
+            if "/company/" not in href and "/jobs/" not in href:
+                continue
+
+            text = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True))
+            if not text or len(text) < 2:
+                continue
+
+            company_name = self._extract_wellfound_company_name(text)
+            if not company_name:
+                continue
+
+            company_url = urljoin(WELLFOUND_JOBS_URL, href)
+            companies.setdefault(company_name, {
+                "name": company_name,
+                "domain": _slugify_domain(company_name),
+                "description": text[:180],
+                "size": "Startup (< 50)",
+                "funding_stage": "Startup",
+                "hiring_status": "actively_hiring",
+                "remote_friendly": "remote" in text.lower(),
+                "source_url": company_url,
+                "culture_tags": ["startup"],
+            })
+
+        return [_normalize_company(c, "Wellfound") for c in companies.values()][:10]
+
+    def _parse_workatastartup_company_line(self, line: str) -> tuple[str, str]:
+        match = re.match(r"^(?P<name>.+?)\s*\((?P<batch>[^)]+)\)\s*[•-]\s*(?P<desc>.+)$", line)
+        if match:
+            return match.group("name").strip(), match.group("desc").strip()
+        return line.split("•", 1)[0].strip(), line
+
+    def _extract_wellfound_company_name(self, text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        cleaned = re.split(r"\s+[•·|-]\s+", cleaned, maxsplit=1)[0]
+        if len(cleaned) < 2 or len(cleaned) > 60:
+            return ""
+        return cleaned
+
+    async def _ai_enrich_company(self, company: dict, scraped_text: str) -> dict:
+        """Use GPT to fill in sparse company profile fields (for CSR/SPA sites)."""
+        domain = company.get("domain", "")
+        name = company.get("name", domain)
+        existing_desc = company.get("description", "")
+        text_snippet = scraped_text[:2000] if scraped_text else ""
+
+        prompt = (
+            f"Given this website domain and scraped text, infer the company profile.\n"
+            f"Domain: {domain}\n"
+            f"Company name (guessed): {name}\n"
+            f"Scraped text snippet: {text_snippet[:1500]}\n\n"
+            f"Return a JSON object with these fields (only fill what you can reasonably infer):\n"
+            f'{{"description": "...", "mission": "...", "industry": "...", '
+            f'"size": "e.g. 1-50", "tech_stack": [...], "funding_stage": "...", '
+            f'"headquarters": "city, country", "culture_tags": [...], '
+            f'"remote_friendly": true/false, "hiring_status": "unknown"}}'
+        )
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self._model,
+                    "messages": [
+                        {"role": "system", "content": "You are a company research expert. Return only valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 800,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+            response.raise_for_status()
+            data = json.loads(response.json()["choices"][0]["message"]["content"])
+
+        # Merge: only overwrite fields that are currently empty/unknown
+        for key, val in data.items():
+            if not company.get(key) or company.get(key) in ("", "Other", "Unknown", "unknown", []):
+                company[key] = val
+
+        return company
+
+    def _infer_company_name(self, title: str, domain: str) -> str:
+        if title:
+            base = re.split(r"[|\-–—]", title, maxsplit=1)[0].strip()
+            if 1 < len(base) <= 60:
+                return base
+        host = urlparse(_normalize_url(domain)).netloc or domain
+        label = host.replace("www.", "").split(".")[0]
+        return label.replace("-", " ").title()
+
+    def _extract_description_from_text(self, text: str) -> str:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        for sentence in sentences:
+            cleaned = sentence.strip()
+            if 40 <= len(cleaned) <= 220:
+                return cleaned
+        return text[:180]
+
+    def _extract_mission_from_text(self, text: str) -> str:
+        patterns = [r"(?:mission|purpose)\s*(?:is|:)?\s*([^.!?]{25,200})", r"we build\s+([^.!?]{20,180})"]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def _infer_industry(self, text: str) -> str:
+        lowered = text.lower()
+        industry_map = {
+            "AI / ML": ["ai", "machine learning", "llm", "foundation model", "agentic"],
+            "Fintech": ["fintech", "payments", "banking", "lending", "invoice"],
+            "Healthcare / Biotech": ["healthcare", "biotech", "clinical", "medical", "drug"],
+            "Developer Tools": ["developer", "api", "sdk", "observability", "devops"],
+            "Cybersecurity": ["security", "identity", "compliance", "fraud", "threat"],
+            "Enterprise SaaS": ["saas", "workflow", "crm", "sales", "operations"],
+            "Robotics": ["robotics", "drone", "autonomous", "hardware"],
+        }
+        for industry, keywords in industry_map.items():
+            if any(keyword in lowered for keyword in keywords):
+                return industry
+        return ""
+
+    def _infer_company_size(self, text: str) -> str:
+        lowered = text.lower()
+        patterns = [
+            (r"(\d{1,4})\+? employees", None),
+            (r"team of (\d{1,4})", None),
+        ]
+        for pattern, _ in patterns:
+            match = re.search(pattern, lowered)
+            if not match:
+                continue
+            count = int(match.group(1))
+            if count < 50:
+                return "Startup (< 50)"
+            if count < 200:
+                return "Small (50-200)"
+            if count < 1000:
+                return "Mid-size (200-1000)"
+            if count < 5000:
+                return "Large (1000-5000)"
+            return "Enterprise (5000+)"
+
+        if any(token in lowered for token in ["seed stage", "early-stage", "founding team", "series a"]):
+            return "Startup (< 50)"
+        return ""
+
+    def _infer_tech_stack(self, text: str) -> list[str]:
+        lowered = text.lower()
+        tech_keywords = {
+            "Python": ["python"],
+            "TypeScript": ["typescript"],
+            "JavaScript": ["javascript"],
+            "React": ["react"],
+            "Next.js": ["next.js", "nextjs"],
+            "Node.js": ["node.js", "nodejs"],
+            "Go": [" golang", " go ", "go services"],
+            "Rust": ["rust"],
+            "Java": ["java"],
+            "Kubernetes": ["kubernetes", "k8s"],
+            "AWS": ["aws"],
+            "GCP": ["gcp", "google cloud"],
+            "Postgres": ["postgres", "postgresql"],
+            "PyTorch": ["pytorch"],
+            "TensorFlow": ["tensorflow"],
+        }
+        found = []
+        for tech, patterns in tech_keywords.items():
+            if any(pattern in lowered for pattern in patterns):
+                found.append(tech)
+        return found[:8]
+
+    def _infer_funding_stage(self, text: str) -> str:
+        lowered = text.lower()
+        for stage in ["pre-seed", "seed", "series a", "series b", "series c", "series d", "public"]:
+            if stage in lowered:
+                return stage.title()
+        if "y combinator" in lowered or re.search(r"\b[wsf]\d{2}\b", lowered):
+            return "YC-backed"
+        return ""
+
+    def _infer_headquarters(self, text: str) -> str:
+        match = re.search(r"(?:based in|headquartered in|located in)\s+([A-Z][A-Za-z .,-]{3,60})", text)
+        if match:
+            return match.group(1).strip()
+        return ""
+
+    def _infer_culture_tags(self, text: str) -> list[str]:
+        lowered = text.lower()
+        tags = []
+        tag_keywords = {
+            "remote": ["remote", "distributed"],
+            "startup": ["early-stage", "founding", "startup"],
+            "fast-paced": ["fast-paced", "move fast"],
+            "mission-driven": ["mission-driven", "purpose"],
+            "ownership": ["ownership", "high agency"],
+            "research": ["research", "experimentation"],
+        }
+        for tag, keywords in tag_keywords.items():
+            if any(keyword in lowered for keyword in keywords):
+                tags.append(tag)
+        return tags[:6]
 
     # ─── YC Companies ─────────────────────────────────────────────────────────
 
