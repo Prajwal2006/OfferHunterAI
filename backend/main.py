@@ -715,7 +715,7 @@ async def get_discovered_companies(
 async def add_manual_company(request: ManualCompanyRequest):
     """Scrape a user-supplied company website, rank it, persist it, and return it."""
     try:
-        logger = AgentEventLogger(event_queue=_event_queue)
+        logger = AgentEventLogger(event_queue=_broadcast_queue)
         agent = CompanyFinderAgent(logger=logger)
         task_id = str(uuid.uuid4())
 
@@ -731,11 +731,20 @@ async def add_manual_company(request: ManualCompanyRequest):
         )
 
         cached = _user_companies_cache.get(request.user_id, [])
-        deduped = [
-            existing for existing in cached
-            if existing.get("id") != company.get("id")
-            and existing.get("domain", "").lower() != company.get("domain", "").lower()
-        ]
+        new_id = company.get("id")
+        new_domain = (company.get("domain") or "").lower()
+
+        deduped = []
+        for existing in cached:
+            existing_id = existing.get("id")
+            existing_domain = (existing.get("domain") or "").lower()
+
+            same_id = bool(new_id) and bool(existing_id) and existing_id == new_id
+            same_domain = bool(new_domain) and bool(existing_domain) and existing_domain == new_domain
+
+            if not same_id and not same_domain:
+                deduped.append(existing)
+
         _user_companies_cache[request.user_id] = [company, *deduped]
 
         return {"company": company, "task_id": task_id}

@@ -55,9 +55,9 @@ export default function Navigation() {
                 alt="OfferHunter AI Logo"
                 width={48}
                 height={48}
-                className="logo-animate rounded-lg"
+                className="logo-animate rounded-full"
               />
-              <div className="absolute inset-0 bg-gradient-to-br from-primary/20 to-secondary/20 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity" />
+              <div className="absolute inset-0 bg-linear-to-br from-primary/20 to-secondary/20 rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
             </motion.div>
             <div className="hidden sm:block">
               <span className="font-bold text-xl tracking-tight">

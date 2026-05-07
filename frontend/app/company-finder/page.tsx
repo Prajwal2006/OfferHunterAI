@@ -369,10 +369,17 @@ function CompanyFinderContent() {
     try {
       const result = await addManualCompany({ user_id: userId, website_url: websiteUrl });
       setCompanies((prev) => {
+        const newId = result.company.id;
+        const newDomain = (result.company.domain || "").toLowerCase();
         const deduped = prev.filter(
-          (company) =>
-            company.id !== result.company.id &&
-            company.domain.toLowerCase() !== result.company.domain.toLowerCase()
+          (company) => {
+            const sameId = Boolean(newId) && Boolean(company.id) && company.id === newId;
+            const sameDomain =
+              Boolean(newDomain) &&
+              Boolean(company.domain) &&
+              company.domain.toLowerCase() === newDomain;
+            return !sameId && !sameDomain;
+          }
         );
         return [result.company, ...deduped];
       });

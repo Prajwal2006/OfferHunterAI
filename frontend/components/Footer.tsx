@@ -66,7 +66,7 @@ export function Footer() {
   return (
     <footer className="relative border-t border-border">
       {/* Gradient accent */}
-      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-1/2 h-px bg-gradient-to-r from-transparent via-primary/50 to-transparent" />
+      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-1/2 h-px bg-linear-to-r from-transparent via-primary/50 to-transparent" />
 
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12 lg:py-16">
         {/* Main footer content */}
@@ -79,7 +79,7 @@ export function Footer() {
                 alt="OfferHunter AI"
                 width={40}
                 height={40}
-                className="rounded-lg"
+                className="rounded-full"
               />
               <span className="font-bold text-lg">
                 <span className="text-primary">Offer</span>

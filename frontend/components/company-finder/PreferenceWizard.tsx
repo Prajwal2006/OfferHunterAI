@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   CheckCircle2,
@@ -258,6 +258,156 @@ interface PreferenceWizardProps {
   onComplete: (preferences: UserPreferences) => void;
 }
 
+function mapPrefsToAnswers(currentPrefs?: Partial<UserPreferences>): Record<string, Answer> {
+  if (!currentPrefs) return {};
+
+  const answers: Record<string, Answer> = {};
+  const stepOption = (stepId: string, matcher: (value: string) => boolean, fallback: string) => {
+    const step = STEPS.find((s) => s.id === stepId);
+    return step?.options?.find(matcher) ?? fallback;
+  };
+
+  const workModeMap: Record<string, string> = {
+    remote: "Remote",
+    hybrid: "Hybrid",
+    onsite: "Onsite",
+    flexible: "Flexible (any)",
+  };
+
+  const employmentTypeMap: Record<string, string> = {
+    full_time: "Full-time",
+    internship: "Internship",
+    part_time: "Part-time",
+    contract: "Contract / Freelance",
+    freelance: "Contract / Freelance",
+  };
+
+  const companySizeMap: Record<string, string> = {
+    "startup (<50)": "Startup (< 50)",
+    "startup (< 50)": "Startup (< 50)",
+    "small (50-200)": "Small (50-200)",
+    "mid (200-1000)": "Mid-size (200-1000)",
+    "mid-size (200-1000)": "Mid-size (200-1000)",
+    "large (1000-5000)": "Large (1000-5000)",
+    "enterprise (5000+)": "Enterprise (5000+)",
+  };
+
+  if (currentPrefs.preferred_roles?.length) {
+    answers.preferred_roles = { type: "multi", values: currentPrefs.preferred_roles };
+  }
+
+  if (currentPrefs.work_mode) {
+    answers.work_mode = {
+      type: "single",
+      values: [workModeMap[currentPrefs.work_mode] ?? "Flexible (any)"],
+    };
+  }
+
+  if (currentPrefs.preferred_locations?.length) {
+    answers.preferred_locations = {
+      type: "multi",
+      values: currentPrefs.preferred_locations,
+    };
+  }
+
+  if (currentPrefs.employment_type?.length) {
+    answers.employment_type = {
+      type: "multi",
+      values: currentPrefs.employment_type.map((value) => employmentTypeMap[value] ?? value),
+    };
+  }
+
+  if (typeof currentPrefs.salary_min === "number" || typeof currentPrefs.salary_max === "number") {
+    answers.salary = {
+      type: "salary",
+      min: currentPrefs.salary_min ?? null,
+      max: currentPrefs.salary_max ?? null,
+    };
+  }
+
+  if (currentPrefs.company_size_pref?.length) {
+    answers.company_size = {
+      type: "multi",
+      values: currentPrefs.company_size_pref.map((value) => {
+        const normalized = value.trim().toLowerCase();
+        return companySizeMap[normalized] ?? value;
+      }),
+    };
+  }
+
+  if (currentPrefs.industries_of_interest?.length) {
+    answers.industries = {
+      type: "multi",
+      values: currentPrefs.industries_of_interest,
+    };
+  }
+
+  if (typeof currentPrefs.open_to_startups === "boolean") {
+    answers.open_to_startups = {
+      type: "single",
+      values: [
+        currentPrefs.open_to_startups
+          ? stepOption("open_to_startups", (v) => v.startsWith("Yes"), "Yes, love them")
+          : stepOption("open_to_startups", (v) => v.startsWith("No"), "No, prefer established companies"),
+      ],
+    };
+  }
+
+  if (typeof currentPrefs.sponsorship_required === "boolean") {
+    answers.sponsorship = {
+      type: "single",
+      values: [
+        currentPrefs.sponsorship_required
+          ? stepOption("sponsorship", (v) => v.startsWith("Yes"), "Yes")
+          : stepOption("sponsorship", (v) => v.startsWith("No"), "No"),
+      ],
+    };
+  }
+
+  if (currentPrefs.earliest_start) {
+    answers.start_date = {
+      type: "single",
+      values: [currentPrefs.earliest_start],
+    };
+  }
+
+  if (currentPrefs.career_priorities && Object.keys(currentPrefs.career_priorities).length > 0) {
+    const reversePriorityMap: Record<string, string> = {
+      compensation: "Compensation",
+      learning: "Learning & Growth",
+      brand_value: "Company Brand",
+      work_life_balance: "Work-Life Balance",
+      research: "Research / Innovation",
+      growth: "Impact",
+    };
+    const values: Record<string, number> = {};
+    Object.entries(currentPrefs.career_priorities).forEach(([k, v]) => {
+      const mapped = reversePriorityMap[k] ?? k;
+      values[mapped] = Number(v);
+    });
+    answers.career_priorities = { type: "priorities", values };
+  }
+
+  const avoidedParts = [
+    ...(currentPrefs.avoided_companies ?? []),
+    ...(currentPrefs.avoided_industries ?? []),
+  ];
+  if (avoidedParts.length) {
+    answers.avoided = { type: "text", value: avoidedParts.join(", ") };
+  }
+
+  if (currentPrefs.profile_links && Object.keys(currentPrefs.profile_links).length > 0) {
+    answers.profile_links = { type: "links", values: currentPrefs.profile_links };
+  }
+
+  const notes = (currentPrefs as Partial<UserPreferences> & { notes?: string }).notes;
+  if (notes) {
+    answers.anything_else = { type: "text", value: notes };
+  }
+
+  return answers;
+}
+
 export default function PreferenceWizard({
   userId,
   initialMessage,
@@ -265,9 +415,13 @@ export default function PreferenceWizard({
   onComplete,
 }: PreferenceWizardProps) {
   const [stepIndex, setStepIndex] = useState(-1); // -1 = greeting
-  const [answers, setAnswers] = useState<Record<string, Answer>>({});
+  const [answers, setAnswers] = useState<Record<string, Answer>>(() => mapPrefsToAnswers(currentPrefs));
   const [otherInputs, setOtherInputs] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setAnswers(mapPrefsToAnswers(currentPrefs));
+  }, [currentPrefs]);
 
   const step = stepIndex >= 0 ? STEPS[stepIndex] : null;
   const isLast = stepIndex === STEPS.length - 1;

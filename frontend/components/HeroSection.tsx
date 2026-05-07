@@ -57,7 +57,7 @@ export function HeroSection() {
                 alt="OfferHunter AI"
                 width={180}
                 height={180}
-                className="logo-animate"
+                className="logo-animate rounded-full"
                 priority
               />
               {/* Orbiting particles */}
@@ -125,7 +125,7 @@ export function HeroSection() {
               <motion.button
                 whileHover={{ scale: 1.03 }}
                 whileTap={{ scale: 0.97 }}
-                className="btn-futuristic relative group flex items-center gap-2 px-8 py-4 rounded-2xl font-semibold text-lg bg-gradient-to-r from-primary to-secondary text-primary-foreground shadow-xl shadow-primary/25"
+                className="btn-futuristic relative group flex items-center gap-2 px-8 py-4 rounded-2xl font-semibold text-lg bg-linear-to-r from-primary to-secondary text-primary-foreground shadow-xl shadow-primary/25"
               >
                 <Zap className="w-5 h-5" />
                 <span>Start Hunting</span>
