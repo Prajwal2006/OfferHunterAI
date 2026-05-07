@@ -88,7 +88,7 @@ class WellfoundSource(CompanySource):
                 "culture_tags": ["startup"],
             })
 
-        results = [normalize_company(c, self.SOURCE_NAME) for c in companies.values()][:10]
+        results = [normalize_company(c, self.SOURCE_NAME) for c in companies.values()][:30]
         await self._notify(progress_callback, f"Found {len(results)} companies on Wellfound")
         return results
 

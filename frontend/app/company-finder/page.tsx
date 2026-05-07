@@ -28,13 +28,18 @@ import {
   fetchResumes,
   handoffToAgent,
   addManualCompany,
+  updateWorkspaceCompany,
+  sendCompanyFeedback,
+  continueCompanyDiscovery,
+  fetchOrchestrationState,
+  fetchDiscoverySessions,
 } from "@/lib/api";
 import {
   Company,
-  ParsedProfile,
   UserPreferences,
   ConversationMessage,
-  AgentRunStatus,
+  OrchestrationState,
+  DiscoverySession,
 } from "@/lib/types";
 import CompanyCard from "@/components/company-finder/CompanyCard";
 import CompanyDetailModal from "@/components/company-finder/CompanyDetailModal";
@@ -204,12 +209,10 @@ function CompanyFinderContent() {
   const userId = session?.user?.id ?? "";
 
   const [step, setStep] = useState<FlowStep>("checking");
-  const [profile, setProfile] = useState<ParsedProfile | null>(null);
   const [preferences, setPreferences] = useState<UserPreferences | null>(null);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [selectedCompany, setSelectedCompany] = useState<Company | null>(null);
   const [agentMessage, setAgentMessage] = useState<string>("");
-  const [taskId, setTaskId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [prefOpener, setPrefOpener] = useState("");
   const [prefHistory, setPrefHistory] = useState<ConversationMessage[]>([]);
@@ -224,7 +227,12 @@ function CompanyFinderContent() {
   const [manualWebsiteUrl, setManualWebsiteUrl] = useState("");
   const [manualCompanyError, setManualCompanyError] = useState<string | null>(null);
   const [manualCompanyLoading, setManualCompanyLoading] = useState(false);
+  const [orchestrationState, setOrchestrationState] = useState<OrchestrationState | null>(null);
+  const [discoverySessions, setDiscoverySessions] = useState<DiscoverySession[]>([]);
+  const [sourceMode, setSourceMode] = useState<string>("all");
   const esRef = useRef<EventSource | null>(null);
+  // Track whether the running state was triggered by "Find More" (merge) vs fresh run (replace)
+  const isContinuingRef = useRef(false);
 
   // ── Initial load ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -242,12 +250,18 @@ function CompanyFinderContent() {
         }
 
         // 2. Check for parsed profile
-        const profileData = await fetchParsedProfile(userId);
-        setProfile(profileData.profile);
+        await fetchParsedProfile(userId);
 
         // 3. Check for preferences
         const prefsData = await fetchUserPreferences(userId);
         setPreferences(prefsData.preferences);
+
+        const [orchestration, sessions] = await Promise.all([
+          fetchOrchestrationState(userId).catch(() => ({ state: null })),
+          fetchDiscoverySessions(userId, { limit: 8 }).catch(() => ({ sessions: [] })),
+        ]);
+        setOrchestrationState(orchestration.state ?? null);
+        setDiscoverySessions(sessions.sessions ?? []);
 
         if (!prefsData.preferences?.conversation_complete) {
           // Need to collect preferences
@@ -261,15 +275,10 @@ function CompanyFinderContent() {
           return;
         }
 
-        // 4. Check for existing companies
-        const companyData = await fetchDiscoveredCompanies(userId, { limit: 50 });
-        if (companyData.companies.length > 0) {
-          setCompanies(companyData.companies);
-          setStep("results");
-        } else {
-          // Auto-run discovery
-          await startDiscovery();
-        }
+        // 4. Check for existing companies — show them without auto-running discovery
+        const companyData = await fetchDiscoveredCompanies(userId, { limit: 100 });
+        setCompanies(companyData.companies);
+        setStep("results");
       } catch (err) {
         setError(err instanceof Error ? err.message : "Initialization failed");
         setStep("error");
@@ -277,7 +286,6 @@ function CompanyFinderContent() {
     }
 
     init();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
 
   // ── SSE Event Stream for agent progress ────────────────────────────────────
@@ -295,21 +303,35 @@ function CompanyFinderContent() {
         if (data.agent_name === "CompanyFinderAgent" || data.agent_name === "Orchestrator") {
           setAgentMessage(data.message ?? "");
           if (data.status === "completed") {
-            const meta = data.metadata || {};
-            // Prefer companies from event metadata (avoids extra round-trip / DB dependency)
-            if (Array.isArray(meta.companies) && meta.companies.length > 0) {
-              setCompanies(meta.companies as Company[]);
-              setStep("results");
-            } else {
-              // Fall back to fetching from API (which now has in-memory cache fallback)
-              fetchDiscoveredCompanies(userId, { limit: 50 })
-                .then((res) => {
+            const wasContinuing = isContinuingRef.current;
+            isContinuingRef.current = false;
+            // Always reload from DB so persisted state is the source of truth
+            fetchDiscoveredCompanies(userId, { limit: 100 })
+              .then((res) => {
+                if (wasContinuing) {
+                  // Merge: keep existing companies and append genuinely new ones
+                  setCompanies((prev) => {
+                    const existingIds = new Set(
+                      prev.map((c) => c.id).filter(Boolean)
+                    );
+                    const existingDomains = new Set(
+                      prev.map((c) => (c.domain || "").toLowerCase()).filter(Boolean)
+                    );
+                    const brandNew = res.companies.filter(
+                      (c) =>
+                        !existingIds.has(c.id) &&
+                        !(c.domain && existingDomains.has(c.domain.toLowerCase()))
+                    );
+                    return [...prev, ...brandNew];
+                  });
+                } else {
                   setCompanies(res.companies);
-                  setStep("results");
-                })
-                .catch(() => setStep("results"));
-            }
+                }
+                setStep("results");
+              })
+              .catch(() => setStep("results"));
           } else if (data.status === "failed") {
+            isContinuingRef.current = false;
             setError(data.message || "Agent failed");
             setStep("error");
           }
@@ -328,8 +350,7 @@ function CompanyFinderContent() {
     setAgentMessage("Starting Company Finder Agent...");
     setError(null);
     try {
-      const result = await runCompanyFinder({ user_id: userId, count: 25 });
-      setTaskId(result.task_id);
+      await runCompanyFinder({ user_id: userId, count: 60 });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start agent");
       setStep("error");
@@ -392,6 +413,83 @@ function CompanyFinderContent() {
       setManualCompanyLoading(false);
     }
   }, [manualWebsiteUrl, userId]);
+
+  const onCompanyFeedback = useCallback(
+    async (company: Company, feedback: "like" | "dislike") => {
+      if (!company.id) return;
+      const nextLiked = feedback === "like";
+      const nextDisliked = feedback === "dislike";
+
+      setCompanies((prev) =>
+        prev.map((c) =>
+          c.id === company.id
+            ? {
+                ...c,
+                workspace: {
+                  ...(c.workspace || {}),
+                  liked: nextLiked,
+                  disliked: nextDisliked,
+                },
+              }
+            : c
+        )
+      );
+
+      try {
+        await sendCompanyFeedback(company.id, {
+          user_id: userId,
+          feedback_type: feedback,
+        });
+      } catch {
+        await fetchDiscoveredCompanies(userId, { limit: 50 }).then((data) => setCompanies(data.companies));
+      }
+    },
+    [userId]
+  );
+
+  const onArchiveCompany = useCallback(
+    async (company: Company) => {
+      if (!company.id) return;
+      setCompanies((prev) => prev.filter((c) => c.id !== company.id));
+      try {
+        await updateWorkspaceCompany(company.id, { user_id: userId, archived: true });
+      } catch {
+        await fetchDiscoveredCompanies(userId, { limit: 50 }).then((data) => setCompanies(data.companies));
+      }
+    },
+    [userId]
+  );
+
+  const onRemoveCompany = useCallback(
+    async (company: Company) => {
+      if (!company.id) return;
+      setCompanies((prev) => prev.filter((c) => c.id !== company.id));
+      try {
+        await updateWorkspaceCompany(company.id, { user_id: userId, removed: true });
+      } catch {
+        await fetchDiscoveredCompanies(userId, { limit: 50 }).then((data) => setCompanies(data.companies));
+      }
+    },
+    [userId]
+  );
+
+  const onFindMoreCompanies = useCallback(async () => {
+    isContinuingRef.current = true;
+    setStep("running");
+    setAgentMessage("Continuing discovery and expanding your persistent workspace...");
+    setError(null);
+    try {
+      await continueCompanyDiscovery({
+        user_id: userId,
+        count: 40,
+        source_mode: sourceMode === "all" ? undefined : sourceMode,
+      });
+    } catch (err) {
+      isContinuingRef.current = false;
+      setError(err instanceof Error ? err.message : "Failed to continue discovery");
+      setStep("results"); // Stay on results so existing companies remain visible
+    }
+  }, [sourceMode, userId]);
 
   // ── Filter companies ───────────────────────────────────────────────────────
   const filteredCompanies = companies.filter((c) => {
@@ -495,7 +593,7 @@ function CompanyFinderContent() {
           <div>
             <h2 className="text-lg font-bold text-foreground">Tell Me About Your Goals</h2>
             <p className="text-xs text-muted-foreground">
-              I'll use your answers to find perfectly matched companies
+              I&apos;ll use your answers to find perfectly matched companies
             </p>
           </div>
         </motion.div>
@@ -681,8 +779,76 @@ function CompanyFinderContent() {
         )}
       </div>
 
+      <div className="glass border border-border rounded-2xl p-4 sm:p-5 space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-foreground">Persistent Discovery Workspace</p>
+            <p className="text-xs text-muted-foreground">
+              Companies are saved to your account with orchestration state, feedback, and history.
+            </p>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Stage: <span className="text-foreground font-medium">{orchestrationState?.current_stage || "CompanyFinder"}</span>
+          </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-3">
+          <button
+            type="button"
+            onClick={() => void onFindMoreCompanies()}
+            className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Find More Companies
+          </button>
+
+          <div className="flex items-center gap-2">
+            <select
+              value={sourceMode}
+              onChange={(e) => setSourceMode(e.target.value)}
+              className="px-3 py-2.5 bg-muted border border-border rounded-xl text-sm text-foreground focus:border-primary focus:outline-none transition-colors"
+            >
+              <option value="all">All Sources</option>
+              <option value="startups">Startups</option>
+              <option value="yc">YC Companies</option>
+              <option value="remote">Remote Companies</option>
+              <option value="ai">AI Startups</option>
+              <option value="fortune500">Fortune 500</option>
+              <option value="stealth">Stealth Startups</option>
+              <option value="international">Hiring Internationally</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => void onFindMoreCompanies()}
+              className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            >
+              Search Different Sources
+            </button>
+          </div>
+        </div>
+
+        {discoverySessions.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            Last session: {discoverySessions[0].companies_found || discoverySessions[0].total_companies_found || 0} companies,
+            sources {Array.isArray(discoverySessions[0].sources_used) ? discoverySessions[0].sources_used.join(", ") : "n/a"}
+          </p>
+        )}
+      </div>
+
       {/* Company Grid */}
-      {filteredCompanies.length === 0 ? (
+      {companies.length === 0 ? (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          className="text-center py-16"
+        >
+          <Building2 className="w-12 h-12 text-muted-foreground mx-auto mb-3 opacity-30" />
+          <p className="text-muted-foreground font-medium mb-1">No companies discovered yet.</p>
+          <p className="text-sm text-muted-foreground mb-4">
+            Click <span className="text-foreground font-medium">Find More Companies</span> above to start discovery.
+          </p>
+        </motion.div>
+      ) : filteredCompanies.length === 0 ? (
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
@@ -700,16 +866,40 @@ function CompanyFinderContent() {
           </button>
         </motion.div>
       ) : (
-        <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
-          {filteredCompanies.map((company, i) => (
-            <CompanyCard
-              key={company.id ?? company.name}
-              company={company}
-              index={i}
-              onClick={setSelectedCompany}
-            />
-          ))}
-        </div>
+        <>
+          <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
+            {filteredCompanies.map((company, i) => (
+              <CompanyCard
+                key={company.id ?? company.name}
+                company={company}
+                index={i}
+                onClick={setSelectedCompany}
+                onFeedback={onCompanyFeedback}
+                onArchive={onArchiveCompany}
+                onRemove={onRemoveCompany}
+              />
+            ))}
+          </div>
+
+          {/* Bottom Find More Companies button */}
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2 pb-4">
+            <button
+              type="button"
+              onClick={() => void onFindMoreCompanies()}
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
+            >
+              <RefreshCw className="w-4 h-4" />
+              Find More Companies
+            </button>
+            <button
+              type="button"
+              onClick={() => void onFindMoreCompanies()}
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            >
+              Search Different Sources
+            </button>
+          </div>
+        </>
       )}
 
       {/* Company Detail Modal */}

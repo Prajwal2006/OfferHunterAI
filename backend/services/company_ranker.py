@@ -302,22 +302,11 @@ class CompanyRankerService:
 
         ranked.sort(key=lambda c: c["ranking"]["match_score"], reverse=True)
 
-        # Drop companies that are clearly irrelevant to the candidate.
-        # Only prune when there are more results than needed, so we don't
-        # accidentally return an empty list when discovery is sparse.
-        has_industry_prefs = bool(
-            preferences.get("preferred_roles")
-            or preferences.get("industries_of_interest")
-            or profile.get("preferred_domains")
-        )
-        if has_industry_prefs and len(ranked) > 5:
-            ranked = [
-                c for c in ranked
-                if not (
-                    c["ranking"]["interests_match"] < 0.05
-                    and c["ranking"]["match_score"] < 0.45
-                )
-            ]
+        # Keep discovery broad. Earlier versions hard-pruned low-interest-match
+        # companies here, but interest matching is intentionally conservative
+        # and often lacks exact taxonomy overlap for good opportunities. The
+        # persistent workspace should preserve candidates and let ranking,
+        # filters, archive/remove, and feedback learning do the narrowing.
 
         # Enrich top 15 with AI explanations (batch for efficiency)
         if enrich_with_ai and self._api_key:

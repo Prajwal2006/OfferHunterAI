@@ -109,7 +109,7 @@ class WorkAtAStartupSource(CompanySource):
                     "work_mode": "remote" if "remote" in line.lower() else "hybrid_or_onsite",
                 })
 
-        results = [normalize_company(c, self.SOURCE_NAME) for c in companies.values()][:15]
+        results = [normalize_company(c, self.SOURCE_NAME) for c in companies.values()][:40]
         await self._notify(progress_callback, f"Found {len(results)} companies on Work at a Startup")
         return results
 

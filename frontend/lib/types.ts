@@ -46,11 +46,13 @@ export interface Company {
   recent_news?: NewsItem[];
   culture_tags?: string[];
   source?: string;
+  application_strategy?: string;
   // Joined data
   ranking?: CompanyRanking;
   match_score?: number;
   company_contacts?: CompanyContact[];
   contacts?: CompanyContact[];
+  workspace?: WorkspaceCompanyState;
 }
 
 export interface CompanyRanking {
@@ -64,10 +66,56 @@ export interface CompanyRanking {
   visa_compatibility: number;
   hiring_likelihood: number;
   company_size_match?: number;
+  semantic_similarity?: number;
   match_explanation: string;
   strengths: string[];
   gaps: string[];
   suggestions: string[];
+}
+
+export interface WorkspaceCompanyState {
+  id?: string;
+  source?: string;
+  discovered_at?: string;
+  status?: string;
+  orchestration_stage?: string;
+  liked?: boolean | null;
+  disliked?: boolean | null;
+  archived?: boolean;
+  removed?: boolean;
+  manually_added?: boolean;
+  personalization_completed?: boolean;
+  outreach_started?: boolean;
+  outreach_sent?: boolean;
+  notes?: string;
+  application_strategy?: string;
+  ranking_score?: number;
+  ranking_explanation?: string;
+}
+
+export interface DiscoverySession {
+  id: string;
+  user_id: string;
+  status: "running" | "completed" | "failed" | "paused";
+  queries_used?: string[];
+  sources_used?: string[];
+  companies_found?: number;
+  total_companies_found?: number;
+  embedding_version?: string;
+  created_at?: string;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export interface OrchestrationState {
+  user_id: string;
+  current_stage: OrchestrationStepId | string;
+  progress: Record<string, unknown>;
+  active_agents: string[];
+  paused_state: boolean;
+  last_task_id?: string;
+  updated_at?: string;
+  created_at?: string;
 }
 
 export interface CompanyContact {

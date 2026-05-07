@@ -116,6 +116,15 @@ def _normalize_company(raw: dict[str, Any], source: str) -> dict[str, Any]:
     }
 
 
+def _domain_key(value: str) -> str:
+    """Normalize domains/URLs for workspace exclusion and deduplication."""
+    if not value:
+        return ""
+    parsed = urlparse(_normalize_url(value.strip().lower()))
+    host = parsed.netloc or parsed.path.split("/")[0]
+    return host.removeprefix("www.").strip()
+
+
 def _startup_priority_score(company: dict[str, Any]) -> tuple[float, float]:
     size = (company.get("size") or "").lower()
     stage = (company.get("funding_stage") or "").lower()
@@ -150,9 +159,9 @@ class CompanyDiscoveryService:
     """
 
     # Quality thresholds for the feedback loop
-    _MIN_DIVERSITY_SOURCES = 3      # At least N distinct sources represented
-    _MIN_COMPANIES = 10             # Re-search if fewer than N unique companies found
-    _MAX_FEEDBACK_ROUNDS = 1        # How many additional search rounds to run
+    _MIN_DIVERSITY_SOURCES = 4      # At least N distinct sources represented
+    _MIN_COMPANIES = 35             # Re-search if fewer than N unique companies found
+    _MAX_FEEDBACK_ROUNDS = 3        # How many additional search rounds to run
 
     def __init__(self) -> None:
         self._api_key = os.getenv("OPENAI_API_KEY", "")
@@ -168,6 +177,16 @@ class CompanyDiscoveryService:
             YCCompaniesSource(),
             AIDiscoverySource(api_key=self._api_key, model=self._model),
         ]
+        self._source_modes: dict[str, set[str]] = {
+            "all": {s.SOURCE_NAME for s in self._sources},
+            "startups": {"HackerNews", "WorkAtAStartup", "Wellfound", "YCombinator", "AI Discovery"},
+            "yc": {"YCombinator", "WorkAtAStartup"},
+            "remote": {"RemoteOK", "HackerNews", "Wellfound"},
+            "ai": {"AI Discovery", "HackerNews", "Wellfound", "RemoteOK"},
+            "fortune500": {"AI Discovery"},
+            "stealth": {"AI Discovery", "HackerNews"},
+            "international": {"RemoteOK", "Wellfound", "AI Discovery"},
+        }
 
     async def discover(
         self,
@@ -175,6 +194,7 @@ class CompanyDiscoveryService:
         preferences: dict[str, Any],
         target_count: int = 30,
         progress_callback: Any = None,
+        excluded_domains: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Discover companies via multi-source parallel search with query expansion
@@ -183,19 +203,36 @@ class CompanyDiscoveryService:
         Args:
             profile:           Parsed resume profile.
             preferences:       User job preferences.
-            target_count:      Target number of unique companies to return.
+            target_count:      Target number of unique NEW companies to return.
             progress_callback: async callable(source_name, message) for SSE.
+            excluded_domains:  Domains already in the user's workspace — these
+                               are injected into the AI prompt and filtered out
+                               of final results so every run returns fresh companies.
 
         Returns:
             Deduplicated, priority-sorted list of company dicts.
         """
+        requested_count = max(target_count, 1)
+        discovery_target = max(requested_count, 60)
+        excluded = {_domain_key(d) for d in (excluded_domains or []) if d}
+
+        # ── Inject internal keys so AI source can vary its prompt ─────────────
+        # Mutate a shallow copy so we don't pollute the caller's preferences dict.
+        prefs = dict(preferences)
+        prefs["_excluded_domains"] = list(excluded)
+        prefs["_excluded_names"] = list(prefs.get("_excluded_names") or [])
+        prefs["_discovery_round"] = int(prefs.get("_discovery_round") or 1)
+
+        # Request more than target_count to compensate for exclusion filtering
+        inner_target = discovery_target + max(len(excluded) // 2, 20)
+
         # ── Phase 1: Expand queries ───────────────────────────────────────────
         if progress_callback:
             await progress_callback("QueryExpansion", "Expanding search queries with AI...")
         try:
-            queries = await self._query_expander.expand_queries(profile, preferences)
+            queries = await self._query_expander.expand_queries(profile, prefs)
         except Exception:
-            queries = self._query_expander._base_queries(profile, preferences)
+            queries = self._query_expander._base_queries(profile, prefs)
 
         if progress_callback:
             await progress_callback(
@@ -209,7 +246,16 @@ class CompanyDiscoveryService:
                 "Discovery",
                 "Searching Hacker News, RemoteOK, Work at a Startup, Wellfound, YC, and AI sources...",
             )
-        companies = await self._run_all_sources(profile, preferences, queries, progress_callback)
+        source_mode = str(preferences.get("source_mode") or "all").strip().lower()
+        allowed_sources = self._source_modes.get(source_mode, self._source_modes["all"])
+        active_sources = [s for s in self._sources if s.SOURCE_NAME in allowed_sources]
+        companies = await self._run_all_sources(
+            profile,
+            prefs,
+            queries,
+            progress_callback,
+            active_sources,
+        )
 
         # ── Phase 3: Dedup ────────────────────────────────────────────────────
         companies = self._deduplicate(companies)
@@ -218,15 +264,29 @@ class CompanyDiscoveryService:
 
         # ── Phase 4: Feedback loop (second pass if quality is low) ────────────
         companies = await self._feedback_loop(
-            companies, profile, preferences, queries, target_count, progress_callback
+            companies, profile, prefs, queries, inner_target, progress_callback
         )
 
         # ── Phase 4.5: Filter clearly irrelevant industries ───────────────────
         companies = self._filter_industry_mismatch(companies, profile, preferences)
 
+        # ── Phase 4.6: Remove companies already in the user's workspace ───────
+        if excluded:
+            before = len(companies)
+            companies = [
+                c for c in companies
+                if _domain_key(c.get("domain") or c.get("website_url") or "") not in excluded
+            ]
+            if progress_callback and before != len(companies):
+                await progress_callback(
+                    "Discovery",
+                    f"Filtered out {before - len(companies)} already-discovered companies — "
+                    f"{len(companies)} new companies remaining",
+                )
+
         # ── Phase 5: Sort by startup priority + relevance ─────────────────────
         companies.sort(key=_startup_priority_score, reverse=True)
-        return companies[:target_count]
+        return companies[:discovery_target]
 
     # ─── Internal Pipeline Helpers ────────────────────────────────────────────
 
@@ -309,6 +369,7 @@ class CompanyDiscoveryService:
         preferences: dict[str, Any],
         queries: list[str],
         progress_callback: Any,
+        sources: list[Any],
     ) -> list[dict[str, Any]]:
         """
         Run all CompanySource connectors in parallel with individual timeouts.
@@ -324,12 +385,17 @@ class CompanyDiscoveryService:
                 if progress_callback:
                     await progress_callback(source.SOURCE_NAME, f"{source.SOURCE_NAME} timed out")
                 return []
-            except Exception:
+            except Exception as exc:
+                if progress_callback:
+                    await progress_callback(
+                        source.SOURCE_NAME,
+                        f"{source.SOURCE_NAME} failed: {type(exc).__name__}",
+                    )
                 return []
 
-        results = await asyncio.gather(*[_run_source(s) for s in self._sources])
+        results = await asyncio.gather(*[_run_source(s) for s in sources])
         all_companies: list[dict[str, Any]] = []
-        for source, result in zip(self._sources, results):
+        for source, result in zip(sources, results):
             if result:
                 all_companies.extend(result)
                 if progress_callback:
@@ -371,19 +437,49 @@ class CompanyDiscoveryService:
                     f"Running additional discovery pass ({round_num + 1}/{self._MAX_FEEDBACK_ROUNDS})...",
                 )
 
-            # Use the AI source with more variation on the second pass
+            # Use the AI source with more variation on each pass and exclude
+            # companies already found in earlier passes so the graph expands.
             try:
+                existing_domains = {
+                    _domain_key(c.get("domain") or c.get("website_url") or "")
+                    for c in companies
+                    if c.get("domain") or c.get("website_url")
+                }
+                existing_names = {
+                    (c.get("name") or "").lower().strip()
+                    for c in companies
+                    if c.get("name")
+                }
+                round_preferences = dict(preferences)
+                round_preferences["_excluded_domains"] = sorted(
+                    set(round_preferences.get("_excluded_domains") or []) | existing_domains
+                )
+                round_preferences["_excluded_names"] = sorted(
+                    set(round_preferences.get("_excluded_names") or []) | existing_names
+                )
+                round_preferences["_discovery_round"] = (
+                    int(round_preferences.get("_discovery_round") or 1) + round_num + 1
+                )
                 ai_source = AIDiscoverySource(api_key=self._api_key, model=self._model)
                 additional = await asyncio.wait_for(
                     ai_source.search(
-                        profile, preferences, base_queries[3:] + base_queries[:3],  # shifted queries
-                        progress_callback, count=target_count - len(companies) + 5
+                        profile,
+                        round_preferences,
+                        base_queries[3:] + base_queries[:3],  # shifted queries
+                        progress_callback,
+                        count=max(target_count - len(companies) + 10, 25),
                     ),
                     timeout=45.0,
                 )
                 companies.extend(additional)
                 companies = self._deduplicate(companies)
-            except Exception:
+                sources_present = len({c.get("source", "") for c in companies})
+            except Exception as exc:
+                if progress_callback:
+                    await progress_callback(
+                        "Discovery",
+                        f"Additional discovery pass failed: {type(exc).__name__}",
+                    )
                 break
 
         return companies
@@ -394,7 +490,7 @@ class CompanyDiscoveryService:
         seen: set[str] = set()
         unique: list[dict[str, Any]] = []
         for company in companies:
-            domain = (company.get("domain") or "").lower().strip()
+            domain = _domain_key(company.get("domain") or company.get("website_url") or "")
             if domain and domain not in seen:
                 seen.add(domain)
                 unique.append(company)

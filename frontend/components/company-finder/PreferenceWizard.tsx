@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   CheckCircle2,
@@ -419,10 +419,6 @@ export default function PreferenceWizard({
   const [otherInputs, setOtherInputs] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    setAnswers(mapPrefsToAnswers(currentPrefs));
-  }, [currentPrefs]);
-
   const step = stepIndex >= 0 ? STEPS[stepIndex] : null;
   const isLast = stepIndex === STEPS.length - 1;
   const progress = stepIndex < 0 ? 0 : Math.round(((stepIndex + 1) / STEPS.length) * 100);
@@ -653,7 +649,7 @@ export default function PreferenceWizard({
                 <div className="bg-muted text-foreground text-sm leading-relaxed px-4 py-3 rounded-2xl rounded-tl-sm max-w-lg">
                   {initialMessage}
                   <p className="mt-2 text-muted-foreground">
-                    I'll walk you through <strong>{STEPS.length} quick questions</strong> â€” each with options to choose from. It takes about 2 minutes.
+                    I&apos;ll walk you through <strong>{STEPS.length} quick questions</strong> â€” each with options to choose from. It takes about 2 minutes.
                   </p>
                 </div>
               </div>

@@ -118,6 +118,6 @@ class RemoteOKSource(CompanySource):
             if company_match_counts.get(name, 0) >= 1
         }
 
-        results = [normalize_company(c, self.SOURCE_NAME) for c in qualified.values()][:15]
+        results = [normalize_company(c, self.SOURCE_NAME) for c in qualified.values()][:40]
         await self._notify(progress_callback, f"Found {len(results)} companies on RemoteOK")
         return results

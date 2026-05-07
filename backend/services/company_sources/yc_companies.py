@@ -62,7 +62,7 @@ class YCCompaniesSource(CompanySource):
                             "indexName": "YCCompany_production",
                             "query": query,
                             "params": (
-                                "hitsPerPage=20&page=0"
+                                "hitsPerPage=50&page=0"
                                 "&facets=%5B%22top_company%22%2C%22isHiring%22%5D"
                                 "&facetFilters=%5B%5B%22isHiring%3Atrue%22%5D%5D"
                             ),
@@ -104,7 +104,7 @@ class YCCompaniesSource(CompanySource):
             companies = self._fallback(profile, preferences)
 
         await self._notify(progress_callback, f"Found {len(companies)} YC companies")
-        return companies[:15]
+        return companies[:50]
 
     @staticmethod
     def _fallback(

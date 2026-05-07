@@ -60,11 +60,13 @@ const statusStyles = {
 interface OrchestrationFlowProps {
   activeStep?: string;
   currentTask?: string;
+  onStepClick?: (stepId: string) => void;
 }
 
 export default function OrchestrationFlow({
   activeStep,
   currentTask,
+  onStepClick,
 }: OrchestrationFlowProps) {
   const resolvedSteps = steps.map((step) => ({
     ...step,
@@ -90,7 +92,9 @@ export default function OrchestrationFlow({
             <div key={step.id} className="flex items-center gap-2 flex-1 min-w-0">
               {/* Node */}
               <div className="flex flex-col items-center gap-2 flex-1">
-                <motion.div
+                <motion.button
+                  type="button"
+                  onClick={() => onStepClick?.(step.id)}
                   animate={
                     isActive
                       ? {
@@ -103,10 +107,10 @@ export default function OrchestrationFlow({
                       : {}
                   }
                   transition={{ duration: 2, repeat: Infinity }}
-                  className={`w-12 h-12 rounded-xl border-2 flex items-center justify-center text-lg shadow-lg ${styles.node} ${styles.glow}`}
+                  className={`w-12 h-12 rounded-xl border-2 flex items-center justify-center text-lg shadow-lg ${styles.node} ${styles.glow} ${onStepClick ? "cursor-pointer hover:scale-105 transition-transform" : ""}`}
                 >
                   {step.status === "completed" ? "✓" : step.status === "active" ? "⟳" : "○"}
-                </motion.div>
+                </motion.button>
 
                 <div className="text-center">
                   <div className={`text-xs font-semibold ${styles.label} whitespace-nowrap`}>
@@ -121,7 +125,7 @@ export default function OrchestrationFlow({
                   <motion.div
                     initial={{ opacity: 0, y: 4 }}
                     animate={{ opacity: 1, y: 0 }}
-                    className="text-xs text-emerald-500 text-center max-w-[120px] truncate bg-emerald-500/10 px-2 py-1 rounded-lg border border-emerald-500/20"
+                    className="text-xs text-emerald-500 text-center max-w-30 truncate bg-emerald-500/10 px-2 py-1 rounded-lg border border-emerald-500/20"
                   >
                     {currentTask}
                   </motion.div>
@@ -130,7 +134,7 @@ export default function OrchestrationFlow({
 
               {/* Connector arrow */}
               {index < resolvedSteps.length - 1 && (
-                <div className="flex items-center flex-shrink-0 mb-8">
+                <div className="flex items-center shrink-0 mb-8">
                   <div className="relative w-8 h-0.5">
                     <div className={`absolute inset-0 ${styles.connector} rounded-full`} />
                     {/* Animated particle for active connector */}
@@ -142,7 +146,7 @@ export default function OrchestrationFlow({
                       />
                     )}
                   </div>
-                  <div className="w-0 h-0 border-t-4 border-t-transparent border-b-4 border-b-transparent border-l-4 border-l-border flex-shrink-0" />
+                  <div className="w-0 h-0 border-t-4 border-t-transparent border-b-4 border-b-transparent border-l-4 border-l-border shrink-0" />
                 </div>
               )}
             </div>

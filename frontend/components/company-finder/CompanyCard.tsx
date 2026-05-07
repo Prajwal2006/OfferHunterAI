@@ -13,6 +13,10 @@ import {
   ChevronRight,
   CheckCircle2,
   AlertCircle,
+  ThumbsUp,
+  ThumbsDown,
+  Archive,
+  Trash2,
 } from "lucide-react";
 import { Company } from "@/lib/types";
 
@@ -20,6 +24,9 @@ interface CompanyCardProps {
   company: Company;
   index: number;
   onClick: (company: Company) => void;
+  onFeedback?: (company: Company, feedback: "like" | "dislike") => void;
+  onArchive?: (company: Company) => void;
+  onRemove?: (company: Company) => void;
 }
 
 function MatchBar({ score, label }: { score: number; label: string }) {
@@ -65,7 +72,14 @@ function HiringBadge({ status }: { status?: string }) {
   );
 }
 
-export default function CompanyCard({ company, index, onClick }: CompanyCardProps) {
+export default function CompanyCard({
+  company,
+  index,
+  onClick,
+  onFeedback,
+  onArchive,
+  onRemove,
+}: CompanyCardProps) {
   const ranking = company.ranking;
   const matchScore = ranking?.match_score ?? company.match_score ?? company.relevance_score ?? 0;
   const matchPct = Math.round(matchScore * 100);
@@ -274,6 +288,64 @@ export default function CompanyCard({ company, index, onClick }: CompanyCardProp
           View details
           <ChevronRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
         </span>
+      </div>
+
+      <div className="mt-3 pt-2 border-t border-border/60 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onFeedback?.(company, "like");
+          }}
+          className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] border transition-colors ${
+            company.workspace?.liked
+              ? "bg-green-500/15 text-green-600 border-green-500/30"
+              : "text-muted-foreground border-border hover:text-foreground hover:bg-muted"
+          }`}
+        >
+          <ThumbsUp className="w-3.5 h-3.5" />
+          Like
+        </button>
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onFeedback?.(company, "dislike");
+          }}
+          className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] border transition-colors ${
+            company.workspace?.disliked
+              ? "bg-red-500/15 text-red-600 border-red-500/30"
+              : "text-muted-foreground border-border hover:text-foreground hover:bg-muted"
+          }`}
+        >
+          <ThumbsDown className="w-3.5 h-3.5" />
+          Dislike
+        </button>
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onArchive?.(company);
+          }}
+          className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+        >
+          <Archive className="w-3.5 h-3.5" />
+          Archive
+        </button>
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRemove?.(company);
+          }}
+          className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] border border-border text-muted-foreground hover:text-red-500 hover:border-red-500/40 hover:bg-red-500/5 transition-colors ml-auto"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+          Remove
+        </button>
       </div>
     </motion.div>
   );

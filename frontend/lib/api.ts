@@ -161,14 +161,119 @@ export async function discoverCompanies(payload: {
 
 export async function fetchDiscoveredCompanies(
   userId: string,
-  opts?: { limit?: number; minScore?: number }
+  opts?: {
+    limit?: number;
+    offset?: number;
+    minScore?: number;
+    includeArchived?: boolean;
+    includeRemoved?: boolean;
+    stage?: string;
+    source?: string;
+  }
 ) {
   const params = new URLSearchParams({ user_id: userId });
   if (opts?.limit) params.set("limit", String(opts.limit));
+  if (opts?.offset != null) params.set("offset", String(opts.offset));
   if (opts?.minScore != null) params.set("min_score", String(opts.minScore));
+  if (opts?.includeArchived) params.set("include_archived", "true");
+  if (opts?.includeRemoved) params.set("include_removed", "true");
+  if (opts?.stage) params.set("stage", opts.stage);
+  if (opts?.source) params.set("source", opts.source);
   const res = await fetch(`${API_URL}/company-finder/companies?${params}`);
   if (!res.ok) throw new Error("Failed to fetch companies");
   return res.json() as Promise<{ companies: import("./types").Company[]; total: number }>;
+}
+
+export async function updateWorkspaceCompany(
+  companyId: string,
+  payload: {
+    user_id: string;
+    archived?: boolean;
+    removed?: boolean;
+    liked?: boolean;
+    disliked?: boolean;
+    notes?: string;
+    orchestration_stage?: string;
+    personalization_completed?: boolean;
+    outreach_started?: boolean;
+    outreach_sent?: boolean;
+  }
+) {
+  const res = await fetch(`${API_URL}/company-finder/companies/${companyId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to update company workspace state");
+  return res.json();
+}
+
+export async function sendCompanyFeedback(
+  companyId: string,
+  payload: {
+    user_id: string;
+    feedback_type: "like" | "dislike";
+    feedback_reason?: string;
+  }
+) {
+  const res = await fetch(`${API_URL}/company-finder/companies/${companyId}/feedback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to save company feedback");
+  return res.json();
+}
+
+export async function continueCompanyDiscovery(payload: {
+  user_id: string;
+  count?: number;
+  source_mode?: string;
+}) {
+  const res = await fetch(`${API_URL}/company-finder/continue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to continue discovery");
+  return res.json() as Promise<{ task_id: string; status: string }>;
+}
+
+export async function fetchDiscoverySessions(
+  userId: string,
+  opts?: { limit?: number; offset?: number }
+) {
+  const params = new URLSearchParams();
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  if (opts?.offset != null) params.set("offset", String(opts.offset));
+  const res = await fetch(`${API_URL}/company-finder/discovery-sessions/${encodeURIComponent(userId)}?${params.toString()}`);
+  if (!res.ok) throw new Error("Failed to fetch discovery sessions");
+  return res.json() as Promise<{ sessions: import("./types").DiscoverySession[]; total: number }>;
+}
+
+export async function fetchOrchestrationState(userId: string) {
+  const res = await fetch(`${API_URL}/company-finder/orchestration/${encodeURIComponent(userId)}`);
+  if (!res.ok) throw new Error("Failed to fetch orchestration state");
+  return res.json() as Promise<{ state: import("./types").OrchestrationState | null }>;
+}
+
+export async function saveOrchestrationState(
+  userId: string,
+  payload: {
+    current_stage?: string;
+    progress?: Record<string, unknown>;
+    active_agents?: string[];
+    paused_state?: boolean;
+    last_task_id?: string;
+  }
+) {
+  const res = await fetch(`${API_URL}/company-finder/orchestration/${encodeURIComponent(userId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to save orchestration state");
+  return res.json() as Promise<{ state: import("./types").OrchestrationState }>;
 }
 
 export async function fetchCompanyDetail(companyId: string) {

@@ -275,6 +275,16 @@ export default function CompanyDetailModal({
                 </div>
 
                 <div className="flex flex-wrap gap-2 mt-2">
+                  {company.workspace?.source && (
+                    <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-muted border border-border text-muted-foreground">
+                      Source: {company.workspace.source}
+                    </span>
+                  )}
+                  {company.workspace?.orchestration_stage && (
+                    <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-primary/10 border border-primary/30 text-primary">
+                      Stage: {company.workspace.orchestration_stage}
+                    </span>
+                  )}
                   {company.website_url && (
                     <a
                       href={company.website_url}
@@ -348,7 +358,7 @@ export default function CompanyDetailModal({
                     )}
                     {company.mission && company.mission !== company.description && (
                       <p className="text-sm text-muted-foreground leading-relaxed mt-1 italic">
-                        "{company.mission}"
+                        &quot;{company.mission}&quot;
                       </p>
                     )}
                   </section>
@@ -453,6 +463,19 @@ export default function CompanyDetailModal({
                     </h3>
                     <p className="text-sm text-muted-foreground leading-relaxed bg-muted/40 rounded-xl p-3">
                       {ranking.match_explanation}
+                    </p>
+                  </section>
+                )}
+
+                {/* Application Strategy */}
+                {(company.workspace?.application_strategy || company.application_strategy) && (
+                  <section>
+                    <h3 className="text-sm font-semibold text-foreground mb-2 flex items-center gap-2">
+                      <Send className="w-4 h-4 text-primary" />
+                      Recommended Application Strategy
+                    </h3>
+                    <p className="text-sm text-muted-foreground leading-relaxed bg-muted/40 rounded-xl p-3">
+                      {company.workspace?.application_strategy || company.application_strategy}
                     </p>
                   </section>
                 )}

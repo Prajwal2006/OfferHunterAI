@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -118,6 +119,19 @@ class CompanyFinderAgent:
             f"Starting Company Finder Agent for user {user_id}",
             {"run_id": run_id})
 
+        await supabase_client.upsert_orchestration_state({
+            "user_id": user_id,
+            "current_stage": "CompanyFinder",
+            "active_agents": [self.AGENT_NAME],
+            "paused_state": False,
+            "last_task_id": task_id,
+            "progress": {
+                "step": "resume_parse",
+                "completed_steps": [],
+                "percent": 0.1,
+            },
+        })
+
         # ── Step 1: Parse Resume ──────────────────────────────────────────────
         await self._emit("running", task_id, "Parsing resume with AI...")
         profile = await self._resume_parser.parse(resume_text)
@@ -137,14 +151,75 @@ class CompanyFinderAgent:
         # ── Step 2: Use provided preferences or empty dict ────────────────────
         prefs = preferences or {}
 
+        # Learn from explicit like/dislike feedback and nudge future ranking/search.
+        feedback_learning = await supabase_client.summarize_feedback_learning(user_id)
+        prefs = self._merge_feedback_learning_into_preferences(prefs, feedback_learning)
+
+        await supabase_client.upsert_orchestration_state({
+            "user_id": user_id,
+            "current_stage": "CompanyFinder",
+            "active_agents": [self.AGENT_NAME],
+            "paused_state": False,
+            "last_task_id": task_id,
+            "progress": {
+                "step": "company_discovery",
+                "completed_steps": ["resume_parse"],
+                "percent": 0.35,
+                "feedback_learning": feedback_learning,
+            },
+        })
+
         # ── Step 3: Discover companies ────────────────────────────────────────
         companies = await self._run_discovery(task_id, profile, prefs, count)
+
+        prefs_snapshot = {k: v for k, v in prefs.items() if not k.startswith("_")}
+        discovery_session = await supabase_client.create_discovery_session({
+            "user_id": user_id,
+            "queries_used": profile.get("keywords", [])[:20],
+            "preferences_snapshot": prefs_snapshot,
+            "companies_found": len(companies),
+            "total_companies_found": len(companies),
+            "sources_searched": [c.get("source") for c in companies if c.get("source")],
+            "sources_used": list({c.get("source") for c in companies if c.get("source")}),
+            "embedding_version": "text-embedding-3-small",
+            "status": "running",
+        })
+        discovery_session_id = discovery_session.get("id")
+
+        await supabase_client.upsert_orchestration_state({
+            "user_id": user_id,
+            "current_stage": "Personalization" if companies else "CompanyFinder",
+            "active_agents": [self.AGENT_NAME],
+            "paused_state": False,
+            "last_task_id": task_id,
+            "progress": {
+                "step": "contact_discovery",
+                "completed_steps": ["resume_parse", "company_discovery"],
+                "percent": 0.65,
+                "companies_found": len(companies),
+            },
+        })
 
         # ── Step 4: Find contacts ─────────────────────────────────────────────
         companies = await self._run_contact_discovery(task_id, companies)
 
         # ── Step 5: Persist companies + rankings ──────────────────────────────
-        companies = await self._persist_companies(task_id, user_id, companies)
+        companies = await self._persist_companies(
+            task_id,
+            user_id,
+            companies,
+            discovery_session_id=discovery_session_id,
+            manually_added=False,
+        )
+
+        if discovery_session_id:
+            await supabase_client.update_discovery_session(discovery_session_id, {
+                "status": "completed",
+                "completed_at": datetime.utcnow().isoformat(),
+                "companies_found": len(companies),
+                "total_companies_found": len(companies),
+                "sources_used": list({c.get("source") for c in companies if c.get("source")}),
+            })
 
         # Persist agent run
         await supabase_client.insert_agent_run({
@@ -155,6 +230,20 @@ class CompanyFinderAgent:
             "status": "completed",
             "input": {"resume_length": len(resume_text), "count": count},
             "output": {"companies_found": len(companies)},
+        })
+
+        await supabase_client.upsert_orchestration_state({
+            "user_id": user_id,
+            "current_stage": "Personalization" if companies else "CompanyFinder",
+            "active_agents": [],
+            "paused_state": False,
+            "last_task_id": task_id,
+            "progress": {
+                "step": "company_discovery_complete",
+                "completed_steps": ["resume_parse", "company_discovery", "contact_discovery"],
+                "percent": 1.0,
+                "companies_found": len(companies),
+            },
         })
 
         await self._emit("completed", task_id,
@@ -179,6 +268,7 @@ class CompanyFinderAgent:
         preferences: dict[str, Any],
         count: int = 25,
         user_id: str | None = None,
+        excluded_domains: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Run discovery + ranking without the resume parse step.
@@ -186,13 +276,55 @@ class CompanyFinderAgent:
         """
         await self._emit("started", task_id,
             f"Starting company discovery — {len(profile.get('skills', []))} skills, "
-            f"{len(preferences.get('preferred_roles', []))} target roles")
+            f"{len(preferences.get('preferred_roles', []))} target roles"
+            + (f", excluding {len(excluded_domains)} already-known domains" if excluded_domains else ""))
 
-        companies = await self._run_discovery(task_id, profile, preferences, count)
+        if user_id:
+            await supabase_client.upsert_orchestration_state({
+                "user_id": user_id,
+                "current_stage": "CompanyFinder",
+                "active_agents": [self.AGENT_NAME],
+                "paused_state": False,
+                "last_task_id": task_id,
+                "progress": {"step": "company_discovery", "percent": 0.25},
+            })
+
+        companies = await self._run_discovery(task_id, profile, preferences, count, excluded_domains=excluded_domains)
         companies = await self._run_contact_discovery(task_id, companies)
 
         if user_id:
-            companies = await self._persist_companies(task_id, user_id, companies)
+            # Strip internal _ prefixed keys before persisting (they contain large sets/lists)
+            prefs_snapshot = {k: v for k, v in preferences.items() if not k.startswith("_")}
+            discovery_session = await supabase_client.create_discovery_session({
+                "user_id": user_id,
+                "queries_used": profile.get("keywords", [])[:20],
+                "preferences_snapshot": prefs_snapshot,
+                "companies_found": len(companies),
+                "total_companies_found": len(companies),
+                "sources_searched": [c.get("source") for c in companies if c.get("source")],
+                "sources_used": list({c.get("source") for c in companies if c.get("source")}),
+                "embedding_version": "text-embedding-3-small",
+                "status": "completed",
+            })
+            companies = await self._persist_companies(
+                task_id,
+                user_id,
+                companies,
+                discovery_session_id=discovery_session.get("id"),
+                manually_added=False,
+            )
+            await supabase_client.upsert_orchestration_state({
+                "user_id": user_id,
+                "current_stage": "Personalization" if companies else "CompanyFinder",
+                "active_agents": [],
+                "paused_state": False,
+                "last_task_id": task_id,
+                "progress": {
+                    "step": "company_discovery_complete",
+                    "percent": 1.0,
+                    "companies_found": len(companies),
+                },
+            })
 
         await self._emit("completed", task_id,
             f"Discovery complete — {len(companies)} companies found",
@@ -256,7 +388,13 @@ class CompanyFinderAgent:
         await self._emit("running", task_id, f"Ranking {company.get('name', 'company')} against your profile...")
         ranked = await self._ranker.rank([company], profile=profile, preferences=preferences)
         ranked = await self._run_contact_discovery(task_id, ranked)
-        ranked = await self._persist_companies(task_id, user_id, ranked)
+        ranked = await self._persist_companies(
+            task_id,
+            user_id,
+            ranked,
+            discovery_session_id=None,
+            manually_added=True,
+        )
 
         result = ranked[0]
         await self._emit(
@@ -279,6 +417,7 @@ class CompanyFinderAgent:
         profile: dict[str, Any],
         preferences: dict[str, Any],
         count: int,
+        excluded_domains: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Full discovery pipeline:
@@ -302,6 +441,7 @@ class CompanyFinderAgent:
             preferences=preferences,
             target_count=count,
             progress_callback=progress_cb,
+            excluded_domains=excluded_domains,
         )
 
         await self._emit(
@@ -401,29 +541,50 @@ class CompanyFinderAgent:
         return companies
 
     async def _persist_companies(
-        self, task_id: str, user_id: str, companies: list[dict[str, Any]]
+        self,
+        task_id: str,
+        user_id: str,
+        companies: list[dict[str, Any]],
+        discovery_session_id: Optional[str],
+        manually_added: bool,
     ) -> list[dict[str, Any]]:
         """Upsert companies and rankings into Supabase."""
         await self._emit("running", task_id, "Saving companies and rankings to database...")
 
         persisted = []
         for company in companies:
+            ranking: dict[str, Any] = {}
+            contacts: list = []
             try:
                 ranking = company.pop("ranking", {})
                 contacts = company.pop("contacts", [])
 
-                # Upsert company
+                # domain is required for the companies table unique constraint
+                if not company.get("domain"):
+                    company["domain"] = (
+                        (company.get("website_url") or "")
+                        .replace("https://", "")
+                        .replace("http://", "")
+                        .split("/")[0]
+                        .strip()
+                        or f"unknown-{company.get('name', 'co').lower().replace(' ', '-')}"
+                    )
+
+                # Upsert company (shared company record, keyed by domain)
                 saved = await supabase_client.upsert_company({
                     **company,
                     "user_id": user_id,
                 })
                 company_id = saved.get("id") or company.get("id")
+                if not company_id:
+                    raise ValueError(f"No company_id returned for {company.get('name')!r}")
+
                 company["id"] = company_id
                 company["ranking"] = ranking
                 company["contacts"] = contacts
 
                 # Upsert ranking
-                if company_id and ranking:
+                if ranking:
                     await supabase_client.upsert_company_ranking({
                         "user_id": user_id,
                         "company_id": company_id,
@@ -431,15 +592,42 @@ class CompanyFinderAgent:
                     })
 
                 # Insert contacts
-                if company_id and contacts:
+                if contacts:
                     await supabase_client.insert_company_contacts(
                         company_id=company_id, contacts=contacts
                     )
 
+                application_strategy = self._derive_application_strategy(company, contacts)
+                await supabase_client.upsert_user_company({
+                    "user_id": user_id,
+                    "company_id": company_id,
+                    "discovery_session_id": discovery_session_id,
+                    "source": company.get("source", "unknown"),
+                    "status": "active",
+                    "orchestration_stage": "Personalization",
+                    "manually_added": manually_added,
+                    "personalization_completed": False,
+                    "outreach_started": False,
+                    "outreach_sent": False,
+                    "ranking_score": ranking.get("match_score", company.get("relevance_score", 0)),
+                    "ranking_explanation": ranking.get("match_explanation", ""),
+                    "ranking_metadata": ranking,
+                    "application_strategy": application_strategy,
+                    "metadata": {
+                        "extended_ranking": company.get("extended_ranking", {}),
+                        "domain": company.get("domain"),
+                    },
+                })
+
                 persisted.append(company)
-            except Exception:
-                company.setdefault("ranking", ranking if "ranking" in dir() else {})
-                company.setdefault("contacts", contacts if "contacts" in dir() else [])
+            except Exception as exc:
+                # Log the failure so it's visible in the SSE stream for debugging
+                await self._emit(
+                    "running", task_id,
+                    f"Warning: could not persist '{company.get('name', '?')}' — {exc}",
+                )
+                company["ranking"] = ranking
+                company["contacts"] = contacts
                 persisted.append(company)
 
         return persisted
@@ -460,3 +648,55 @@ class CompanyFinderAgent:
             message=message,
             metadata=metadata or {},
         )
+
+    @staticmethod
+    def _merge_feedback_learning_into_preferences(
+        preferences: dict[str, Any],
+        learning: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(preferences)
+
+        preferred_industries = list(merged.get("industries_of_interest", []) or [])
+        for industry in learning.get("liked_industries", []):
+            if industry not in preferred_industries:
+                preferred_industries.append(industry)
+        merged["industries_of_interest"] = preferred_industries
+
+        avoided_industries = list(merged.get("avoided_industries", []) or [])
+        for industry in learning.get("disliked_industries", []):
+            if industry not in avoided_industries:
+                avoided_industries.append(industry)
+        merged["avoided_industries"] = avoided_industries
+
+        preferred_stack = list(merged.get("preferred_tech_stack", []) or [])
+        for tech in learning.get("liked_tech", []):
+            if tech not in preferred_stack:
+                preferred_stack.append(tech)
+        merged["preferred_tech_stack"] = preferred_stack
+
+        return merged
+
+    @staticmethod
+    def _derive_application_strategy(
+        company: dict[str, Any],
+        contacts: list[dict[str, Any]],
+    ) -> str:
+        titles = " ".join((c.get("title") or "").lower() for c in contacts)
+        has_founder = any((c.get("contact_type") or "") == "founder" for c in contacts)
+        has_recruiter = any((c.get("contact_type") or "") in {"recruiter", "hr"} for c in contacts)
+        has_hiring_manager = "engineering manager" in titles or any(
+            (c.get("contact_type") or "") == "hiring_manager" for c in contacts
+        )
+        stage = (company.get("funding_stage") or "").lower()
+
+        if has_founder and any(x in stage for x in ["seed", "series a", "yc"]):
+            return "Cold email founder with product + execution proof, then apply through careers page"
+        if has_hiring_manager:
+            return "Reach out directly to the hiring manager with a tailored project case study"
+        if has_recruiter:
+            return "Apply through careers page first, then send a concise recruiter follow-up"
+        if company.get("source") == "YCombinator":
+            return "Apply via YC jobs and follow up with a founder-focused intro email"
+        if company.get("source") == "RemoteOK":
+            return "Apply through remote role listing and include async collaboration examples"
+        return "Apply on careers page, then send a personalized outreach email to engineering leadership"

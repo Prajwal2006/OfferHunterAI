@@ -63,7 +63,7 @@ class HackerNewsSource(CompanySource):
                 params: dict[str, Any] = {
                     "query": query,
                     "numericFilters": "created_at_i>1700000000",
-                    "hitsPerPage": 50,
+                        "hitsPerPage": 100,
                 }
                 if story_id:
                     params["tags"] = f"comment,story_{story_id}"
@@ -87,7 +87,7 @@ class HackerNewsSource(CompanySource):
             extracted = self._extract_companies_from_post(title, text)
             companies.extend(extracted)
 
-        results = [normalize_company(c, self.SOURCE_NAME) for c in companies[:10]]
+        results = [normalize_company(c, self.SOURCE_NAME) for c in companies[:30]]
         await self._notify(progress_callback, f"Found {len(results)} companies on Hacker News")
         return results
 

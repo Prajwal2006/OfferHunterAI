@@ -126,7 +126,7 @@ class CompanyFinderRunRequest(BaseModel):
     resume_text: Optional[str] = None
     resume_version_id: Optional[str] = None
     preferences: Optional[dict[str, Any]] = None
-    count: int = 25
+    count: int = 60
 
 
 class PreferenceChatRequest(BaseModel):
@@ -149,6 +149,39 @@ class ParseResumeRequest(BaseModel):
 class ManualCompanyRequest(BaseModel):
     user_id: str
     website_url: str
+
+
+class CompanyWorkspaceUpdateRequest(BaseModel):
+    user_id: str
+    archived: Optional[bool] = None
+    removed: Optional[bool] = None
+    liked: Optional[bool] = None
+    disliked: Optional[bool] = None
+    notes: Optional[str] = None
+    orchestration_stage: Optional[str] = None
+    personalization_completed: Optional[bool] = None
+    outreach_started: Optional[bool] = None
+    outreach_sent: Optional[bool] = None
+
+
+class CompanyFeedbackRequest(BaseModel):
+    user_id: str
+    feedback_type: str
+    feedback_reason: Optional[str] = ""
+
+
+class ContinueDiscoveryRequest(BaseModel):
+    user_id: str
+    count: int = 40
+    source_mode: Optional[str] = None
+
+
+class OrchestrationStateUpdateRequest(BaseModel):
+    current_stage: Optional[str] = None
+    progress: Optional[dict[str, Any]] = None
+    active_agents: Optional[list[str]] = None
+    paused_state: Optional[bool] = None
+    last_task_id: Optional[str] = None
 
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Agent Event Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -676,43 +709,118 @@ async def get_parsed_profile(user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _workspace_row_to_company(row: dict[str, Any]) -> dict[str, Any]:
+    company = dict(row.get("companies") or {})
+
+    # Prefer ranking data stored directly on the user_companies row
+    # (avoids a fragile cross-table join that doesn't work reliably with supabase-py)
+    ranking_metadata: dict[str, Any] = row.get("ranking_metadata") or {}
+    if ranking_metadata:
+        company["ranking"] = {
+            k: v
+            for k, v in ranking_metadata.items()
+            if k not in {"id", "company_id", "user_id", "created_at", "updated_at"}
+        }
+    company["match_score"] = (
+        ranking_metadata.get("match_score")
+        or row.get("ranking_score")
+        or company.get("relevance_score")
+        or 0
+    )
+
+    company["workspace"] = {
+        "id": row.get("id"),
+        "source": row.get("source"),
+        "discovered_at": row.get("discovered_at"),
+        "status": row.get("status"),
+        "orchestration_stage": row.get("orchestration_stage"),
+        "liked": row.get("liked"),
+        "disliked": row.get("disliked"),
+        "archived": row.get("archived", False),
+        "removed": row.get("removed", False),
+        "manually_added": row.get("manually_added", False),
+        "personalization_completed": row.get("personalization_completed", False),
+        "outreach_started": row.get("outreach_started", False),
+        "outreach_sent": row.get("outreach_sent", False),
+        "notes": row.get("notes") or "",
+        "application_strategy": row.get("application_strategy") or "",
+        "ranking_score": row.get("ranking_score"),
+        "ranking_explanation": row.get("ranking_explanation") or "",
+    }
+    return company
+
+
 @app.get("/company-finder/companies")
 async def get_discovered_companies(
     user_id: str,
     limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     min_score: float = Query(0.0, ge=0.0, le=1.0),
+    include_archived: bool = Query(False),
+    include_removed: bool = Query(False),
+    stage: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
 ):
     """
     Get discovered and ranked companies for a user.
     Includes rankings and contacts.
     """
     try:
-        # Try Supabase first
-        rankings = await supabase_client.get_company_rankings(user_id, limit=limit)
+        rows = await supabase_client.get_user_companies(
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+            include_archived=include_archived,
+            include_removed=include_removed,
+            stage=stage,
+            source=source,
+        )
 
-        if rankings:
-            # Flatten: merge company data with ranking data
-            companies = []
-            for row in rankings:
-                company = row.get("companies") or {}
-                company["ranking"] = {
+        companies = []
+        for row in rows:
+            company = _workspace_row_to_company(row)
+            score = (
+                (company.get("ranking") or {}).get("match_score")
+                or company.get("match_score")
+                or row.get("ranking_score")
+                or company.get("relevance_score")
+                or 0
+            )
+            if score >= min_score:
+                companies.append(company)
+
+        if companies:
+            return {"companies": companies, "total": len(companies), "offset": offset, "limit": limit}
+
+        # ── Fallback 1: legacy company_rankings table ──────────────────────────
+        # user_companies might be empty if migration 005 hasn't been run or
+        # companies were stored before the new persistence layer was added.
+        ranking_rows = await supabase_client.get_company_rankings(user_id, limit=limit)
+        if ranking_rows:
+            legacy = []
+            for row in ranking_rows:
+                c = dict(row.get("companies") or {})
+                if not c:
+                    continue
+                c["ranking"] = {
                     k: v for k, v in row.items()
-                    if k not in ("id", "companies", "company_id", "user_id", "created_at", "updated_at")
+                    if k not in {"id", "company_id", "user_id", "created_at", "updated_at", "companies"}
                 }
-                company["match_score"] = row.get("match_score", 0)
-                if company.get("id") and min_score <= row.get("match_score", 0):
-                    companies.append(company)
-            if companies:
-                return {"companies": companies, "total": len(companies)}
+                c["match_score"] = row.get("match_score", 0)
+                legacy.append(c)
+            if legacy:
+                return {"companies": legacy[:limit], "total": len(legacy), "offset": 0, "limit": limit}
 
-        # Fall back to in-memory cache (populated by the most recent agent run)
+        # ── Fallback 2: in-memory cache (cleared on server restart) ───────────
         cached = _user_companies_cache.get(user_id, [])
         if cached:
             filtered = [c for c in cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
-            return {"companies": filtered[:limit], "total": len(filtered)}
+            return {"companies": filtered[:limit], "total": len(filtered), "offset": 0, "limit": limit}
 
-        return {"companies": [], "total": 0}
+        return {"companies": [], "total": 0, "offset": offset, "limit": limit}
     except Exception as e:
+        import traceback
+        print(f"[companies endpoint] ERROR for user {user_id}: {e}\n{traceback.format_exc()}")
         # Fall back to in-memory cache on any DB error
         cached = _user_companies_cache.get(user_id, [])
         if cached:
@@ -780,6 +888,172 @@ async def get_company_detail(company_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.patch("/company-finder/companies/{company_id}")
+async def update_workspace_company(company_id: str, request: CompanyWorkspaceUpdateRequest):
+    """Update persistent user-company workspace state (archive/remove/notes/stage)."""
+    try:
+        updates = {
+            k: v
+            for k, v in request.model_dump().items()
+            if k != "user_id" and v is not None
+        }
+        if not updates:
+            return {"updated": False, "reason": "No fields provided"}
+
+        row = await supabase_client.update_user_company(request.user_id, company_id, updates)
+        return {"updated": True, "workspace": row}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/company-finder/companies/{company_id}/feedback")
+async def save_company_feedback(company_id: str, request: CompanyFeedbackRequest):
+    """Persist like/dislike feedback and immediately reflect it in workspace state."""
+    if request.feedback_type not in {"like", "dislike"}:
+        raise HTTPException(status_code=400, detail="feedback_type must be 'like' or 'dislike'")
+
+    try:
+        feedback = await supabase_client.record_company_feedback(
+            user_id=request.user_id,
+            company_id=company_id,
+            feedback_type=request.feedback_type,
+            feedback_reason=request.feedback_reason or "",
+        )
+
+        await supabase_client.update_user_company(
+            request.user_id,
+            company_id,
+            {
+                "liked": request.feedback_type == "like",
+                "disliked": request.feedback_type == "dislike",
+            },
+        )
+
+        return {"feedback": feedback}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/company-finder/continue")
+async def continue_company_discovery(request: ContinueDiscoveryRequest):
+    """
+    Continue discovery without replacing workspace.
+    Supports optional source_mode to bias source selection through preferences.
+    """
+    task_id = str(uuid.uuid4())
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
+    agent = CompanyFinderAgent(logger=logger)
+
+    profile = await supabase_client.get_parsed_profile(request.user_id) or {}
+    preferences = await supabase_client.get_user_preferences(request.user_id) or {}
+    if request.source_mode:
+        preferences["source_mode"] = request.source_mode
+
+    # ── Build exclusion set from every company already in the workspace ───────
+    excluded_domains: set[str] = set()
+    excluded_names: set[str] = set()
+
+    # Pull from DB first (most reliable)
+    try:
+        existing_rows = await supabase_client.get_user_companies(
+            user_id=request.user_id, limit=500, include_archived=True, include_removed=True
+        )
+        for row in existing_rows:
+            c = row.get("companies") or {}
+            domain = (c.get("domain") or row.get("metadata", {}).get("domain") or "").lower().strip()
+            name = (c.get("name") or "").lower().strip()
+            if domain:
+                excluded_domains.add(domain)
+            if name:
+                excluded_names.add(name)
+    except Exception:
+        pass
+
+    # Also pull from in-memory cache as a safety net
+    for c in _user_companies_cache.get(request.user_id, []):
+        domain = (c.get("domain") or "").lower().strip()
+        name = (c.get("name") or "").lower().strip()
+        if domain:
+            excluded_domains.add(domain)
+        if name:
+            excluded_names.add(name)
+
+    # Determine discovery round from existing session count to vary AI framing
+    try:
+        sessions = await supabase_client.get_discovery_sessions(request.user_id, limit=100)
+        discovery_round = len(sessions) + 1
+    except Exception:
+        discovery_round = 2
+
+    preferences["_excluded_names"] = list(excluded_names)
+    preferences["_discovery_round"] = discovery_round
+
+    async def run_discovery():
+        try:
+            companies = await agent.run_discovery_only(
+                task_id=task_id,
+                profile=profile,
+                preferences=preferences,
+                count=request.count,
+                user_id=request.user_id,
+                excluded_domains=excluded_domains,
+            )
+
+            # Incremental workspace: merge with existing cache by id/domain.
+            existing = _user_companies_cache.get(request.user_id, [])
+            dedup: dict[str, dict[str, Any]] = {}
+            for c in existing + companies:
+                key = c.get("id") or (c.get("domain") or c.get("name") or "")
+                if key:
+                    dedup[str(key)] = c
+            _user_companies_cache[request.user_id] = list(dedup.values())
+        except Exception as e:
+            await logger.emit(
+                agent_name="CompanyFinderAgent",
+                task_id=task_id,
+                status="failed",
+                message=f"Continue discovery failed: {str(e)}",
+            )
+
+    asyncio.create_task(run_discovery())
+    return {"task_id": task_id, "status": "started", "excluded_count": len(excluded_domains)}
+
+
+@app.get("/company-finder/discovery-sessions/{user_id}")
+async def get_discovery_session_history(
+    user_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        sessions = await supabase_client.get_discovery_sessions(user_id, limit=limit, offset=offset)
+        return {"sessions": sessions, "total": len(sessions), "offset": offset, "limit": limit}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/company-finder/orchestration/{user_id}")
+async def get_orchestration_state(user_id: str):
+    try:
+        state = await supabase_client.get_orchestration_state(user_id)
+        return {"state": state}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/company-finder/orchestration/{user_id}")
+async def update_orchestration_state(user_id: str, request: OrchestrationStateUpdateRequest):
+    try:
+        payload = {"user_id": user_id}
+        payload.update({
+            k: v for k, v in request.model_dump().items() if v is not None
+        })
+        state = await supabase_client.upsert_orchestration_state(payload)
+        return {"state": state}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/company-finder/companies/{company_id}/handoff")
 async def handoff_to_agent(
     company_id: str,
@@ -825,6 +1099,36 @@ async def handoff_to_agent(
 
     agent = AgentClass(logger=logger)
     asyncio.create_task(agent.run(task_id=task_id, **handoff_context))
+
+    stage_map = {
+        "personalizer": "Personalization",
+        "email-writer": "EmailWriter",
+        "resume-tailor": "Review",
+    }
+    company_id_value = company.get("id")
+    if company_id_value:
+        await supabase_client.update_user_company(
+            user_id=user_id,
+            company_id=company_id_value,
+            updates={
+                "orchestration_stage": stage_map.get(target_agent.lower(), "Personalization"),
+                "personalization_completed": target_agent.lower() in {"personalizer", "email-writer", "resume-tailor"},
+                "outreach_started": target_agent.lower() in {"email-writer", "resume-tailor"},
+            },
+        )
+
+    await supabase_client.upsert_orchestration_state({
+        "user_id": user_id,
+        "current_stage": stage_map.get(target_agent.lower(), "Personalization"),
+        "active_agents": [target_agent],
+        "paused_state": False,
+        "last_task_id": task_id,
+        "progress": {
+            "step": "handoff",
+            "target_agent": target_agent,
+            "company_id": company_id,
+        },
+    })
 
     return {
         "task_id": task_id,

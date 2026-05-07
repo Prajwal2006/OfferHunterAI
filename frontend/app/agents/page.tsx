@@ -11,10 +11,11 @@ import OrchestrationFlow from "@/components/OrchestrationFlow";
 import TaskTimeline from "@/components/TaskTimeline";
 import { MOCK_PIPELINE } from "@/lib/mockData";
 import { RequireAuth } from "@/components/RequireAuth";
-import { fetchResumes, createEventSource } from "@/lib/api";
+import { fetchResumes, createEventSource, fetchOrchestrationState } from "@/lib/api";
 import { useAuth } from "@/components/AuthProvider";
 import { ResumeVersion } from "@/lib/types";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 // Map agent name tokens â†’ orchestration step IDs
 const AGENT_TO_STEP: Record<string, string> = {
@@ -119,14 +120,16 @@ function useAgentState() {
 export default function AgentsPage() {
   const { events, agents, isRunning, demoMode, startDemo, applyEvent } = useAgentState();
   const { session } = useAuth();
+  const router = useRouter();
   const [filterAgent, setFilterAgent] = useState<string>("all");
   const [activeResume, setActiveResume] = useState<ResumeVersion | null>(null);
+  const [persistedStage, setPersistedStage] = useState<string | undefined>(undefined);
   const logRef = useRef<HTMLDivElement>(null);
   const esRef = useRef<EventSource | null>(null);
 
   // Derive active step from agent states
   const runningAgent = agents.find((a) => a.status === "running");
-  const activeStep = runningAgent ? AGENT_TO_STEP[runningAgent.name] : undefined;
+  const activeStep = runningAgent ? AGENT_TO_STEP[runningAgent.name] : persistedStage;
 
   const filteredEvents =
     filterAgent === "all"
@@ -181,6 +184,54 @@ export default function AgentsPage() {
     }
     loadActiveResume();
   }, [session?.user?.id]);
+
+  useEffect(() => {
+    async function loadOrchestrationState() {
+      const userId = session?.user?.id;
+      if (!userId) return;
+      try {
+        const response = await fetchOrchestrationState(userId);
+        const stage = response.state?.current_stage;
+        if (typeof stage === "string" && stage.length > 0) {
+          setPersistedStage(stage);
+        }
+      } catch {
+        setPersistedStage(undefined);
+      }
+    }
+    loadOrchestrationState();
+  }, [session?.user?.id]);
+
+  const handleResumeFromStep = useCallback(
+    (stepId: string) => {
+      if (stepId === "CompanyFinder") {
+        router.push("/company-finder");
+        return;
+      }
+      if (stepId === "Personalization" || stepId === "EmailWriter") {
+        router.push("/pipeline");
+        return;
+      }
+      if (stepId === "Review") {
+        router.push("/review");
+        return;
+      }
+      if (stepId === "Sender") {
+        router.push("/analytics");
+      }
+    },
+    [router]
+  );
+
+  const handleAgentCardClick = useCallback(
+    (agent: AgentInfo) => {
+      const step = AGENT_TO_STEP[agent.name];
+      if (step) {
+        handleResumeFromStep(step);
+      }
+    },
+    [handleResumeFromStep]
+  );
 
   const agentNames = [...new Set(agents.map((a) => a.name))];
 
@@ -321,6 +372,7 @@ export default function AgentsPage() {
         <OrchestrationFlow
           activeStep={activeStep}
           currentTask={runningAgent?.currentTask}
+          onStepClick={handleResumeFromStep}
         />
       </motion.div>
 
@@ -336,7 +388,7 @@ export default function AgentsPage() {
           </div>
           <div className="grid sm:grid-cols-2 gap-4">
             {agents.map((agent, i) => (
-              <AgentCard key={agent.name} agent={agent} index={i} />
+              <AgentCard key={agent.name} agent={agent} index={i} onClick={handleAgentCardClick} />
             ))}
           </div>
         </div>

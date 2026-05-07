@@ -106,6 +106,17 @@ class QueryExpansionService:
         industries = ", ".join(list(preferences.get("industries_of_interest", []))[:3])
         experience = profile.get("experience_level", "mid-level")
         work_mode = preferences.get("work_mode", "flexible")
+        discovery_round: int = int(preferences.get("_discovery_round") or 1)
+
+        round_angle = {
+            1: "Focus on well-known and mainstream companies that are commonly listed on job boards.",
+            2: "Focus on niche, lesser-known, or emerging companies — avoid mainstream giants.",
+            3: "Focus on international, remote-first, or non-SF/NYC companies.",
+            4: "Focus on deep-tech, B2B SaaS, infrastructure, and developer-tools companies.",
+            5: "Focus on mission-driven, climate-tech, health-tech, and social-impact companies.",
+        }.get(discovery_round, f"Focus on an entirely different set of companies than previous rounds (diversity angle {discovery_round}).")
+
+        temperature = min(0.7 + (discovery_round - 1) * 0.05, 0.95)
 
         prompt = f"""Given this job seeker's profile, generate 15 diverse search queries to
 discover matching companies across job boards and databases.
@@ -115,6 +126,8 @@ Tech skills: {skills}
 Industries of interest: {industries or "any"}
 Experience level: {experience}
 Work mode preference: {work_mode}
+
+Discovery angle for this round: {round_angle}
 
 Generate queries that span:
 1. Adjacent job titles (e.g. "founding engineer", "staff engineer", "platform engineer")
@@ -136,7 +149,7 @@ Return a JSON object: {{"queries": ["query1", "query2", ...]}}"""
                 json={
                     "model": self._model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.7,
+                    "temperature": temperature,
                     "max_tokens": 512,
                     "response_format": {"type": "json_object"},
                 },
