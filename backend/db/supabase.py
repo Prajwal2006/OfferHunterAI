@@ -703,6 +703,42 @@ class SupabaseClient:
             "source_boost": source_delta,
         }
 
+    async def insert_discovery_source_log(self, log: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return log
+        result = client.table("discovery_source_logs").insert(log).execute()
+        return result.data[0] if result.data else log
+
+    async def get_discovery_source_logs(
+        self, user_id: str, session_id: Optional[str] = None, limit: int = 100
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        query = (
+            client.table("discovery_source_logs")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("started_at", desc=True)
+            .limit(limit)
+        )
+        if session_id:
+            query = query.eq("discovery_session_id", session_id)
+        result = query.execute()
+        return result.data or []
+
+    async def upsert_company_embedding(self, embedding: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return embedding
+        result = (
+            client.table("company_embeddings")
+            .upsert(embedding, on_conflict="domain")
+            .execute()
+        )
+        return result.data[0] if result.data else embedding
+
 
 # Singleton instance
 supabase_client = SupabaseClient()

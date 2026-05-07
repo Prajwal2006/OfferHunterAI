@@ -3,6 +3,7 @@ OfferHunter AI Ã¢â‚¬â€ FastAPI Backend
 """
 import asyncio
 import json
+import os
 import re
 import sys
 import uuid
@@ -43,6 +44,7 @@ except ImportError:
 # In-memory company results cache (user_id -> companies list)
 # Used as fallback when Supabase is not configured or rankings table is empty
 _user_companies_cache: dict[str, list] = {}
+USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ SSE Broadcast Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 # Each SSE connection gets its own queue so every subscriber receives every event.
@@ -127,6 +129,7 @@ class CompanyFinderRunRequest(BaseModel):
     resume_version_id: Optional[str] = None
     preferences: Optional[dict[str, Any]] = None
     count: int = 60
+    rediscover: bool = False
 
 
 class PreferenceChatRequest(BaseModel):
@@ -174,6 +177,52 @@ class ContinueDiscoveryRequest(BaseModel):
     user_id: str
     count: int = 40
     source_mode: Optional[str] = None
+
+
+async def _load_company_memory(user_id: str) -> dict[str, set[str]]:
+    """
+    Load every durable company memory signal used to avoid repeated recommendations.
+    Includes hidden rows so archived, removed, disliked, and applied companies are
+    still treated as seen unless the caller explicitly requests rediscovery.
+    """
+    memory = {
+        "seen_domains": set(),
+        "seen_names": set(),
+        "disliked_domains": set(),
+        "applied_domains": set(),
+    }
+
+    try:
+        rows = await supabase_client.get_user_companies(
+            user_id=user_id,
+            limit=1000,
+            include_archived=True,
+            include_removed=True,
+        )
+        for row in rows:
+            company = row.get("companies") or {}
+            domain = (company.get("domain") or row.get("metadata", {}).get("domain") or "").lower().strip()
+            name = (company.get("name") or "").lower().strip()
+            if domain:
+                memory["seen_domains"].add(domain)
+                if row.get("disliked") or row.get("removed"):
+                    memory["disliked_domains"].add(domain)
+                if row.get("outreach_sent"):
+                    memory["applied_domains"].add(domain)
+            if name:
+                memory["seen_names"].add(name)
+    except Exception:
+        pass
+
+    for company in _user_companies_cache.get(user_id, []):
+        domain = (company.get("domain") or "").lower().strip()
+        name = (company.get("name") or "").lower().strip()
+        if domain:
+            memory["seen_domains"].add(domain)
+        if name:
+            memory["seen_names"].add(name)
+
+    return memory
 
 
 class OrchestrationStateUpdateRequest(BaseModel):
@@ -363,7 +412,7 @@ async def get_emails(status: Optional[str] = None):
         result = await supabase_client.get_emails(status=status)
         return {"emails": result}
     except Exception:
-        return {"emails": _mock_emails(status)}
+        return {"emails": _mock_emails(status) if USE_MOCK_DATA else []}
 
 
 @app.patch("/emails/{email_id}")
@@ -535,12 +584,23 @@ async def run_company_finder(request: CompanyFinderRunRequest):
 
     async def run_pipeline():
         try:
+            preferences = dict(request.preferences or {})
+            excluded_domains: set[str] | None = None
+            if not request.rediscover:
+                memory = await _load_company_memory(request.user_id)
+                excluded_domains = memory["seen_domains"] | memory["disliked_domains"] | memory["applied_domains"]
+                preferences["_excluded_names"] = sorted(memory["seen_names"])
+                preferences["_seen_domains"] = sorted(memory["seen_domains"])
+                preferences["_disliked_domains"] = sorted(memory["disliked_domains"])
+                preferences["_applied_domains"] = sorted(memory["applied_domains"])
+
             result = await agent.run_full_pipeline(
                 task_id=task_id,
                 user_id=request.user_id,
                 resume_text=resume_text,
-                preferences=request.preferences,
+                preferences=preferences,
                 count=request.count,
+                excluded_domains=excluded_domains,
             )
             # Cache companies in memory so the GET endpoint can serve them
             # even when Supabase is not configured
@@ -573,6 +633,16 @@ async def discover_companies(request: CompanyFinderRunRequest):
         or await supabase_client.get_user_preferences(request.user_id)
         or {}
     )
+    preferences = dict(preferences)
+
+    excluded_domains: set[str] | None = None
+    if not request.rediscover:
+        memory = await _load_company_memory(request.user_id)
+        excluded_domains = memory["seen_domains"] | memory["disliked_domains"] | memory["applied_domains"]
+        preferences["_excluded_names"] = sorted(memory["seen_names"])
+        preferences["_seen_domains"] = sorted(memory["seen_domains"])
+        preferences["_disliked_domains"] = sorted(memory["disliked_domains"])
+        preferences["_applied_domains"] = sorted(memory["applied_domains"])
 
     async def run_discovery():
         try:
@@ -582,6 +652,7 @@ async def discover_companies(request: CompanyFinderRunRequest):
                 preferences=preferences,
                 count=request.count,
                 user_id=request.user_id,
+                excluded_domains=excluded_domains,
             )
             if companies:
                 _user_companies_cache[request.user_id] = companies
@@ -1028,6 +1099,23 @@ async def get_discovery_session_history(
     try:
         sessions = await supabase_client.get_discovery_sessions(user_id, limit=limit, offset=offset)
         return {"sessions": sessions, "total": len(sessions), "offset": offset, "limit": limit}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/company-finder/source-logs/{user_id}")
+async def get_discovery_source_logs(
+    user_id: str,
+    session_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=300),
+):
+    try:
+        logs = await supabase_client.get_discovery_source_logs(
+            user_id=user_id,
+            session_id=session_id,
+            limit=limit,
+        )
+        return {"logs": logs, "total": len(logs)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

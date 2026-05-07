@@ -62,6 +62,14 @@ export async function rejectEmail(emailId: string, reason?: string) {
   return res.json();
 }
 
+export async function sendEmail(emailId: string) {
+  const res = await fetch(`${API_URL}/emails/${emailId}/send`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Failed to send email");
+  return res.json();
+}
+
 export async function editEmail(
   emailId: string,
   updates: {
@@ -135,6 +143,7 @@ export async function runCompanyFinder(payload: {
   resume_version_id?: string;
   preferences?: Record<string, unknown>;
   count?: number;
+  rediscover?: boolean;
 }) {
   const res = await fetch(`${API_URL}/company-finder/run`, {
     method: "POST",
@@ -249,6 +258,20 @@ export async function fetchDiscoverySessions(
   const res = await fetch(`${API_URL}/company-finder/discovery-sessions/${encodeURIComponent(userId)}?${params.toString()}`);
   if (!res.ok) throw new Error("Failed to fetch discovery sessions");
   return res.json() as Promise<{ sessions: import("./types").DiscoverySession[]; total: number }>;
+}
+
+export async function fetchDiscoverySourceLogs(
+  userId: string,
+  opts?: { sessionId?: string; limit?: number }
+) {
+  const params = new URLSearchParams();
+  if (opts?.sessionId) params.set("session_id", opts.sessionId);
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const res = await fetch(
+    `${API_URL}/company-finder/source-logs/${encodeURIComponent(userId)}?${params.toString()}`
+  );
+  if (!res.ok) throw new Error("Failed to fetch source logs");
+  return res.json() as Promise<{ logs: import("./types").DiscoverySourceLog[]; total: number }>;
 }
 
 export async function fetchOrchestrationState(userId: string) {

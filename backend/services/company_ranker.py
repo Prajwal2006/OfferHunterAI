@@ -202,6 +202,23 @@ class CompanyRankerService:
             pass  # Semantic scoring is best-effort
 
         ranked = []
+        source_counts: dict[str, int] = {}
+        industry_counts: dict[str, int] = {}
+        seen_domains = {
+            str(d).lower().strip().removeprefix("www.")
+            for d in preferences.get("_seen_domains", [])
+        }
+        disliked_domains = {
+            str(d).lower().strip().removeprefix("www.")
+            for d in preferences.get("_disliked_domains", [])
+        }
+        applied_domains = {
+            str(d).lower().strip().removeprefix("www.")
+            for d in preferences.get("_applied_domains", [])
+        }
+        source_boost = preferences.get("_feedback_learning", {}).get("source_boost", {})
+        exploratory_sources = {"HackerNews", "Wellfound", "WorkAtAStartup", "AI Discovery", "YCombinator"}
+
         for company in companies:
             skills_match = _list_overlap_score(user_skills, company.get("tech_stack", []))
             tech_stack_match = _list_overlap_score(preferred_tech, company.get("tech_stack", []))
@@ -237,8 +254,8 @@ class CompanyRankerService:
             domain = (company.get("domain") or "").lower()
             semantic_similarity = semantic_scores.get(domain, 0.5)
 
-            # Weighted final score
-            match_score = (
+            # Core semantic/relevance score.
+            semantic_relevance = (
                 WEIGHTS["skills_match"] * skills_match
                 + WEIGHTS["interests_match"] * interests_match
                 + WEIGHTS["tech_stack_match"] * tech_stack_match
@@ -249,6 +266,37 @@ class CompanyRankerService:
                 + WEIGHTS["resume_match"] * resume_match
                 + WEIGHTS["company_size_match"] * company_size_match
                 + WEIGHTS["semantic_similarity"] * semantic_similarity
+            )
+            source = str(company.get("source") or "unknown")
+            industry = str(company.get("industry") or "unknown").lower()
+            source_seen = source_counts.get(source, 0)
+            industry_seen = industry_counts.get(industry, 0)
+            domain_key = (company.get("domain") or "").lower().strip().removeprefix("www.")
+
+            novelty_weight = 0.0 if domain_key in seen_domains else 0.12
+            if domain_key in disliked_domains or domain_key in applied_domains:
+                novelty_weight -= 0.35
+
+            diversity_weight = max(0.0, 0.10 - (industry_seen * 0.025) - (source_seen * 0.015))
+            hidden_gem = company_size_match >= 0.85 or any(
+                token in str(company.get("funding_stage") or "").lower()
+                for token in ["pre-seed", "seed", "series a", "yc"]
+            )
+            exploration_weight = 0.08 if (source in exploratory_sources and hidden_gem) else 0.03
+            hiring_signal_weight = 0.08 * hiring_likelihood
+            feedback_alignment = max(min(float(source_boost.get(source, 0)) * 0.025, 0.08), -0.08)
+
+            match_score = max(
+                0.0,
+                min(
+                    1.0,
+                    semantic_relevance
+                    + novelty_weight
+                    + diversity_weight
+                    + exploration_weight
+                    + hiring_signal_weight
+                    + feedback_alignment,
+                ),
             )
 
             ranking = {
@@ -263,6 +311,13 @@ class CompanyRankerService:
                 "hiring_likelihood": round(hiring_likelihood, 3),
                 "company_size_match": round(company_size_match, 3),
                 "semantic_similarity": round(semantic_similarity, 3),
+                "semantic_relevance": round(semantic_relevance, 3),
+                "novelty_score": round(max(novelty_weight, 0.0), 3),
+                "diversity_score": round(diversity_weight, 3),
+                "exploration_score": round(exploration_weight, 3),
+                "hiring_signal_score": round(hiring_signal_weight, 3),
+                "feedback_alignment": round(feedback_alignment, 3),
+                "exploration_reason": "Hidden-gem/startup exploration" if exploration_weight >= 0.08 else "Source diversity",
                 "match_explanation": "",
                 "strengths": [],
                 "gaps": [],
@@ -299,8 +354,11 @@ class CompanyRankerService:
             company["relevance_score"] = round(match_score, 3)
             company["ranking"] = ranking
             ranked.append(company)
+            source_counts[source] = source_counts.get(source, 0) + 1
+            industry_counts[industry] = industry_counts.get(industry, 0) + 1
 
         ranked.sort(key=lambda c: c["ranking"]["match_score"], reverse=True)
+        ranked = self._blend_exploration(ranked)
 
         # Keep discovery broad. Earlier versions hard-pruned low-interest-match
         # companies here, but interest matching is intentionally conservative
@@ -317,6 +375,54 @@ class CompanyRankerService:
                 pass
 
         return ranked
+
+    @staticmethod
+    def _blend_exploration(companies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep roughly 80% high-confidence and 20% exploratory candidates."""
+        if len(companies) < 5:
+            return companies
+
+        high_conf = [
+            c for c in companies
+            if (c.get("ranking") or {}).get("semantic_relevance", 0) >= 0.55
+            or (c.get("ranking") or {}).get("hiring_likelihood", 0) >= 0.8
+        ]
+        exploratory = [
+            c for c in companies
+            if c not in high_conf
+            or (c.get("ranking") or {}).get("exploration_score", 0) >= 0.08
+        ]
+
+        result: list[dict[str, Any]] = []
+        high_i = 0
+        explore_i = 0
+        seen_domains: set[str] = set()
+
+        while high_i < len(high_conf) or explore_i < len(exploratory):
+            take_explore = len(result) % 5 == 4 and explore_i < len(exploratory)
+            pool = exploratory if take_explore else high_conf
+            idx = explore_i if take_explore else high_i
+
+            if idx >= len(pool):
+                pool = exploratory if pool is high_conf else high_conf
+                idx = explore_i if pool is exploratory else high_i
+
+            if idx >= len(pool):
+                break
+
+            company = pool[idx]
+            if pool is exploratory:
+                explore_i += 1
+            else:
+                high_i += 1
+
+            domain = (company.get("domain") or company.get("name") or "").lower()
+            if domain and domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            result.append(company)
+
+        return result
 
     @staticmethod
     def _score_compensation(

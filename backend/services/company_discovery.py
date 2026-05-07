@@ -21,6 +21,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
@@ -38,6 +39,7 @@ try:
         YCCompaniesSource,
         AIDiscoverySource,
     )
+    from ..db.supabase import supabase_client
 except ImportError:
     import sys
     from pathlib import Path
@@ -51,6 +53,7 @@ except ImportError:
         YCCompaniesSource,
         AIDiscoverySource,
     )
+    from backend.db.supabase import supabase_client
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -183,9 +186,10 @@ class CompanyDiscoveryService:
             "yc": {"YCombinator", "WorkAtAStartup"},
             "remote": {"RemoteOK", "HackerNews", "Wellfound"},
             "ai": {"AI Discovery", "HackerNews", "Wellfound", "RemoteOK"},
-            "fortune500": {"AI Discovery"},
+            "fortune500": {"AI Discovery", "RemoteOK", "HackerNews"},
             "stealth": {"AI Discovery", "HackerNews"},
             "international": {"RemoteOK", "Wellfound", "AI Discovery"},
+            "visa": {"AI Discovery", "RemoteOK", "Wellfound", "HackerNews"},
         }
 
     async def discover(
@@ -376,14 +380,37 @@ class CompanyDiscoveryService:
         Each source gets a dedicated progress callback so SSE updates are per-source.
         """
         async def _run_source(source) -> list[dict[str, Any]]:
+            started = time.perf_counter()
+            log_base = {
+                "user_id": preferences.get("_user_id"),
+                "discovery_session_id": preferences.get("_discovery_session_id"),
+                "source": source.SOURCE_NAME,
+                "query_used": queries[:12],
+                "started_at": datetime.utcnow().isoformat(),
+            }
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     source.search(profile, preferences, queries, progress_callback),
                     timeout=30.0,
                 )
+                await self._record_source_log({
+                    **log_base,
+                    "status": "success",
+                    "result_count": len(result),
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                    "completed_at": datetime.utcnow().isoformat(),
+                })
+                return result
             except asyncio.TimeoutError:
                 if progress_callback:
                     await progress_callback(source.SOURCE_NAME, f"{source.SOURCE_NAME} timed out")
+                await self._record_source_log({
+                    **log_base,
+                    "status": "timeout",
+                    "error": "Timed out after 30 seconds",
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                    "completed_at": datetime.utcnow().isoformat(),
+                })
                 return []
             except Exception as exc:
                 if progress_callback:
@@ -391,6 +418,13 @@ class CompanyDiscoveryService:
                         source.SOURCE_NAME,
                         f"{source.SOURCE_NAME} failed: {type(exc).__name__}",
                     )
+                await self._record_source_log({
+                    **log_base,
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                    "completed_at": datetime.utcnow().isoformat(),
+                })
                 return []
 
         results = await asyncio.gather(*[_run_source(s) for s in sources])
@@ -404,6 +438,15 @@ class CompanyDiscoveryService:
                         f"{source.SOURCE_NAME}: +{len(result)} companies",
                     )
         return all_companies
+
+    @staticmethod
+    async def _record_source_log(log: dict[str, Any]) -> None:
+        if not log.get("user_id"):
+            return
+        try:
+            await supabase_client.insert_discovery_source_log(log)
+        except Exception:
+            pass
 
     async def _feedback_loop(
         self,

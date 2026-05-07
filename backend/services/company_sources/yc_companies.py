@@ -110,18 +110,30 @@ class YCCompaniesSource(CompanySource):
     def _fallback(
         profile: dict[str, Any], preferences: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        """Return a curated list of well-known YC companies when the API fails."""
+        """Return less-obvious YC companies when the API fails.
+
+        This is a resilience fallback, not production mock data. Keep it broad
+        and honor already-seen filters so API failures do not collapse discovery
+        back to the same famous companies.
+        """
+        excluded_domains = {str(d).lower().strip() for d in preferences.get("_excluded_domains", [])}
+        excluded_names = {str(n).lower().strip() for n in preferences.get("_excluded_names", [])}
         known_yc = [
-            {"name": "Stripe", "domain": "stripe.com", "industry": "Fintech", "funding_stage": "YC S09", "website_url": "https://stripe.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
-            {"name": "Brex", "domain": "brex.com", "industry": "Fintech", "funding_stage": "YC W17", "website_url": "https://brex.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
-            {"name": "Scale AI", "domain": "scale.com", "industry": "AI/ML", "funding_stage": "YC S16", "website_url": "https://scale.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
-            {"name": "Gusto", "domain": "gusto.com", "industry": "HR Tech", "funding_stage": "YC W12", "website_url": "https://gusto.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
-            {"name": "Rippling", "domain": "rippling.com", "industry": "HR Tech", "funding_stage": "YC W16", "website_url": "https://rippling.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
-            {"name": "Deel", "domain": "deel.com", "industry": "HR Tech", "funding_stage": "YC W19", "website_url": "https://deel.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
-            {"name": "Retool", "domain": "retool.com", "industry": "Developer Tools", "funding_stage": "YC S17", "website_url": "https://retool.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
-            {"name": "Posthog", "domain": "posthog.com", "industry": "Developer Tools", "funding_stage": "YC W20", "website_url": "https://posthog.com", "headquarters": "Remote", "hiring_status": "hiring"},
-            {"name": "Supabase", "domain": "supabase.com", "industry": "Developer Tools", "funding_stage": "YC S20", "website_url": "https://supabase.com", "headquarters": "Remote", "hiring_status": "hiring"},
-            {"name": "Linear", "domain": "linear.app", "industry": "Productivity", "funding_stage": "Series B", "website_url": "https://linear.app", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
-            {"name": "Vercel", "domain": "vercel.com", "industry": "Developer Tools", "funding_stage": "Series D", "website_url": "https://vercel.com", "headquarters": "Remote", "hiring_status": "hiring"},
+            {"name": "AtoB", "domain": "atob.com", "industry": "Fintech", "funding_stage": "YC S20", "website_url": "https://atob.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Instawork", "domain": "instawork.com", "industry": "Labor Marketplace", "funding_stage": "YC S15", "website_url": "https://instawork.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Fintoc", "domain": "fintoc.com", "industry": "Fintech", "funding_stage": "YC W21", "website_url": "https://fintoc.com", "headquarters": "Santiago, Chile", "hiring_status": "hiring"},
+            {"name": "Turso", "domain": "turso.tech", "industry": "Developer Tools", "funding_stage": "Series A", "website_url": "https://turso.tech", "headquarters": "Remote", "hiring_status": "hiring"},
+            {"name": "Mintlify", "domain": "mintlify.com", "industry": "Developer Tools", "funding_stage": "YC W22", "website_url": "https://mintlify.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Corgi", "domain": "corgi.insure", "industry": "Insurtech", "funding_stage": "YC S23", "website_url": "https://corgi.insure", "headquarters": "Remote", "hiring_status": "hiring"},
+            {"name": "Infisical", "domain": "infisical.com", "industry": "Security", "funding_stage": "YC W23", "website_url": "https://infisical.com", "headquarters": "Remote", "hiring_status": "hiring"},
+            {"name": "Helicone", "domain": "helicone.ai", "industry": "AI / Developer Tools", "funding_stage": "YC W23", "website_url": "https://helicone.ai", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Langfuse", "domain": "langfuse.com", "industry": "AI / Observability", "funding_stage": "Seed", "website_url": "https://langfuse.com", "headquarters": "Berlin, Germany", "hiring_status": "hiring"},
+            {"name": "Pave Robotics", "domain": "paverobotics.com", "industry": "Robotics", "funding_stage": "YC S24", "website_url": "https://paverobotics.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Salvy", "domain": "salvy.com.br", "industry": "Telecom", "funding_stage": "YC W22", "website_url": "https://salvy.com.br", "headquarters": "Sao Paulo, Brazil", "hiring_status": "hiring"},
         ]
-        return [normalize_company(c, "YCombinator") for c in known_yc]
+        filtered = [
+            c for c in known_yc
+            if c["domain"].lower() not in excluded_domains
+            and c["name"].lower() not in excluded_names
+        ]
+        return [normalize_company(c, "YCombinator") for c in filtered]

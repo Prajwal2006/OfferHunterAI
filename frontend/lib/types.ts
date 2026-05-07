@@ -67,6 +67,13 @@ export interface CompanyRanking {
   hiring_likelihood: number;
   company_size_match?: number;
   semantic_similarity?: number;
+  semantic_relevance?: number;
+  novelty_score?: number;
+  diversity_score?: number;
+  exploration_score?: number;
+  hiring_signal_score?: number;
+  feedback_alignment?: number;
+  exploration_reason?: string;
   match_explanation: string;
   strengths: string[];
   gaps: string[];
@@ -103,6 +110,23 @@ export interface DiscoverySession {
   total_companies_found?: number;
   embedding_version?: string;
   created_at?: string;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export interface DiscoverySourceLog {
+  id: string;
+  user_id: string;
+  discovery_session_id?: string;
+  source: string;
+  query_used?: string[];
+  status: "running" | "success" | "failed" | "timeout";
+  result_count: number;
+  duplicate_count?: number;
+  filtered_count?: number;
+  error?: string;
+  duration_ms?: number;
+  metadata?: Record<string, unknown>;
   started_at?: string;
   completed_at?: string;
 }

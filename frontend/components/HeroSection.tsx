@@ -25,7 +25,11 @@ export function HeroSection() {
   ];
 
   return (
-    <section ref={ref} className="relative min-h-screen flex items-center justify-center overflow-hidden">
+    <section
+      ref={ref}
+      style={{ position: "relative" }}
+      className="relative min-h-screen flex items-center justify-center overflow-hidden"
+    >
       {/* Parallax background elements */}
       <motion.div style={{ y, opacity }} className="absolute inset-0 pointer-events-none">
         <div className="absolute top-20 left-10 w-3 h-3 rounded-full bg-primary/50 particle" />

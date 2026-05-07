@@ -108,6 +108,7 @@ class CompanyFinderAgent:
         resume_text: str,
         preferences: dict[str, Any] | None = None,
         count: int = 25,
+        excluded_domains: set[str] | None = None,
     ) -> dict[str, Any]:
         """
         Full pipeline: parse resume → (optionally use provided prefs) → discover → rank → contacts.
@@ -154,6 +155,7 @@ class CompanyFinderAgent:
         # Learn from explicit like/dislike feedback and nudge future ranking/search.
         feedback_learning = await supabase_client.summarize_feedback_learning(user_id)
         prefs = self._merge_feedback_learning_into_preferences(prefs, feedback_learning)
+        prefs["_feedback_learning"] = feedback_learning
 
         await supabase_client.upsert_orchestration_state({
             "user_id": user_id,
@@ -170,21 +172,25 @@ class CompanyFinderAgent:
         })
 
         # ── Step 3: Discover companies ────────────────────────────────────────
-        companies = await self._run_discovery(task_id, profile, prefs, count)
-
         prefs_snapshot = {k: v for k, v in prefs.items() if not k.startswith("_")}
         discovery_session = await supabase_client.create_discovery_session({
             "user_id": user_id,
             "queries_used": profile.get("keywords", [])[:20],
             "preferences_snapshot": prefs_snapshot,
-            "companies_found": len(companies),
-            "total_companies_found": len(companies),
-            "sources_searched": [c.get("source") for c in companies if c.get("source")],
-            "sources_used": list({c.get("source") for c in companies if c.get("source")}),
+            "companies_found": 0,
+            "total_companies_found": 0,
+            "sources_searched": [],
+            "sources_used": [],
             "embedding_version": "text-embedding-3-small",
             "status": "running",
         })
         discovery_session_id = discovery_session.get("id")
+        prefs["_user_id"] = user_id
+        prefs["_discovery_session_id"] = discovery_session_id
+
+        companies = await self._run_discovery(
+            task_id, profile, prefs, count, excluded_domains=excluded_domains
+        )
 
         await supabase_client.upsert_orchestration_state({
             "user_id": user_id,
@@ -280,6 +286,9 @@ class CompanyFinderAgent:
             + (f", excluding {len(excluded_domains)} already-known domains" if excluded_domains else ""))
 
         if user_id:
+            feedback_learning = await supabase_client.summarize_feedback_learning(user_id)
+            preferences = self._merge_feedback_learning_into_preferences(preferences, feedback_learning)
+            preferences["_feedback_learning"] = feedback_learning
             await supabase_client.upsert_orchestration_state({
                 "user_id": user_id,
                 "current_stage": "CompanyFinder",
@@ -289,9 +298,7 @@ class CompanyFinderAgent:
                 "progress": {"step": "company_discovery", "percent": 0.25},
             })
 
-        companies = await self._run_discovery(task_id, profile, preferences, count, excluded_domains=excluded_domains)
-        companies = await self._run_contact_discovery(task_id, companies)
-
+        discovery_session_id = None
         if user_id:
             # Strip internal _ prefixed keys before persisting (they contain large sets/lists)
             prefs_snapshot = {k: v for k, v in preferences.items() if not k.startswith("_")}
@@ -299,20 +306,36 @@ class CompanyFinderAgent:
                 "user_id": user_id,
                 "queries_used": profile.get("keywords", [])[:20],
                 "preferences_snapshot": prefs_snapshot,
-                "companies_found": len(companies),
-                "total_companies_found": len(companies),
-                "sources_searched": [c.get("source") for c in companies if c.get("source")],
-                "sources_used": list({c.get("source") for c in companies if c.get("source")}),
+                "companies_found": 0,
+                "total_companies_found": 0,
+                "sources_searched": [],
+                "sources_used": [],
                 "embedding_version": "text-embedding-3-small",
-                "status": "completed",
+                "status": "running",
             })
+            discovery_session_id = discovery_session.get("id")
+            preferences["_user_id"] = user_id
+            preferences["_discovery_session_id"] = discovery_session_id
+
+        companies = await self._run_discovery(task_id, profile, preferences, count, excluded_domains=excluded_domains)
+        companies = await self._run_contact_discovery(task_id, companies)
+
+        if user_id:
             companies = await self._persist_companies(
                 task_id,
                 user_id,
                 companies,
-                discovery_session_id=discovery_session.get("id"),
+                discovery_session_id=discovery_session_id,
                 manually_added=False,
             )
+            if discovery_session_id:
+                await supabase_client.update_discovery_session(discovery_session_id, {
+                    "status": "completed",
+                    "completed_at": datetime.utcnow().isoformat(),
+                    "companies_found": len(companies),
+                    "total_companies_found": len(companies),
+                    "sources_used": list({c.get("source") for c in companies if c.get("source")}),
+                })
             await supabase_client.upsert_orchestration_state({
                 "user_id": user_id,
                 "current_stage": "Personalization" if companies else "CompanyFinder",
@@ -596,6 +619,22 @@ class CompanyFinderAgent:
                     await supabase_client.insert_company_contacts(
                         company_id=company_id, contacts=contacts
                     )
+
+                try:
+                    try:
+                        from ..services.embedding_service import EmbeddingService
+                    except ImportError:
+                        from backend.services.embedding_service import EmbeddingService
+                    embedding = await EmbeddingService().create_company_embedding(company)
+                except Exception:
+                    embedding = []
+                if embedding:
+                    await supabase_client.upsert_company_embedding({
+                        "company_id": company_id,
+                        "domain": company.get("domain"),
+                        "embedding": embedding,
+                        "model": "text-embedding-3-small",
+                    })
 
                 application_strategy = self._derive_application_strategy(company, contacts)
                 await supabase_client.upsert_user_company({

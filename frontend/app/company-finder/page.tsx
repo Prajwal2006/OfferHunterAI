@@ -33,6 +33,7 @@ import {
   continueCompanyDiscovery,
   fetchOrchestrationState,
   fetchDiscoverySessions,
+  fetchDiscoverySourceLogs,
 } from "@/lib/api";
 import {
   Company,
@@ -40,6 +41,7 @@ import {
   ConversationMessage,
   OrchestrationState,
   DiscoverySession,
+  DiscoverySourceLog,
 } from "@/lib/types";
 import CompanyCard from "@/components/company-finder/CompanyCard";
 import CompanyDetailModal from "@/components/company-finder/CompanyDetailModal";
@@ -229,6 +231,7 @@ function CompanyFinderContent() {
   const [manualCompanyLoading, setManualCompanyLoading] = useState(false);
   const [orchestrationState, setOrchestrationState] = useState<OrchestrationState | null>(null);
   const [discoverySessions, setDiscoverySessions] = useState<DiscoverySession[]>([]);
+  const [sourceLogs, setSourceLogs] = useState<DiscoverySourceLog[]>([]);
   const [sourceMode, setSourceMode] = useState<string>("all");
   const esRef = useRef<EventSource | null>(null);
   // Track whether the running state was triggered by "Find More" (merge) vs fresh run (replace)
@@ -256,12 +259,14 @@ function CompanyFinderContent() {
         const prefsData = await fetchUserPreferences(userId);
         setPreferences(prefsData.preferences);
 
-        const [orchestration, sessions] = await Promise.all([
+        const [orchestration, sessions, logs] = await Promise.all([
           fetchOrchestrationState(userId).catch(() => ({ state: null })),
           fetchDiscoverySessions(userId, { limit: 8 }).catch(() => ({ sessions: [] })),
+          fetchDiscoverySourceLogs(userId, { limit: 24 }).catch(() => ({ logs: [] })),
         ]);
         setOrchestrationState(orchestration.state ?? null);
         setDiscoverySessions(sessions.sessions ?? []);
+        setSourceLogs(logs.logs ?? []);
 
         if (!prefsData.preferences?.conversation_complete) {
           // Need to collect preferences
@@ -328,6 +333,9 @@ function CompanyFinderContent() {
                   setCompanies(res.companies);
                 }
                 setStep("results");
+                void fetchDiscoverySourceLogs(userId, { limit: 24 }).then((logs) =>
+                  setSourceLogs(logs.logs ?? [])
+                );
               })
               .catch(() => setStep("results"));
           } else if (data.status === "failed") {
@@ -345,12 +353,12 @@ function CompanyFinderContent() {
   }, [step, userId]);
 
   // ── Start discovery ────────────────────────────────────────────────────────
-  const startDiscovery = useCallback(async () => {
+  const startDiscovery = useCallback(async (rediscover = false) => {
     setStep("running");
     setAgentMessage("Starting Company Finder Agent...");
     setError(null);
     try {
-      await runCompanyFinder({ user_id: userId, count: 60 });
+      await runCompanyFinder({ user_id: userId, count: 60, rediscover });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start agent");
       setStep("error");
@@ -361,7 +369,7 @@ function CompanyFinderContent() {
   const onPreferencesComplete = useCallback(
     async (prefs: UserPreferences) => {
       setPreferences(prefs);
-      await startDiscovery();
+      await startDiscovery(false);
     },
     [startDiscovery]
   );
@@ -675,7 +683,7 @@ function CompanyFinderContent() {
             {preferences?.conversation_complete ? "Edit Preferences" : "Set Preferences"}
           </button>
           <button
-            onClick={startDiscovery}
+            onClick={() => void startDiscovery(true)}
             className="flex items-center gap-2 px-3 py-2 rounded-xl border border-border hover:bg-muted text-sm text-muted-foreground transition-colors"
           >
             <RefreshCw className="w-4 h-4" />
@@ -702,7 +710,7 @@ function CompanyFinderContent() {
                 onComplete={(prefs) => {
                   setPreferences(prefs);
                   setShowPrefsPane(false);
-                  startDiscovery();
+                  startDiscovery(false);
                 }}
               />
             </div>
@@ -816,6 +824,7 @@ function CompanyFinderContent() {
               <option value="fortune500">Fortune 500</option>
               <option value="stealth">Stealth Startups</option>
               <option value="international">Hiring Internationally</option>
+              <option value="visa">Visa-Sponsoring Companies</option>
             </select>
             <button
               type="button"
@@ -832,6 +841,41 @@ function CompanyFinderContent() {
             Last session: {discoverySessions[0].companies_found || discoverySessions[0].total_companies_found || 0} companies,
             sources {Array.isArray(discoverySessions[0].sources_used) ? discoverySessions[0].sources_used.join(", ") : "n/a"}
           </p>
+        )}
+
+        {sourceLogs.length > 0 && (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-2">
+            {sourceLogs.slice(0, 6).map((log) => (
+              <div
+                key={log.id}
+                className="rounded-xl border border-border bg-muted/30 px-3 py-2 text-xs"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium text-foreground truncate">{log.source}</span>
+                  <span
+                    className={
+                      log.status === "success"
+                        ? "text-green-600 dark:text-green-400"
+                        : log.status === "timeout"
+                        ? "text-amber-600 dark:text-amber-400"
+                        : "text-red-600 dark:text-red-400"
+                    }
+                  >
+                    {log.status}
+                  </span>
+                </div>
+                <div className="mt-1 text-muted-foreground">
+                  {log.result_count || 0} companies
+                  {log.duration_ms ? ` · ${Math.round(log.duration_ms / 1000)}s` : ""}
+                </div>
+                {log.error && (
+                  <div className="mt-1 truncate text-red-600 dark:text-red-400">
+                    {log.error}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         )}
       </div>
 

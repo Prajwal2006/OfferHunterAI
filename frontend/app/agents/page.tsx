@@ -3,17 +3,14 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Activity, Play, RefreshCw, Filter, Bot, Zap, Building2, ArrowRight, Info } from "lucide-react";
-import { AgentEvent, AgentInfo } from "@/lib/types";
-import { MOCK_AGENTS } from "@/lib/mockData";
+import { AgentEvent, AgentInfo, PipelineItem } from "@/lib/types";
 import AgentCard from "@/components/AgentCard";
 import EventStream from "@/components/EventStream";
 import OrchestrationFlow from "@/components/OrchestrationFlow";
 import TaskTimeline from "@/components/TaskTimeline";
-import { MOCK_PIPELINE } from "@/lib/mockData";
 import { RequireAuth } from "@/components/RequireAuth";
-import { fetchResumes, createEventSource, fetchOrchestrationState } from "@/lib/api";
+import { createEventSource, fetchOrchestrationState, fetchDiscoveredCompanies } from "@/lib/api";
 import { useAuth } from "@/components/AuthProvider";
-import { ResumeVersion } from "@/lib/types";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
@@ -26,9 +23,61 @@ const AGENT_TO_STEP: Record<string, string> = {
   EmailSenderAgent: "Sender",
 };
 
+const AGENTS: AgentInfo[] = [
+  {
+    name: "CompanyFinderAgent",
+    displayName: "Company Finder",
+    description: "Discovers relevant companies based on your skills",
+    status: "idle",
+    icon: "search",
+  },
+  {
+    name: "PersonalizationAgent",
+    displayName: "Personalization",
+    description: "Extracts company insights and personalizes context",
+    status: "idle",
+    icon: "target",
+  },
+  {
+    name: "EmailWriterAgent",
+    displayName: "Email Writer",
+    description: "Generates personalized outreach emails",
+    status: "idle",
+    icon: "edit",
+  },
+  {
+    name: "ResumeTailorAgent",
+    displayName: "Resume Tailor",
+    description: "Tailors resume bullets for each company",
+    status: "idle",
+    icon: "file",
+  },
+  {
+    name: "EmailSenderAgent",
+    displayName: "Email Sender",
+    description: "Sends approved emails via Gmail API",
+    status: "idle",
+    icon: "mail",
+  },
+  {
+    name: "FollowUpAgent",
+    displayName: "Follow Up",
+    description: "Sends automated follow-ups after no response",
+    status: "idle",
+    icon: "refresh",
+  },
+  {
+    name: "ResponseClassifierAgent",
+    displayName: "Response Classifier",
+    description: "Classifies and prioritizes email responses",
+    status: "idle",
+    icon: "brain",
+  },
+];
+
 function useAgentState() {
   const [events, setEvents] = useState<AgentEvent[]>([]);
-  const [agents, setAgents] = useState<AgentInfo[]>(MOCK_AGENTS);
+  const [agents, setAgents] = useState<AgentInfo[]>(AGENTS);
   const [isRunning, setIsRunning] = useState(false);
   const [demoMode, setDemoMode] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -81,7 +130,7 @@ function useAgentState() {
     setIsRunning(true);
     setDemoMode(true);
     // Reset agents to idle first
-    setAgents(MOCK_AGENTS.map((a) => ({ ...a, status: "idle" as const, currentTask: undefined })));
+    setAgents(AGENTS.map((a) => ({ ...a, status: "idle" as const, currentTask: undefined })));
     setEvents([]);
 
     let i = 0;
@@ -122,8 +171,8 @@ export default function AgentsPage() {
   const { session } = useAuth();
   const router = useRouter();
   const [filterAgent, setFilterAgent] = useState<string>("all");
-  const [activeResume, setActiveResume] = useState<ResumeVersion | null>(null);
   const [persistedStage, setPersistedStage] = useState<string | undefined>(undefined);
+  const [timelineItems, setTimelineItems] = useState<PipelineItem[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
   const esRef = useRef<EventSource | null>(null);
 
@@ -170,20 +219,69 @@ export default function AgentsPage() {
   }, [applyEvent]);
 
   useEffect(() => {
-    async function loadActiveResume() {
+    async function loadTimeline() {
       const userId = session?.user?.id;
       if (!userId) return;
       try {
-        const result = await fetchResumes(userId);
-        const resumes = (result.resumes || []) as ResumeVersion[];
-        const active = resumes.find((r) => r.is_active) || null;
-        setActiveResume(active);
+        const result = await fetchDiscoveredCompanies(userId, {
+          limit: 100,
+          includeArchived: true,
+        });
+        setTimelineItems(
+          result.companies.map((company) => ({
+            id: `pipeline-${company.id}`,
+            company,
+            created_at:
+              company.created_at ??
+              company.workspace?.discovered_at ??
+              new Date().toISOString(),
+            steps: [
+              {
+                agent: "Company Finder",
+                status: "completed",
+                timestamp: company.workspace?.discovered_at,
+                message: `Discovered ${company.name}`,
+              },
+              {
+                agent: "Personalization",
+                status:
+                  company.workspace?.personalization_completed ||
+                  ["Personalization", "EmailWriter", "Review", "Sender"].includes(
+                    company.workspace?.orchestration_stage || ""
+                  )
+                    ? "completed"
+                    : "pending",
+              },
+              {
+                agent: "Email Writer",
+                status: ["EmailWriter", "Review", "Sender"].includes(
+                  company.workspace?.orchestration_stage || ""
+                )
+                  ? "completed"
+                  : "pending",
+              },
+              {
+                agent: "Human Review",
+                status: ["Review", "Sender"].includes(
+                  company.workspace?.orchestration_stage || ""
+                )
+                  ? "completed"
+                  : "pending",
+              },
+              {
+                agent: "Email Sender",
+                status: company.workspace?.outreach_sent ? "completed" : "pending",
+              },
+            ],
+          }))
+        );
       } catch {
-        setActiveResume(null);
+        setTimelineItems([]);
       }
     }
-    loadActiveResume();
-  }, [session?.user?.id]);
+
+    void loadTimeline();
+  }, [session?.user?.id, events.length]);
 
   useEffect(() => {
     async function loadOrchestrationState() {
@@ -457,7 +555,7 @@ export default function AgentsPage() {
             Task Timeline â€” Per Company
           </h2>
         </div>
-        <TaskTimeline items={MOCK_PIPELINE} />
+        <TaskTimeline items={timelineItems} />
       </motion.div>
       </div>
     </RequireAuth>

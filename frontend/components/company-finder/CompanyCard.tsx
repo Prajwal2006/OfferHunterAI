@@ -221,6 +221,12 @@ export default function CompanyCard({
           <MatchBar score={ranking.tech_stack_match} label="Tech Stack" />
           <MatchBar score={ranking.interests_match} label="Domain" />
           <MatchBar score={ranking.hiring_likelihood} label="Hiring" />
+          {ranking.novelty_score != null && (
+            <MatchBar score={ranking.novelty_score} label="Novelty" />
+          )}
+          {ranking.diversity_score != null && (
+            <MatchBar score={ranking.diversity_score} label="Diversity" />
+          )}
         </div>
       )}
 
@@ -256,6 +262,19 @@ export default function CompanyCard({
           {company.open_positions.length > 1 ? "s" : ""}
         </div>
       )}
+
+      <div className="flex flex-wrap items-center gap-1.5 mb-3 text-[10px] text-muted-foreground">
+        {company.source && (
+          <span className="px-2 py-0.5 rounded-md bg-muted border border-border">
+            {company.source}
+          </span>
+        )}
+        {ranking?.exploration_reason && (
+          <span className="px-2 py-0.5 rounded-md bg-primary/10 text-primary border border-primary/20">
+            {ranking.exploration_reason}
+          </span>
+        )}
+      </div>
 
       {/* Footer */}
       <div className="flex items-center justify-between pt-2 border-t border-border">
