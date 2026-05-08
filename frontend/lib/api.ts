@@ -1,4 +1,8 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/+$/, "");
+
+export function buildApiUrl(path: string): string {
+  return `${API_URL}/${path.replace(/^\/+/, "")}`;
+}
 
 export interface CompanyWorkspaceResponse {
   companies: import("./types").Company[];
@@ -9,7 +13,7 @@ export interface CompanyWorkspaceResponse {
 }
 
 export async function fetchAgentEvents(limit = 50) {
-  const res = await fetch(`${API_URL}/agent-events?limit=${limit}`);
+  const res = await fetch(buildApiUrl(`/agent-events?limit=${limit}`));
   if (!res.ok) throw new Error("Failed to fetch agent events");
   return res.json();
 }
@@ -102,7 +106,7 @@ export async function fetchPipeline() {
 }
 
 export function createEventSource(onMessage: (event: MessageEvent) => void) {
-  const es = new EventSource(`${API_URL}/agent-events/stream`);
+  const es = new EventSource(buildApiUrl("/agent-events/stream"));
   es.onmessage = onMessage;
   return es;
 }

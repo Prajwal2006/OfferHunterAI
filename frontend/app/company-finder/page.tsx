@@ -27,6 +27,7 @@ import {
   sendCompanyFeedback,
   continueCompanyDiscovery,
   fetchDiscoverySourceLogs,
+  buildApiUrl,
 } from "@/lib/api";
 import {
   Company,
@@ -407,7 +408,7 @@ function CompanyFinderContent() {
 
         // 1. Check for resume
         const resumeRes = await fetchWithTimeout(
-          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/resumes?user_id=${encodeURIComponent(userId)}`
+          buildApiUrl(`/resumes?user_id=${encodeURIComponent(userId)}`)
         );
         if (cancelled) return;
         if (!resumeRes.ok) throw new Error("Failed to fetch resumes");
@@ -422,13 +423,13 @@ function CompanyFinderContent() {
 
         // 2. Check for parsed profile (result ignored — just ensures it exists)
         await fetchWithTimeout(
-          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/profile/${encodeURIComponent(userId)}`
+          buildApiUrl(`/company-finder/profile/${encodeURIComponent(userId)}`)
         ).catch(() => null);
         if (cancelled) return;
 
         // 3. Check for preferences
         const prefsRes = await fetchWithTimeout(
-          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/preferences/${encodeURIComponent(userId)}`
+          buildApiUrl(`/company-finder/preferences/${encodeURIComponent(userId)}`)
         );
         if (cancelled) return;
         if (!prefsRes.ok) throw new Error("Failed to fetch preferences");
@@ -438,17 +439,17 @@ function CompanyFinderContent() {
 
         const [orchestration, sessions, logs] = await Promise.all([
           fetchJsonWithTimeout<{ state: OrchestrationState | null }>(
-            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/orchestration/${encodeURIComponent(userId)}`,
+            buildApiUrl(`/company-finder/orchestration/${encodeURIComponent(userId)}`),
             undefined,
             { state: null }
           ),
           fetchJsonWithTimeout<{ sessions: DiscoverySession[] }>(
-            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/discovery-sessions/${encodeURIComponent(userId)}?limit=8`,
+            buildApiUrl(`/company-finder/discovery-sessions/${encodeURIComponent(userId)}?limit=8`),
             undefined,
             { sessions: [] }
           ),
           fetchJsonWithTimeout<{ logs: DiscoverySourceLog[] }>(
-            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/source-logs/${encodeURIComponent(userId)}?limit=24`,
+            buildApiUrl(`/company-finder/source-logs/${encodeURIComponent(userId)}?limit=24`),
             undefined,
             { logs: [] }
           ),
@@ -462,12 +463,12 @@ function CompanyFinderContent() {
           // Need to collect preferences
           const [opener, histData] = await Promise.all([
             fetchJsonWithTimeout<{ message: string }>(
-              `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/preferences/opener?user_id=${encodeURIComponent(userId)}`,
+              buildApiUrl(`/company-finder/preferences/opener?user_id=${encodeURIComponent(userId)}`),
               undefined,
               { message: "What kinds of roles are you targeting?" }
             ),
             fetchJsonWithTimeout<{ history: ConversationMessage[] }>(
-              `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/conversation/${encodeURIComponent(userId)}`,
+              buildApiUrl(`/company-finder/conversation/${encodeURIComponent(userId)}`),
               undefined,
               { history: [] }
             ),
@@ -481,7 +482,7 @@ function CompanyFinderContent() {
 
         // 4. Check for existing companies — show them without auto-running discovery
         const companyData = await fetchJsonWithTimeout<{ companies: Company[] }>(
-          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=1000`,
+          buildApiUrl(`/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=1000`),
           undefined,
           { companies: [] }
         );
@@ -491,7 +492,7 @@ function CompanyFinderContent() {
         if (repairRequestedForUserRef.current !== userId) {
           repairRequestedForUserRef.current = userId;
           void fetchJsonWithTimeout<{ status: string; user_id: string }>(
-            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/companies/repair`,
+            buildApiUrl("/company-finder/companies/repair"),
             {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -502,7 +503,7 @@ function CompanyFinderContent() {
             .then(() => new Promise((resolve) => setTimeout(resolve, 2500)))
             .then(() =>
               fetchJsonWithTimeout<{ companies: Company[] }>(
-                `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=1000`,
+                buildApiUrl(`/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=1000`),
                 undefined,
                 { companies: [] }
               )

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -51,6 +51,32 @@ except ImportError:
 _user_companies_cache: dict[str, list] = {}
 _workspace_repairs_running: set[str] = set()
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_allowed_cors_origins() -> list[str]:
+    defaults = {
+        "https://offerhunterai.vercel.app",
+        "https://www.offerhunterai.vercel.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    }
+    configured = {
+        value.strip().rstrip("/")
+        for value in (os.getenv("CORS_ALLOW_ORIGINS", "") + "," + os.getenv("FRONTEND_URL", "")).split(",")
+        if value.strip()
+    }
+    return sorted(defaults | configured)
+
+
+ALLOWED_CORS_ORIGINS = _build_allowed_cors_origins()
 
 
 def _company_memory_key(company: dict[str, Any]) -> str:
@@ -134,10 +160,26 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "Origin",
+        "Cache-Control",
+        "Pragma",
+        "Last-Event-ID",
+        "X-Requested-With",
+    ],
+    expose_headers=[
+        "Content-Type",
+        "Cache-Control",
+        "Connection",
+        "X-Accel-Buffering",
+    ],
+    max_age=600,
 )
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Models Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -302,7 +344,7 @@ async def get_agent_events(
 
 
 @app.get("/agent-events/stream")
-async def stream_agent_events():
+async def stream_agent_events(request: Request):
     """Server-Sent Events endpoint for real-time agent event streaming."""
     subscriber_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
     _sse_subscribers.append(subscriber_queue)
@@ -329,12 +371,18 @@ async def stream_agent_events():
             except ValueError:
                 pass
 
+    request_origin = (request.headers.get("origin") or "").rstrip("/")
+    allow_origin = request_origin if request_origin in ALLOWED_CORS_ORIGINS else ALLOWED_CORS_ORIGINS[0]
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Access-Control-Allow-Origin": allow_origin,
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "Vary": "Origin",
         },
     )
 
