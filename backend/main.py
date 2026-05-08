@@ -44,7 +44,33 @@ except ImportError:
 # In-memory company results cache (user_id -> companies list)
 # Used as fallback when Supabase is not configured or rankings table is empty
 _user_companies_cache: dict[str, list] = {}
+_workspace_repairs_running: set[str] = set()
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _company_memory_key(company: dict[str, Any]) -> str:
+    return str(
+        company.get("id")
+        or (company.get("domain") or "").lower().strip()
+        or (company.get("website_url") or "").lower().strip()
+        or (company.get("name") or "").lower().strip()
+    )
+
+
+def _merge_user_company_cache(user_id: str, incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Append newly discovered companies to the process-local fallback cache.
+
+    Supabase is the source of truth. This cache only exists for local/dev
+    resilience, so it must mimic the same append-only workspace semantics.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for company in _user_companies_cache.get(user_id, []) + list(incoming or []):
+        key = _company_memory_key(company)
+        if key:
+            merged[key] = {**merged.get(key, {}), **company}
+    _user_companies_cache[user_id] = list(merged.values())
+    return _user_companies_cache[user_id]
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ SSE Broadcast Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 # Each SSE connection gets its own queue so every subscriber receives every event.
@@ -177,6 +203,10 @@ class ContinueDiscoveryRequest(BaseModel):
     user_id: str
     count: int = 40
     source_mode: Optional[str] = None
+
+
+class WorkspaceRepairRequest(BaseModel):
+    user_id: str
 
 
 async def _load_company_memory(user_id: str) -> dict[str, set[str]]:
@@ -337,7 +367,7 @@ async def run_agents(request: RunAgentsRequest):
             )
             companies = pipeline_result.get("companies", [])
             if companies and request.user_id:
-                _user_companies_cache[request.user_id] = companies
+                _merge_user_company_cache(request.user_id, companies)
 
             # 2. Personalization (per company)
             personalization_agent = PersonalizationAgent(logger=logger)
@@ -605,7 +635,7 @@ async def run_company_finder(request: CompanyFinderRunRequest):
             # Cache companies in memory so the GET endpoint can serve them
             # even when Supabase is not configured
             if result and result.get("companies"):
-                _user_companies_cache[request.user_id] = result["companies"]
+                _merge_user_company_cache(request.user_id, result["companies"])
         except Exception as e:
             await logger.emit(
                 agent_name="CompanyFinderAgent",
@@ -655,7 +685,7 @@ async def discover_companies(request: CompanyFinderRunRequest):
                 excluded_domains=excluded_domains,
             )
             if companies:
-                _user_companies_cache[request.user_id] = companies
+                _merge_user_company_cache(request.user_id, companies)
         except Exception as e:
             await logger.emit(
                 agent_name="CompanyFinderAgent",
@@ -782,6 +812,15 @@ async def get_parsed_profile(user_id: str):
 
 def _workspace_row_to_company(row: dict[str, Any]) -> dict[str, Any]:
     company = dict(row.get("companies") or {})
+    metadata = row.get("metadata") or {}
+
+    if not company:
+        company = {
+            "id": row.get("company_id"),
+            "domain": metadata.get("domain", ""),
+            "source": row.get("source", "unknown"),
+            "relevance_score": row.get("ranking_score") or 0,
+        }
 
     # Prefer ranking data stored directly on the user_companies row
     # (avoids a fragile cross-table join that doesn't work reliably with supabase-py)
@@ -821,10 +860,214 @@ def _workspace_row_to_company(row: dict[str, Any]) -> dict[str, Any]:
     return company
 
 
+def _normalize_company_domain(company: dict[str, Any]) -> str:
+    domain = (company.get("domain") or company.get("website_url") or "").strip().lower()
+    domain = domain.replace("https://", "").replace("http://", "").split("/")[0]
+    return domain.removeprefix("www.")
+
+
+async def _persist_recovered_workspace_companies(
+    user_id: str,
+    companies: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Persist company snapshots recovered from old completed agent events."""
+    recovered: list[dict[str, Any]] = []
+    for raw in companies:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            continue
+        company = dict(raw)
+        ranking = company.pop("ranking", {}) or {}
+        contacts = company.pop("contacts", []) or []
+        company.pop("workspace", None)
+        company.pop("company_contacts", None)
+        company.pop("_persistence_error", None)
+        company["domain"] = _normalize_company_domain(company) or re.sub(
+            r"[^a-zA-Z0-9]",
+            "",
+            str(company.get("name", "company")).lower(),
+        ) + ".com"
+
+        try:
+            saved = await supabase_client.upsert_company({**company, "user_id": user_id})
+            company_id = saved.get("id") or company.get("id")
+            if not company_id:
+                continue
+            company["id"] = company_id
+            company["ranking"] = ranking
+            company["contacts"] = contacts
+
+            if ranking:
+                await supabase_client.upsert_company_ranking({
+                    "user_id": user_id,
+                    "company_id": company_id,
+                    **ranking,
+                })
+
+            await supabase_client.upsert_user_company({
+                "user_id": user_id,
+                "company_id": company_id,
+                "source": company.get("source", "recovered"),
+                "status": "active",
+                "orchestration_stage": "Personalization",
+                "ranking_score": ranking.get("match_score", company.get("relevance_score", 0)),
+                "ranking_explanation": ranking.get("match_explanation", ""),
+                "ranking_metadata": ranking,
+                "application_strategy": company.get("application_strategy", ""),
+                "metadata": {
+                    "domain": company.get("domain"),
+                    "recovered_from": "agent_events",
+                },
+            })
+            recovered.append(company)
+        except Exception:
+            # Keep the recovered snapshot for UI fallback even if the DB schema
+            # is still missing the persistent workspace migration.
+            company["ranking"] = ranking
+            company["contacts"] = contacts
+            recovered.append(company)
+    return recovered
+
+
+async def _recover_workspace_from_agent_events(user_id: str) -> list[dict[str, Any]]:
+    """
+    Repair old runs that emitted completed companies but failed before
+    user_companies was durable.
+    """
+    try:
+        state = await supabase_client.get_orchestration_state(user_id)
+        task_ids = []
+        if state and state.get("last_task_id"):
+            task_ids.append(state["last_task_id"])
+
+        runs = await supabase_client.get_agent_runs(user_id, agent_name="CompanyFinderAgent", limit=10)
+        for run in runs:
+            task_id = run.get("task_id")
+            if task_id and task_id not in task_ids:
+                task_ids.append(task_id)
+
+        recovered_by_key: dict[str, dict[str, Any]] = {}
+
+        for task_id in task_ids[:25]:
+            events = await supabase_client.get_agent_events_for_task(
+                task_id,
+                agent_name="CompanyFinderAgent",
+                status="completed",
+                limit=5,
+            )
+            for event in events:
+                metadata = event.get("metadata") or {}
+                if metadata.get("user_id") and metadata.get("user_id") != user_id:
+                    continue
+                companies = metadata.get("companies") or []
+                if companies:
+                    recovered = await _persist_recovered_workspace_companies(user_id, companies)
+                    for company in recovered:
+                        key = _company_memory_key(company)
+                        if key:
+                            recovered_by_key[key] = company
+
+        # Older discovery-only runs did not always create ai_agent_runs, and
+        # orchestration_state.last_task_id is overwritten by newer runs. Sweep
+        # completed CompanyFinder artifacts too. Newer events include user_id;
+        # legacy events do not, so they are treated as repair candidates.
+        events = await supabase_client.get_completed_company_finder_events(limit=200)
+        for event in events:
+            metadata = event.get("metadata") or {}
+            if metadata.get("user_id") and metadata.get("user_id") != user_id:
+                continue
+            companies = metadata.get("companies") or []
+            if not companies:
+                continue
+            recovered = await _persist_recovered_workspace_companies(user_id, companies)
+            for company in recovered:
+                key = _company_memory_key(company)
+                if key:
+                    recovered_by_key[key] = company
+
+        return list(recovered_by_key.values())
+    except Exception:
+        return []
+    return []
+
+
+async def _recover_workspace_from_legacy_companies(user_id: str) -> list[dict[str, Any]]:
+    """
+    Repair older rows that were inserted into companies.user_id before the
+    user_companies workspace table became the source of truth.
+    """
+    try:
+        legacy = await supabase_client.get_companies_by_user_id(user_id, limit=500)
+    except Exception:
+        return []
+
+    recovered: list[dict[str, Any]] = []
+    for company in legacy:
+        company_id = company.get("id")
+        if not company_id:
+            continue
+        try:
+            await supabase_client.upsert_user_company({
+                "user_id": user_id,
+                "company_id": company_id,
+                "source": company.get("source", "legacy"),
+                "status": "active",
+                "orchestration_stage": "Personalization",
+                "ranking_score": company.get("relevance_score", 0),
+                "ranking_metadata": {
+                    "match_score": company.get("relevance_score", 0),
+                    "signal_source": "legacy_companies_user_id",
+                },
+                "metadata": {
+                    "domain": company.get("domain"),
+                    "recovered_from": "companies.user_id",
+                },
+            })
+            recovered.append(company)
+        except Exception:
+            recovered.append(company)
+    return recovered
+
+
+async def _repair_workspace_memory(user_id: str) -> dict[str, Any]:
+    """
+    Reconcile historical discovery artifacts into user_companies.
+
+    This is intentionally not called from the normal read path. It performs
+    write-heavy recovery and can touch many rows, so it runs in the background.
+    """
+    if user_id in _workspace_repairs_running:
+        return {"status": "already_running", "recovered_count": 0}
+
+    _workspace_repairs_running.add(user_id)
+    recovered_by_key: dict[str, dict[str, Any]] = {}
+    try:
+        ranking_rows = await supabase_client.backfill_user_companies_from_rankings(user_id)
+        legacy_companies = await _recover_workspace_from_legacy_companies(user_id)
+        event_companies = await _recover_workspace_from_agent_events(user_id)
+
+        for row in ranking_rows:
+            company = _workspace_row_to_company(row) if row.get("companies") else row
+            key = _company_memory_key(company)
+            if key:
+                recovered_by_key[key] = company
+        for company in legacy_companies + event_companies:
+            key = _company_memory_key(company)
+            if key:
+                recovered_by_key[key] = company
+
+        recovered = list(recovered_by_key.values())
+        if recovered:
+            _merge_user_company_cache(user_id, recovered)
+
+        return {"status": "completed", "recovered_count": len(recovered)}
+    finally:
+        _workspace_repairs_running.discard(user_id)
+
+
 @app.get("/company-finder/companies")
 async def get_discovered_companies(
     user_id: str,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     include_archived: bool = Query(False),
@@ -900,6 +1143,29 @@ async def get_discovered_companies(
         return {"companies": [], "total": 0, "error": str(e)}
 
 
+@app.post("/company-finder/companies/repair")
+async def repair_company_workspace(request: WorkspaceRepairRequest):
+    """
+    Start non-blocking repair of historical discovery artifacts.
+
+    Normal company reads must stay fast. This endpoint reconciles legacy rows
+    and old agent-event company payloads into user_companies in the background.
+    """
+    async def run_repair():
+        try:
+            await _repair_workspace_memory(request.user_id)
+        except Exception:
+            pass
+
+    if request.user_id not in _workspace_repairs_running:
+        asyncio.create_task(run_repair())
+
+    return {
+        "status": "started" if request.user_id not in _workspace_repairs_running else "already_running",
+        "user_id": request.user_id,
+    }
+
+
 
 @app.post("/company-finder/companies/manual")
 async def add_manual_company(request: ManualCompanyRequest):
@@ -935,7 +1201,7 @@ async def add_manual_company(request: ManualCompanyRequest):
             if not same_id and not same_domain:
                 deduped.append(existing)
 
-        _user_companies_cache[request.user_id] = [company, *deduped]
+        _merge_user_company_cache(request.user_id, [company, *deduped])
 
         return {"company": company, "task_id": task_id}
     except ValueError as e:
@@ -1070,14 +1336,7 @@ async def continue_company_discovery(request: ContinueDiscoveryRequest):
                 excluded_domains=excluded_domains,
             )
 
-            # Incremental workspace: merge with existing cache by id/domain.
-            existing = _user_companies_cache.get(request.user_id, [])
-            dedup: dict[str, dict[str, Any]] = {}
-            for c in existing + companies:
-                key = c.get("id") or (c.get("domain") or c.get("name") or "")
-                if key:
-                    dedup[str(key)] = c
-            _user_companies_cache[request.user_id] = list(dedup.values())
+            _merge_user_company_cache(request.user_id, companies)
         except Exception as e:
             await logger.emit(
                 agent_name="CompanyFinderAgent",

@@ -553,12 +553,65 @@ class SupabaseClient:
         client = self._get_client()
         if not client:
             return row
+
+        user_id = row.get("user_id")
+        company_id = row.get("company_id")
+        if not user_id or not company_id:
+            return row
+
+        try:
+            existing_result = (
+                client.table("user_companies")
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("company_id", company_id)
+                .limit(1)
+                .execute()
+            )
+            existing = (existing_result.data or [None])[0]
+        except Exception:
+            existing = None
+
+        if not existing:
+            result = client.table("user_companies").insert(row).execute()
+            return result.data[0] if result.data else row
+
+        # Existing workspace rows are durable user state. A new discovery run may
+        # refresh ranking/source metadata, but must not reset archive/remove,
+        # feedback, personalization, outreach, notes, or orchestration progress.
+        existing_metadata = existing.get("metadata") or {}
+        incoming_metadata = row.get("metadata") or {}
+        session_history = list(existing_metadata.get("discovery_session_history") or [])
+        incoming_session = row.get("discovery_session_id")
+        if incoming_session and incoming_session not in session_history:
+            session_history.append(incoming_session)
+
+        refreshable_keys = {
+            "source",
+            "ranking_score",
+            "ranking_explanation",
+            "ranking_metadata",
+            "application_strategy",
+        }
+        updates = {
+            key: row[key]
+            for key in refreshable_keys
+            if key in row and row[key] is not None
+        }
+        updates["metadata"] = {
+            **existing_metadata,
+            **incoming_metadata,
+            "last_discovery_session_id": incoming_session or existing_metadata.get("last_discovery_session_id"),
+            "discovery_session_history": session_history,
+        }
+
         result = (
             client.table("user_companies")
-            .upsert(row, on_conflict="user_id,company_id")
+            .update(updates)
+            .eq("id", existing["id"])
             .execute()
         )
-        return result.data[0] if result.data else row
+        return result.data[0] if result.data else {**existing, **updates}
 
     async def get_user_companies(
         self,
@@ -578,12 +631,7 @@ class SupabaseClient:
         # ranking data lives in user_companies.ranking_metadata / ranking_score directly,
         # so we don't join company_rankings (the cross-table filter is not supported by
         # supabase-py and would silently return wrong results).
-        query = (
-            client.table("user_companies")
-            .select("*, companies(*)")
-            .eq("user_id", user_id)
-            .order("updated_at", desc=True)
-        )
+        query = client.table("user_companies").select("*, companies(*)").eq("user_id", user_id)
         if not include_archived:
             query = query.eq("archived", False)
         if not include_removed:
@@ -593,8 +641,82 @@ class SupabaseClient:
         if source:
             query = query.eq("source", source)
 
-        result = query.range(offset, offset + max(limit - 1, 0)).execute()
-        return result.data or []
+        try:
+            result = query.order("updated_at", desc=True).range(offset, offset + max(limit - 1, 0)).execute()
+            return result.data or []
+        except Exception:
+            fallback = client.table("user_companies").select("*").eq("user_id", user_id)
+            if not include_archived:
+                fallback = fallback.eq("archived", False)
+            if not include_removed:
+                fallback = fallback.eq("removed", False)
+            if stage:
+                fallback = fallback.eq("orchestration_stage", stage)
+            if source:
+                fallback = fallback.eq("source", source)
+            result = fallback.order("updated_at", desc=True).range(offset, offset + max(limit - 1, 0)).execute()
+            rows = result.data or []
+            company_ids = [row.get("company_id") for row in rows if row.get("company_id")]
+            if not company_ids:
+                return rows
+            companies_result = (
+                client.table("companies")
+                .select("*")
+                .in_("id", company_ids)
+                .execute()
+            )
+            companies_by_id = {c.get("id"): c for c in (companies_result.data or [])}
+            for row in rows:
+                row["companies"] = companies_by_id.get(row.get("company_id")) or {}
+            return rows
+
+    async def backfill_user_companies_from_rankings(self, user_id: str) -> list[dict]:
+        """
+        Reattach legacy ranked companies to the persistent workspace.
+
+        Older runs wrote company_rankings but not user_companies. This converts
+        those rows into durable workspace entries without touching any existing
+        workspace state.
+        """
+        client = self._get_client()
+        if not client:
+            return []
+
+        ranking_result = (
+            client.table("company_rankings")
+            .select("*, companies(*)")
+            .eq("user_id", user_id)
+            .order("match_score", desc=True)
+            .limit(500)
+            .execute()
+        )
+        rows = ranking_result.data or []
+        backfilled: list[dict] = []
+        for row in rows:
+            company = row.get("companies") or {}
+            company_id = row.get("company_id") or company.get("id")
+            if not company_id:
+                continue
+            ranking_metadata = {
+                k: v
+                for k, v in row.items()
+                if k not in {"id", "company_id", "user_id", "created_at", "updated_at", "companies"}
+            }
+            backfilled.append(await self.upsert_user_company({
+                "user_id": user_id,
+                "company_id": company_id,
+                "source": company.get("source") or "legacy",
+                "status": "active",
+                "orchestration_stage": "Personalization",
+                "ranking_score": row.get("match_score", company.get("relevance_score", 0)),
+                "ranking_explanation": row.get("match_explanation", ""),
+                "ranking_metadata": ranking_metadata,
+                "metadata": {
+                    "backfilled_from": "company_rankings",
+                    "domain": company.get("domain"),
+                },
+            }))
+        return backfilled
 
     async def update_user_company(self, user_id: str, company_id: str, updates: dict[str, Any]) -> dict:
         client = self._get_client()
@@ -726,6 +848,62 @@ class SupabaseClient:
         if session_id:
             query = query.eq("discovery_session_id", session_id)
         result = query.execute()
+        return result.data or []
+
+    async def get_agent_events_for_task(
+        self,
+        task_id: str,
+        agent_name: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+
+        query = (
+            client.table("agent_events")
+            .select("*")
+            .eq("task_id", task_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if agent_name:
+            query = query.eq("agent_name", agent_name)
+        if status:
+            query = query.eq("status", status)
+
+        result = query.execute()
+        return result.data or []
+
+    async def get_completed_company_finder_events(self, limit: int = 200) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+
+        result = (
+            client.table("agent_events")
+            .select("*")
+            .eq("agent_name", "CompanyFinderAgent")
+            .eq("status", "completed")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+
+    async def get_companies_by_user_id(self, user_id: str, limit: int = 500) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("companies")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
         return result.data or []
 
     async def upsert_company_embedding(self, embedding: dict[str, Any]) -> dict:

@@ -34,6 +34,7 @@ import {
   fetchOrchestrationState,
   fetchDiscoverySessions,
   fetchDiscoverySourceLogs,
+  repairCompanyWorkspace,
 } from "@/lib/api";
 import {
   Company,
@@ -123,6 +124,86 @@ interface Filters {
   hiring: string;
   remote: string;
   minScore: number;
+}
+
+function companyMemoryKey(company: Company): string {
+  return String(
+    company.id ||
+      company.domain?.toLowerCase().trim() ||
+      company.website_url?.toLowerCase().trim() ||
+      company.name?.toLowerCase().trim() ||
+      ""
+  );
+}
+
+function mergeCompanies(existing: Company[], incoming: Company[]): Company[] {
+  const merged = new Map<string, Company>();
+  for (const company of [...existing, ...incoming]) {
+    const key = companyMemoryKey(company);
+    if (!key) continue;
+    merged.set(key, { ...(merged.get(key) || {}), ...company });
+  }
+  return Array.from(merged.values());
+}
+
+type StreamedAgentEvent = {
+  type?: string;
+  task_id?: string;
+  agent_name?: string;
+  status?: "started" | "running" | "completed" | "failed";
+  message?: string;
+  metadata?: Record<string, unknown>;
+};
+
+function stageLabel(stage: string): string {
+  const normalized = stage.trim().toLowerCase();
+  const labels: Record<string, string> = {
+    resume_parse: "Parsing your resume",
+    query_expansion: "Building smart search queries",
+    company_discovery: "Searching across company sources",
+    enrichment: "Enriching company intelligence",
+    ranking: "Ranking companies for your profile",
+    contact_discovery: "Finding recruiter and founder contacts",
+    persistence: "Saving results to your workspace",
+  };
+  return labels[normalized] || "Processing";
+}
+
+function inferStageFromEvent(data: StreamedAgentEvent): string {
+  const metadata = data.metadata || {};
+  const fromMetadata = String(metadata.stage || "").trim();
+  if (fromMetadata) return fromMetadata;
+
+  const source = String(metadata.source || "").trim().toLowerCase();
+  if (source === "queryexpansion") return "query_expansion";
+  if (source) return "company_discovery";
+
+  const message = String(data.message || "").toLowerCase();
+  if (message.includes("resume")) return "resume_parse";
+  if (message.includes("expanding search queries") || message.includes("query")) return "query_expansion";
+  if (message.includes("enrich")) return "enrichment";
+  if (message.includes("ranking") || message.includes("ranked:")) return "ranking";
+  if (message.includes("contact")) return "contact_discovery";
+  if (message.includes("saving") || message.includes("persist")) return "persistence";
+  return "company_discovery";
+}
+
+function buildAgentBannerMessage(data: StreamedAgentEvent): string {
+  const stage = inferStageFromEvent(data);
+  const label = stageLabel(stage);
+  const metadata = data.metadata || {};
+  const source = String(metadata.source || "").trim();
+  const status = data.status || "running";
+
+  if (stage === "company_discovery" && source && source !== "QueryExpansion") {
+    return `${label}: ${source}...`;
+  }
+
+  if (status === "completed") {
+    return "Discovery complete. Finalizing results...";
+  }
+
+  return `${label}...`;
 }
 
 function FilterBar({
@@ -234,17 +315,41 @@ function CompanyFinderContent() {
   const [sourceLogs, setSourceLogs] = useState<DiscoverySourceLog[]>([]);
   const [sourceMode, setSourceMode] = useState<string>("all");
   const esRef = useRef<EventSource | null>(null);
+  const activeTaskIdRef = useRef<string | null>(null);
+  const currentStageRef = useRef<string>("company_discovery");
+  const stageStartedAtRef = useRef<number>(Date.now());
+  const initializedUserRef = useRef<string | null>(null);
+  const repairRequestedForUserRef = useRef<string | null>(null);
   // Track whether the running state was triggered by "Find More" (merge) vs fresh run (replace)
   const isContinuingRef = useRef(false);
 
   // ── Initial load ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!userId) return;
+    if (initializedUserRef.current === userId) return;
+    initializedUserRef.current = userId;
+    let cancelled = false;
+    const abortController = new AbortController();
+    const FETCH_TIMEOUT_MS = 15_000;
+
+    // Wraps fetch with a per-call timeout so a slow/hung API never blocks "checking" forever.
+    function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const timeoutId = setTimeout(() => abortController.abort(), FETCH_TIMEOUT_MS);
+      return fetch(input, { ...init, signal: abortController.signal }).finally(() =>
+        clearTimeout(timeoutId)
+      );
+    }
 
     async function init() {
       try {
         // 1. Check for resume
-        const resumeData = await fetchResumes(userId);
+        const resumeRes = await fetchWithTimeout(
+          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/resumes?user_id=${encodeURIComponent(userId)}`
+        );
+        if (cancelled) return;
+        if (!resumeRes.ok) throw new Error("Failed to fetch resumes");
+        const resumeData = await resumeRes.json();
+        if (cancelled) return;
         const resumes = resumeData.resumes ?? [];
 
         if (resumes.length === 0) {
@@ -252,11 +357,20 @@ function CompanyFinderContent() {
           return;
         }
 
-        // 2. Check for parsed profile
-        await fetchParsedProfile(userId);
+        // 2. Check for parsed profile (result ignored — just ensures it exists)
+        await fetchWithTimeout(
+          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/profile/${encodeURIComponent(userId)}`
+        ).catch(() => null);
+        if (cancelled) return;
 
         // 3. Check for preferences
-        const prefsData = await fetchUserPreferences(userId);
+        const prefsRes = await fetchWithTimeout(
+          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/preferences/${encodeURIComponent(userId)}`
+        );
+        if (cancelled) return;
+        if (!prefsRes.ok) throw new Error("Failed to fetch preferences");
+        const prefsData = await prefsRes.json();
+        if (cancelled) return;
         setPreferences(prefsData.preferences);
 
         const [orchestration, sessions, logs] = await Promise.all([
@@ -264,6 +378,7 @@ function CompanyFinderContent() {
           fetchDiscoverySessions(userId, { limit: 8 }).catch(() => ({ sessions: [] })),
           fetchDiscoverySourceLogs(userId, { limit: 24 }).catch(() => ({ logs: [] })),
         ]);
+        if (cancelled) return;
         setOrchestrationState(orchestration.state ?? null);
         setDiscoverySessions(sessions.sessions ?? []);
         setSourceLogs(logs.logs ?? []);
@@ -274,6 +389,7 @@ function CompanyFinderContent() {
             getPreferenceOpener(userId),
             fetchConversationHistory(userId),
           ]);
+          if (cancelled) return;
           setPrefOpener(opener);
           setPrefHistory(histData.history ?? []);
           setStep("preferences");
@@ -281,16 +397,37 @@ function CompanyFinderContent() {
         }
 
         // 4. Check for existing companies — show them without auto-running discovery
-        const companyData = await fetchDiscoveredCompanies(userId, { limit: 100 });
-        setCompanies(companyData.companies);
+        const companyData = await fetchDiscoveredCompanies(userId, { limit: 1000 });
+        if (cancelled) return;
+        setCompanies((prev) => mergeCompanies(prev, companyData.companies));
         setStep("results");
+        if (repairRequestedForUserRef.current !== userId) {
+          repairRequestedForUserRef.current = userId;
+          void repairCompanyWorkspace(userId)
+            .then(() => new Promise((resolve) => setTimeout(resolve, 2500)))
+            .then(() => fetchDiscoveredCompanies(userId, { limit: 1000 }))
+            .then((data) => {
+              if (!cancelled) {
+                setCompanies((prev) => mergeCompanies(prev, data.companies));
+              }
+            })
+            .catch(() => {
+              // Workspace repair is best-effort and must never block page load.
+            });
+        }
       } catch (err) {
+        if (cancelled) return;
         setError(err instanceof Error ? err.message : "Initialization failed");
         setStep("error");
       }
     }
 
     init();
+    return () => {
+      cancelled = true;
+      abortController.abort();
+      initializedUserRef.current = null;
+    };
   }, [userId]);
 
   // ── SSE Event Stream for agent progress ────────────────────────────────────
@@ -303,44 +440,40 @@ function CompanyFinderContent() {
     esRef.current?.close();
     const es = createEventSource((event: MessageEvent) => {
       try {
-        const data = JSON.parse(event.data);
+        const data = JSON.parse(event.data) as StreamedAgentEvent;
         if (data.type === "connected") return;
+        if (activeTaskIdRef.current && data.task_id !== activeTaskIdRef.current) return;
         if (data.agent_name === "CompanyFinderAgent" || data.agent_name === "Orchestrator") {
-          setAgentMessage(data.message ?? "");
+          const stage = inferStageFromEvent(data);
+          if (stage !== currentStageRef.current) {
+            currentStageRef.current = stage;
+            stageStartedAtRef.current = Date.now();
+          }
+          setAgentMessage(buildAgentBannerMessage(data));
           if (data.status === "completed") {
-            const wasContinuing = isContinuingRef.current;
             isContinuingRef.current = false;
             // Always reload from DB so persisted state is the source of truth
-            fetchDiscoveredCompanies(userId, { limit: 100 })
+            fetchDiscoveredCompanies(userId, { limit: 1000 })
               .then((res) => {
-                if (wasContinuing) {
-                  // Merge: keep existing companies and append genuinely new ones
-                  setCompanies((prev) => {
-                    const existingIds = new Set(
-                      prev.map((c) => c.id).filter(Boolean)
-                    );
-                    const existingDomains = new Set(
-                      prev.map((c) => (c.domain || "").toLowerCase()).filter(Boolean)
-                    );
-                    const brandNew = res.companies.filter(
-                      (c) =>
-                        !existingIds.has(c.id) &&
-                        !(c.domain && existingDomains.has(c.domain.toLowerCase()))
-                    );
-                    return [...prev, ...brandNew];
-                  });
-                } else {
-                  setCompanies(res.companies);
-                }
+                setCompanies((prev) =>
+                  res.companies.length > 0 || prev.length === 0
+                    ? mergeCompanies(prev, res.companies)
+                    : prev
+                );
+                activeTaskIdRef.current = null;
                 setStep("results");
                 void fetchDiscoverySourceLogs(userId, { limit: 24 }).then((logs) =>
                   setSourceLogs(logs.logs ?? [])
                 );
               })
-              .catch(() => setStep("results"));
+              .catch(() => {
+                activeTaskIdRef.current = null;
+                setStep("results");
+              });
           } else if (data.status === "failed") {
             isContinuingRef.current = false;
             setError(data.message || "Agent failed");
+            activeTaskIdRef.current = null;
             setStep("error");
           }
         }
@@ -349,17 +482,47 @@ function CompanyFinderContent() {
       }
     });
     esRef.current = es;
-    return () => es.close();
+
+    // Fallback: if the SSE completion event is missed (e.g. connection gap), poll
+    // for companies after 4 minutes and exit the running state regardless.
+    const fallbackTimer = setTimeout(() => {
+      isContinuingRef.current = false;
+      fetchDiscoveredCompanies(userId, { limit: 1000 })
+        .then((res) => {
+          setCompanies((prev) => mergeCompanies(prev, res.companies));
+          activeTaskIdRef.current = null;
+          setStep("results");
+        })
+        .catch(() => {
+          activeTaskIdRef.current = null;
+          setStep("results");
+        });
+    }, 4 * 60 * 1000);
+
+    const stagePulseTimer = setInterval(() => {
+      const elapsedSeconds = Math.max(1, Math.round((Date.now() - stageStartedAtRef.current) / 1000));
+      setAgentMessage(`${stageLabel(currentStageRef.current)}... ${elapsedSeconds}s`);
+    }, 5000);
+
+    return () => {
+      es.close();
+      clearTimeout(fallbackTimer);
+      clearInterval(stagePulseTimer);
+    };
   }, [step, userId]);
 
   // ── Start discovery ────────────────────────────────────────────────────────
   const startDiscovery = useCallback(async (rediscover = false) => {
     setStep("running");
-    setAgentMessage("Starting Company Finder Agent...");
+    currentStageRef.current = "company_discovery";
+    stageStartedAtRef.current = Date.now();
+    setAgentMessage("Preparing discovery run...");
     setError(null);
     try {
-      await runCompanyFinder({ user_id: userId, count: 60, rediscover });
+      const result = await runCompanyFinder({ user_id: userId, count: 60, rediscover });
+      activeTaskIdRef.current = result.task_id;
     } catch (err) {
+      activeTaskIdRef.current = null;
       setError(err instanceof Error ? err.message : "Failed to start agent");
       setStep("error");
     }
@@ -449,7 +612,9 @@ function CompanyFinderContent() {
           feedback_type: feedback,
         });
       } catch {
-        await fetchDiscoveredCompanies(userId, { limit: 50 }).then((data) => setCompanies(data.companies));
+        await fetchDiscoveredCompanies(userId, { limit: 1000 }).then((data) =>
+          setCompanies((prev) => mergeCompanies(prev, data.companies))
+        );
       }
     },
     [userId]
@@ -462,7 +627,9 @@ function CompanyFinderContent() {
       try {
         await updateWorkspaceCompany(company.id, { user_id: userId, archived: true });
       } catch {
-        await fetchDiscoveredCompanies(userId, { limit: 50 }).then((data) => setCompanies(data.companies));
+        await fetchDiscoveredCompanies(userId, { limit: 1000 }).then((data) =>
+          setCompanies((prev) => mergeCompanies(prev, data.companies))
+        );
       }
     },
     [userId]
@@ -475,7 +642,9 @@ function CompanyFinderContent() {
       try {
         await updateWorkspaceCompany(company.id, { user_id: userId, removed: true });
       } catch {
-        await fetchDiscoveredCompanies(userId, { limit: 50 }).then((data) => setCompanies(data.companies));
+        await fetchDiscoveredCompanies(userId, { limit: 1000 }).then((data) =>
+          setCompanies((prev) => mergeCompanies(prev, data.companies))
+        );
       }
     },
     [userId]
@@ -484,16 +653,20 @@ function CompanyFinderContent() {
   const onFindMoreCompanies = useCallback(async () => {
     isContinuingRef.current = true;
     setStep("running");
-    setAgentMessage("Continuing discovery and expanding your persistent workspace...");
+    currentStageRef.current = "company_discovery";
+    stageStartedAtRef.current = Date.now();
+    setAgentMessage("Continuing discovery and expanding your workspace...");
     setError(null);
     try {
-      await continueCompanyDiscovery({
+      const result = await continueCompanyDiscovery({
         user_id: userId,
         count: 40,
         source_mode: sourceMode === "all" ? undefined : sourceMode,
       });
+      activeTaskIdRef.current = result.task_id;
     } catch (err) {
       isContinuingRef.current = false;
+      activeTaskIdRef.current = null;
       setError(err instanceof Error ? err.message : "Failed to continue discovery");
       setStep("results"); // Stay on results so existing companies remain visible
     }
@@ -619,7 +792,8 @@ function CompanyFinderContent() {
     );
   }
 
-  if (step === "running") {
+  if (step === "running" && !isContinuingRef.current && companies.length === 0) {
+    // Fresh discovery with no existing results — show full skeleton screen
     return (
       <div className="max-w-3xl mx-auto py-8 px-4">
         <motion.div
@@ -649,9 +823,21 @@ function CompanyFinderContent() {
     );
   }
 
-  // ── Results ────────────────────────────────────────────────────────────────
+  // ── Results (also shown during "running" when continuing with existing companies) ──
   return (
     <div className="space-y-6">
+      {/* Running banner — shown when "Find More" is active so results stay visible */}
+      {step === "running" && agentMessage && (
+        <AgentStatusBanner
+          message={agentMessage}
+          onCancel={() => {
+            isContinuingRef.current = false;
+            activeTaskIdRef.current = null;
+            setStep("results");
+          }}
+        />
+      )}
+
       {/* Header */}
       <motion.div
         initial={{ opacity: 0, y: -10 }}

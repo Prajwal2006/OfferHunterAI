@@ -20,8 +20,6 @@ import asyncio
 import json
 import os
 import re
-import time
-from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
@@ -31,6 +29,7 @@ from bs4 import BeautifulSoup
 # ─── New service imports ───────────────────────────────────────────────────────
 try:
     from .query_expansion import QueryExpansionService
+    from .discovery import RecursiveExpansionService, SourceOrchestrator, SourceRegistry
     from .company_sources import (
         HackerNewsSource,
         RemoteOKSource,
@@ -45,6 +44,7 @@ except ImportError:
     from pathlib import Path
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from backend.services.query_expansion import QueryExpansionService
+    from backend.services.discovery import RecursiveExpansionService, SourceOrchestrator, SourceRegistry
     from backend.services.company_sources import (
         HackerNewsSource,
         RemoteOKSource,
@@ -172,24 +172,20 @@ class CompanyDiscoveryService:
         self._github_token = os.getenv("GITHUB_TOKEN", "")
         # Service dependencies
         self._query_expander = QueryExpansionService()
-        self._sources: list = [
-            HackerNewsSource(),
-            RemoteOKSource(),
-            WorkAtAStartupSource(),
-            WellfoundSource(),
-            YCCompaniesSource(),
-            AIDiscoverySource(api_key=self._api_key, model=self._model),
-        ]
+        self._source_registry = SourceRegistry(openai_api_key=self._api_key, openai_model=self._model)
+        self._source_orchestrator = SourceOrchestrator(default_timeout_seconds=30.0, max_concurrent_sources=8)
+        self._recursive_expander = RecursiveExpansionService()
+        self._sources: list = self._source_registry.sources
         self._source_modes: dict[str, set[str]] = {
             "all": {s.SOURCE_NAME for s in self._sources},
-            "startups": {"HackerNews", "WorkAtAStartup", "Wellfound", "YCombinator", "AI Discovery"},
-            "yc": {"YCombinator", "WorkAtAStartup"},
-            "remote": {"RemoteOK", "HackerNews", "Wellfound"},
-            "ai": {"AI Discovery", "HackerNews", "Wellfound", "RemoteOK"},
-            "fortune500": {"AI Discovery", "RemoteOK", "HackerNews"},
-            "stealth": {"AI Discovery", "HackerNews"},
-            "international": {"RemoteOK", "Wellfound", "AI Discovery"},
-            "visa": {"AI Discovery", "RemoteOK", "Wellfound", "HackerNews"},
+            "startups": {"Greenhouse", "Lever", "Ashby", "Workable", "Crunchbase", "GitHubDiscovery", "HackerNews", "WorkAtAStartup", "Wellfound", "YCombinator", "AI Discovery"},
+            "yc": {"YCombinator", "WorkAtAStartup", "Greenhouse", "Lever", "Ashby"},
+            "remote": {"RemoteOK", "Greenhouse", "Lever", "Ashby", "Workable", "HackerNews", "Wellfound"},
+            "ai": {"Greenhouse", "Lever", "Ashby", "GitHubDiscovery", "AI Discovery", "HackerNews"},
+            "fortune500": {"Greenhouse", "Lever", "Workable", "AI Discovery", "RemoteOK", "HackerNews"},
+            "stealth": {"AI Discovery", "HackerNews", "GitHubDiscovery"},
+            "international": {"RemoteOK", "Lever", "Ashby", "Workable", "GitHubDiscovery", "AI Discovery"},
+            "visa": {"Greenhouse", "Lever", "Ashby", "RemoteOK", "AI Discovery", "Wellfound", "HackerNews"},
         }
 
     async def discover(
@@ -248,7 +244,7 @@ class CompanyDiscoveryService:
         if progress_callback:
             await progress_callback(
                 "Discovery",
-                "Searching Hacker News, RemoteOK, Work at a Startup, Wellfound, YC, and AI sources...",
+                "Searching API-first job boards, company APIs, OSS sources, and resilient community feeds...",
             )
         source_mode = str(preferences.get("source_mode") or "all").strip().lower()
         allowed_sources = self._source_modes.get(source_mode, self._source_modes["all"])
@@ -265,6 +261,15 @@ class CompanyDiscoveryService:
         companies = self._deduplicate(companies)
         if progress_callback:
             await progress_callback("Discovery", f"Deduplicated to {len(companies)} unique companies")
+
+        recursive = self._recursive_expander.expand(companies)
+        if recursive["queries"]:
+            queries = list(dict.fromkeys(queries + recursive["queries"]))
+            if progress_callback:
+                await progress_callback(
+                    "RecursiveExpansion",
+                    f"Prepared {len(recursive['queries'])} adjacent discovery queries from the opportunity graph",
+                )
 
         # ── Phase 4: Feedback loop (second pass if quality is low) ────────────
         companies = await self._feedback_loop(
@@ -376,68 +381,26 @@ class CompanyDiscoveryService:
         sources: list[Any],
     ) -> list[dict[str, Any]]:
         """
-        Run all CompanySource connectors in parallel with individual timeouts.
-        Each source gets a dedicated progress callback so SSE updates are per-source.
+        Run all CompanySource connectors through the async orchestrator.
+        Sources are isolated: each timeout/failure is logged independently and
+        never blocks the rest of the pipeline.
         """
-        async def _run_source(source) -> list[dict[str, Any]]:
-            started = time.perf_counter()
-            log_base = {
-                "user_id": preferences.get("_user_id"),
-                "discovery_session_id": preferences.get("_discovery_session_id"),
-                "source": source.SOURCE_NAME,
-                "query_used": queries[:12],
-                "started_at": datetime.utcnow().isoformat(),
-            }
-            try:
-                result = await asyncio.wait_for(
-                    source.search(profile, preferences, queries, progress_callback),
-                    timeout=30.0,
+        companies, metrics = await self._source_orchestrator.run(
+            sources=sources,
+            profile=profile,
+            preferences=preferences,
+            queries=queries,
+            progress_callback=progress_callback,
+        )
+        for metric in metrics:
+            await self._record_source_log(
+                metric.as_log_row(
+                    user_id=preferences.get("_user_id"),
+                    discovery_session_id=preferences.get("_discovery_session_id"),
+                    queries=queries,
                 )
-                await self._record_source_log({
-                    **log_base,
-                    "status": "success",
-                    "result_count": len(result),
-                    "duration_ms": int((time.perf_counter() - started) * 1000),
-                    "completed_at": datetime.utcnow().isoformat(),
-                })
-                return result
-            except asyncio.TimeoutError:
-                if progress_callback:
-                    await progress_callback(source.SOURCE_NAME, f"{source.SOURCE_NAME} timed out")
-                await self._record_source_log({
-                    **log_base,
-                    "status": "timeout",
-                    "error": "Timed out after 30 seconds",
-                    "duration_ms": int((time.perf_counter() - started) * 1000),
-                    "completed_at": datetime.utcnow().isoformat(),
-                })
-                return []
-            except Exception as exc:
-                if progress_callback:
-                    await progress_callback(
-                        source.SOURCE_NAME,
-                        f"{source.SOURCE_NAME} failed: {type(exc).__name__}",
-                    )
-                await self._record_source_log({
-                    **log_base,
-                    "status": "failed",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "duration_ms": int((time.perf_counter() - started) * 1000),
-                    "completed_at": datetime.utcnow().isoformat(),
-                })
-                return []
-
-        results = await asyncio.gather(*[_run_source(s) for s in sources])
-        all_companies: list[dict[str, Any]] = []
-        for source, result in zip(sources, results):
-            if result:
-                all_companies.extend(result)
-                if progress_callback:
-                    await progress_callback(
-                        source.SOURCE_NAME,
-                        f"{source.SOURCE_NAME}: +{len(result)} companies",
-                    )
-        return all_companies
+            )
+        return companies
 
     @staticmethod
     async def _record_source_log(log: dict[str, Any]) -> None:
@@ -512,7 +475,7 @@ class CompanyDiscoveryService:
                         progress_callback,
                         count=max(target_count - len(companies) + 10, 25),
                     ),
-                    timeout=45.0,
+                    timeout=25.0,
                 )
                 companies.extend(additional)
                 companies = self._deduplicate(companies)

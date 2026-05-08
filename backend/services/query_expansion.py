@@ -37,7 +37,7 @@ class QueryExpansionService:
         """
         Return an ordered list of search queries for company discovery.
 
-        The list is deduplicated, limited to 20 entries, and starts with the
+        The list is deduplicated, limited to 30 entries, and starts with the
         most directly relevant terms. Longer, more specific queries generated
         by the LLM appear later so callers can truncate without losing core terms.
 
@@ -67,7 +67,7 @@ class QueryExpansionService:
                 seen.add(key)
                 result.append(q.strip())
 
-        return result[:20]
+        return result[:30]
 
     # ─── Internal Helpers ─────────────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ class QueryExpansionService:
             if role.strip():
                 queries.append(role.strip())
 
-        for skill in list(profile.get("tech_stack", []))[:3]:
+        for skill in list(profile.get("tech_stack", []))[:4]:
             if skill.strip():
                 queries.append(skill.strip())
 
@@ -92,7 +92,44 @@ class QueryExpansionService:
             if industry.strip():
                 queries.append(industry.strip())
 
-        return queries or ["software engineer"]
+        seed_text = " ".join(
+            queries + profile.get("skills", []) + profile.get("tech_stack", [])
+        ).lower()
+        semantic_defaults: list[str] = []
+        if any(term in seed_text for term in ["ai", "ml", "machine learning", "python", "llm", "genai"]):
+            semantic_defaults.extend([
+                "MLOps engineer",
+                "AI infra engineer",
+                "backend systems engineer",
+                "GenAI platform engineer",
+                "distributed systems engineer",
+                "vector database engineer",
+                "founding engineer",
+                "machine learning platform",
+                "LLM infrastructure",
+            ])
+        if any(term in seed_text for term in ["backend", "python", "go", "java", "distributed"]):
+            semantic_defaults.extend([
+                "platform engineer",
+                "backend infrastructure",
+                "cloud systems engineer",
+                "API platform engineer",
+            ])
+        if any(term in seed_text for term in ["react", "typescript", "frontend", "next"]):
+            semantic_defaults.extend([
+                "product engineer",
+                "frontend platform engineer",
+                "full-stack engineer",
+            ])
+
+        seen: set[str] = set()
+        expanded: list[str] = []
+        for query in queries + semantic_defaults + ["software engineer"]:
+            key = query.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                expanded.append(query.strip())
+        return expanded[:18]
 
     async def _ai_expand(
         self,
@@ -118,7 +155,7 @@ class QueryExpansionService:
 
         temperature = min(0.7 + (discovery_round - 1) * 0.05, 0.95)
 
-        prompt = f"""Given this job seeker's profile, generate 15 diverse search queries to
+        prompt = f"""Given this job seeker's profile, generate 20 diverse search queries to
 discover matching companies across job boards and databases.
 
 Target roles/queries: {base}
@@ -136,10 +173,10 @@ Generate queries that span:
 4. Role + seniority combos (e.g. "senior backend", "lead ML engineer")
 5. Industry-specific role names (e.g. "quant developer" for fintech)
 
-Each query should be 1–5 words. Useful for searching job boards and company directories.
+Each query should be 1-5 words. Useful for searching job boards, public ATS APIs, OSS organizations, funding databases, and company directories.
 Return a JSON object: {{"queries": ["query1", "query2", ...]}}"""
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={

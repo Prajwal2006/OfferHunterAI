@@ -134,7 +134,12 @@ class CompanyFinderAgent:
         })
 
         # ── Step 1: Parse Resume ──────────────────────────────────────────────
-        await self._emit("running", task_id, "Parsing resume with AI...")
+        await self._emit(
+            "running",
+            task_id,
+            "Parsing resume with AI...",
+            {"stage": "resume_parse"},
+        )
         profile = await self._resume_parser.parse(resume_text)
         profile["raw_text"] = resume_text
 
@@ -145,9 +150,16 @@ class CompanyFinderAgent:
             "raw_text": resume_text,
         })
 
-        await self._emit("running", task_id,
+        await self._emit(
+            "running",
+            task_id,
             f"Resume parsed: {profile.get('full_name', 'User')} — {len(profile.get('skills', []))} skills extracted",
-            {"skills_count": len(profile.get("skills", [])), "domains": profile.get("preferred_domains", [])})
+            {
+                "stage": "resume_parse",
+                "skills_count": len(profile.get("skills", [])),
+                "domains": profile.get("preferred_domains", []),
+            },
+        )
 
         # ── Step 2: Use provided preferences or empty dict ────────────────────
         prefs = preferences or {}
@@ -255,6 +267,7 @@ class CompanyFinderAgent:
         await self._emit("completed", task_id,
             f"Company Finder complete — {len(companies)} companies discovered and ranked",
             {
+                "user_id": user_id,
                 "companies": companies,
                 "company_names": [c["name"] for c in companies[:5]],
                 "total": len(companies),
@@ -352,6 +365,7 @@ class CompanyFinderAgent:
         await self._emit("completed", task_id,
             f"Discovery complete — {len(companies)} companies found",
             {
+                "user_id": user_id,
                 "companies": companies,
                 "company_names": [c["name"] for c in companies[:5]],
                 "total": len(companies),
@@ -451,11 +465,13 @@ class CompanyFinderAgent:
           5. Extended scoring (growth, funding recency, AI adoption)
         """
         async def progress_cb(source: str, message: str) -> None:
-            await self._emit("running", task_id, message, {"source": source})
+            stage = "query_expansion" if source == "QueryExpansion" else "company_discovery"
+            await self._emit("running", task_id, message, {"source": source, "stage": stage})
 
         await self._emit(
             "running", task_id,
             "Expanding search queries with AI and searching across all sources...",
+            {"stage": "query_expansion"},
         )
 
         # ── Multi-source discovery with query expansion + feedback loop ────────
@@ -470,7 +486,7 @@ class CompanyFinderAgent:
         await self._emit(
             "running", task_id,
             f"Discovered {len(companies)} unique companies — starting enrichment...",
-            {"discovered_count": len(companies)},
+            {"stage": "enrichment", "discovered_count": len(companies)},
         )
 
         # ── Enrich top companies with hiring signals + GitHub stats ────────────
@@ -482,15 +498,16 @@ class CompanyFinderAgent:
             await self._emit(
                 "running", task_id,
                 f"Enriched top {enriched_count} companies with hiring signals and tech data",
-                {"enriched_count": enriched_count},
+                {"stage": "enrichment", "enriched_count": enriched_count},
             )
         except Exception as exc:
-            await self._emit("running", task_id, f"Enrichment partial: {exc}")
+            await self._emit("running", task_id, f"Enrichment partial: {exc}", {"stage": "enrichment"})
 
         # ── Semantic + weighted ranking ────────────────────────────────────────
         await self._emit(
             "running", task_id,
             f"Ranking {len(companies)} companies using semantic embeddings + {len(profile.get('skills', []))} skill signals...",
+            {"stage": "ranking"},
         )
 
         companies = await self._ranker.rank(
@@ -529,6 +546,7 @@ class CompanyFinderAgent:
                 f"Ranked: {company.get('name', '?')} — score {score:.2f} "
                 f"({', '.join(strengths[:2]) if strengths else 'no strong signals'})",
                 {
+                    "stage": "ranking",
                     "source": "Ranking",
                     "company": company.get("name"),
                     "score": score,
@@ -544,8 +562,11 @@ class CompanyFinderAgent:
         self, task_id: str, companies: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Find contacts for top companies (limit to top 10 to keep latency low)."""
-        await self._emit("running", task_id,
-            "Discovering recruiter and founder contacts for top companies...")
+        await self._emit(
+            "running", task_id,
+            "Discovering recruiter and founder contacts for top companies...",
+            {"stage": "contact_discovery"},
+        )
 
         top = companies[:10]
         contact_tasks = [self._contact_finder.find_contacts(c) for c in top]
@@ -572,9 +593,10 @@ class CompanyFinderAgent:
         manually_added: bool,
     ) -> list[dict[str, Any]]:
         """Upsert companies and rankings into Supabase."""
-        await self._emit("running", task_id, "Saving companies and rankings to database...")
+        await self._emit("running", task_id, "Saving companies and rankings to database...", {"stage": "persistence"})
 
         persisted = []
+        failed = []
         for company in companies:
             ranking: dict[str, Any] = {}
             contacts: list = []
@@ -664,10 +686,29 @@ class CompanyFinderAgent:
                 await self._emit(
                     "running", task_id,
                     f"Warning: could not persist '{company.get('name', '?')}' — {exc}",
+                    {"stage": "persistence"},
                 )
                 company["ranking"] = ranking
                 company["contacts"] = contacts
-                persisted.append(company)
+                company["_persistence_error"] = f"{type(exc).__name__}: {exc}"
+                failed.append(company)
+
+        if failed:
+            await self._emit(
+                "running",
+                task_id,
+                f"Persistence warning: {len(failed)} of {len(companies)} companies were not saved to the workspace",
+                {
+                    "stage": "persistence",
+                    "failed_companies": [c.get("name") for c in failed[:10]],
+                    "failed_count": len(failed),
+                    "persisted_count": len(persisted),
+                },
+            )
+            if not persisted and companies:
+                raise RuntimeError(
+                    "No discovered companies could be saved to the persistent workspace"
+                )
 
         return persisted
 

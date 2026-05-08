@@ -193,6 +193,16 @@ export async function fetchDiscoveredCompanies(
   return res.json() as Promise<{ companies: import("./types").Company[]; total: number }>;
 }
 
+export async function repairCompanyWorkspace(userId: string) {
+  const res = await fetch(`${API_URL}/company-finder/companies/repair`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId }),
+  });
+  if (!res.ok) throw new Error("Failed to start workspace repair");
+  return res.json() as Promise<{ status: string; user_id: string }>;
+}
+
 export async function updateWorkspaceCompany(
   companyId: string,
   payload: {
