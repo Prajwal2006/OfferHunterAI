@@ -1,167 +1,365 @@
 # Company Finder Agent
 
-The Company Finder Agent is OfferHunterAI's core intelligence layer for proactively discovering and ranking companies that match a user's resume, skills, and job preferences — without the user having to search manually.
+The Company Finder Agent is OfferHunterAI's core intelligence layer for proactively discovering and ranking companies that match a user's resume, skills, and job preferences. It enforces hard constraints (e.g. strict remote-only) before any enrichment or persistence work happens, so only matching companies ever reach the user's workspace.
 
 ---
 
-## How It Works: The 5-Step Pipeline
-
-Every time the Company Finder runs, it executes a sequential pipeline, emitting real-time progress events via Server-Sent Events (SSE) at each step.
+## High-Level Pipeline
 
 ```
-Resume Parse  →  Preference Collection  →  Multi-Source Discovery  →  Ranking & Scoring  →  Contact Discovery
+POST /company-finder/run
+         │
+         ▼
+CompanyFinderAgent.run_full_pipeline()
+         │
+  ┌──────┴──────────────────────────────────┐
+  │  Step 1 · Resume Parse                  │
+  │  ResumeParserService (GPT-4o-mini)       │
+  └──────┬──────────────────────────────────┘
+         │ profile: {skills, tech_stack, domains, ...}
+  ┌──────┴──────────────────────────────────┐
+  │  Step 2 · Feedback Learning             │
+  │  Merge prior like/dislike signals into  │
+  │  preferences before discovery           │
+  └──────┬──────────────────────────────────┘
+         │ preferences: {work_mode, roles, salary, ...}
+  ┌──────┴──────────────────────────────────┐
+  │  Step 3 · Discovery (incremental)       │
+  │  _run_discovery_incrementally()         │
+  │    → discover_stream() per-source batch │
+  │    → _persist_companies() per batch     │
+  └──────┬──────────────────────────────────┘
+         │ persisted minimal records (no ranking yet)
+  ┌──────┴──────────────────────────────────┐
+  │  Step 4 · Background Hydration (async)  │
+  │  asyncio.create_task(...)               │
+  │    ├─ run_enrichment_worker()           │
+  │    ├─ run_ranking_worker()              │
+  │    ├─ run_contact_worker()              │
+  │    └─ run_embedding_worker()            │
+  └─────────────────────────────────────────┘
 ```
 
-### Step 1 — Resume Parsing
+The pipeline returns to the caller (and emits an SSE `running` event) as soon as minimal records are persisted — background hydration completes asynchronously and each stage triggers a `refresh_companies: true` SSE event so the UI re-fetches.
 
-The `ResumeParserService` extracts structured data from the user's uploaded resume:
+---
 
-- **Skills & tech stack** — extracted via regex heuristics and an AI pass (GPT-4o-mini)
+## Step 1 — Resume Parsing
+
+`ResumeParserService` extracts structured data from the uploaded resume text:
+
+- **Skills & tech stack** — regex + GPT-4o-mini extraction pass
 - **Work experience** — titles, companies, dates, descriptions
 - **Education** — degrees, institutions
-- **Inferred profile** — seniority level, preferred domains, years of experience
+- **Inferred profile** — seniority, preferred domains, years of experience, keywords
 
-If a resume has already been parsed (stored in Supabase), this step is skipped.
+The parsed profile is saved to `parsed_profiles` in Supabase. If already parsed, this step is skipped.
 
-### Step 2 — Preference Collection
+---
 
-The user completes the structured 14-step Preference Wizard in the frontend. Preferences include:
+## Step 2 — Preference Normalization & Feedback Learning
 
-| Preference | Examples |
+Before discovery starts, preferences are normalized and enriched:
+
+1. **`normalize_preference_payload(preferences)`** — canonicalises legacy `remote_only: true` into `work_mode: "remote"` so all downstream code uses a single field.
+2. **Feedback learning** — `supabase_client.summarize_feedback_learning(user_id)` returns aggregated like/dislike signals from previous sessions. These are merged into preferences as soft boosts/exclusions for the AI query expander and ranker.
+3. Internal `_` keys are injected: `_user_id`, `_discovery_session_id`, `_excluded_domains`, `_excluded_names`, `_discovery_round`.
+
+---
+
+## Step 3 — Discovery Pipeline (inside `CompanyDiscoveryService`)
+
+`discover_stream()` runs the full multi-source pipeline and yields **per-source batches** as each source completes (streaming to `_run_discovery_incrementally()` so the UI updates incrementally).
+
+### Phase 1 — AI Query Expansion
+
+`QueryExpansionService.expand_queries(profile, preferences)` uses GPT-4o-mini to generate a ranked list of search strings derived from the user's skills, target roles, and industry preferences. Up to 5 queries are used per source. Falls back to a built-in heuristic set if the API call fails.
+
+### Phase 2 — Parallel Source Execution
+
+`SourceOrchestrator.run()` fans out to all active sources concurrently using `asyncio.gather()` with a semaphore cap of **8 concurrent sources** and a per-source timeout of **30 seconds**. Failed or timed-out sources return `[]` and a `SourceMetric` entry recording the failure reason.
+
+**Active sources** are selected by `source_mode` (default: `"all"`):
+
+| Mode | Active Sources |
 |---|---|
-| Target roles | Software Engineer, ML Engineer, DevOps |
-| Work mode | Remote / Hybrid / Onsite |
-| Locations | US, UK, Canada, EU |
-| Employment type | Full-time, Contract |
-| Salary range | $120k–$180k |
-| Company size | Startup (1–50), Scale-up (51–500), Large (500+) |
-| Industries | AI/ML, Fintech, Healthcare, SaaS |
-| Sponsorship needed | Yes / No |
-| Career priorities | Compensation, Growth, Mission, Work-life balance, etc. |
+| `all` | All 12 sources |
+| `startups` | Greenhouse, Lever, Ashby, Workable, Crunchbase, GitHubDiscovery, HackerNews, WorkAtAStartup, Wellfound, YCombinator, AI Discovery |
+| `remote` | RemoteOK, Greenhouse, Lever, Ashby, Workable, HackerNews, Wellfound |
+| `yc` | YCombinator, WorkAtAStartup, Greenhouse, Lever, Ashby |
+| `ai` | Greenhouse, Lever, Ashby, GitHubDiscovery, AI Discovery, HackerNews |
+| `fortune500` | Greenhouse, Lever, Workable, AI Discovery, RemoteOK, HackerNews |
+| `stealth` | AI Discovery, HackerNews, GitHubDiscovery |
+| `international` | RemoteOK, Lever, Ashby, Workable, GitHubDiscovery, AI Discovery |
+| `visa` | Greenhouse, Lever, Ashby, RemoteOK, AI Discovery, Wellfound, HackerNews |
 
-Preferences are saved to Supabase and passed directly into the discovery pipeline.
+### Phase 3 — Deduplication
 
-### Step 3 — Multi-Source Discovery
+Results from all sources are merged and deduplicated by normalized domain (`www.` stripped, scheme stripped). Source attribution is preserved for telemetry.
 
-The `CompanyDiscoveryService` runs **four sources in parallel** using `asyncio.gather()`, then deduplicates and merges the results.
+`RecursiveExpansionService` inspects the deduplicated results and generates adjacent queries from the emerging opportunity graph (e.g. if 3 fintech companies were found, it generates fintech-adjacent queries for the next round).
 
-See the [Internet Scraping Sources](#internet-scraping-sources) section below for full details on each source.
+### Phase 4 — Feedback Loop
 
-### Step 4 — Weighted Ranking & Scoring
+If fewer than 35 unique companies are found from at least 4 distinct sources, the pipeline re-runs with a widened query set for up to 3 additional rounds.
 
-The `CompanyRankerService` scores every discovered company against the user's profile and preferences using a weighted algorithm:
+### Phase 4.5 — Industry Mismatch Filter
+
+`_filter_industry_mismatch()` removes companies whose industry is clearly outside the user's stated industries (e.g. a manufacturing company when the user targets SaaS/AI). This is a soft heuristic, not a hard constraint.
+
+### Phase 4.6 — Hard Constraint Enforcement ← *critical gate*
+
+`apply_hard_constraints_with_diagnostics(companies, preferences)` runs **before any company is persisted**. It returns a `HardConstraintResult` with:
+
+- `visible_companies` — companies that pass all hard constraints
+- `hidden_companies` — companies blocked, annotated with `preference_enforcement.reasons`
+- `counts_by_source` — per-source telemetry (see [Observability](#observability))
+
+**Constraints evaluated in order:**
+
+| Constraint | Trigger | Removal reason |
+|---|---|---|
+| Strict remote | `work_mode == "remote"` in preferences | Company `work_mode != "remote"` OR `remote_confidence < 0.8` |
+| Job-level remote | Strict remote + company has open positions | Any job with `work_mode != "remote"` is removed from `open_positions`; if none remain, the company is hidden |
+| Blocked companies | `avoided_companies` / `blocked_companies` in preferences | Company name or domain matched |
+| Visa/sponsorship | `sponsorship_required: true` | Company `sponsorship_available == false` |
+| Salary floor | `salary_min` set | Company max salary below user minimum |
+| Excluded locations | `excluded_countries` / `excluded_locations` | Company HQ or job location matched |
+| Preferred locations | `preferred_locations` set (non-remote mode) | Company HQ outside preferred list |
+
+**Remote confidence threshold is `0.8`** — companies with `remote_confidence` between 0 and 0.8 are treated as non-remote and blocked when strict remote mode is active.
+
+### Phase 4.7 — Workspace Deduplication
+
+Companies already in the user's workspace (`excluded_domains`) are removed so every discovery run returns only **new** companies.
+
+### Phase 5 — Priority Sorting
+
+`_startup_priority_score()` sorts surviving companies by a composite of:
+- Company size (startups < 200 score highest)
+- Funding stage (pre-seed / seed / Series A / YC score highest)
+- Source origin (Wellfound, WorkAtAStartup, HackerNews get a bonus)
+- `relevance_score` (secondary tiebreaker)
+
+---
+
+## Work-Mode Normalization
+
+Every company and every job within it is normalized to a canonical `WorkMode` before constraints are applied.
+
+### `WorkMode` enum (`backend/models/work_mode.py`)
+
+```python
+class WorkMode(str, Enum):
+    REMOTE  = "remote"
+    HYBRID  = "hybrid"
+    ONSITE  = "onsite"
+    UNKNOWN = "unknown"
+```
+
+### `infer_work_mode(signals, source)` — pattern matching engine
+
+Accepts any number of raw signals (strings, booleans, dicts, lists) and flattens them into a single lowercased text blob, then applies regex patterns in priority order:
+
+| Priority | Pattern examples | WorkMode | Confidence |
+|---|---|---|---|
+| 1st | `hybrid`, `flexible hybrid`, `N days onsite` | `HYBRID` | 0.92 |
+| 2nd | `onsite`, `on-site`, `in-office`, `must be based in`, `relocate to` | `ONSITE` | 0.90 |
+| 3rd | `remote`, `fully remote`, `remote-first`, `work from anywhere`, `distributed team` | `REMOTE` | 0.93 |
+| 4th | City/state names with no remote marker (`San Francisco`, `NY`, `CA`) | `ONSITE` | 0.72 |
+| 5th | Ambiguous phrases (`flexible work environment`) | `UNKNOWN` | 0.35 |
+| Fallback | Source-level default | varies | varies |
+
+**Source-level defaults** (override when no signal is found in text):
+
+| Source | Default WorkMode | Confidence | Reason |
+|---|---|---|---|
+| `RemoteOK` | `REMOTE` | 0.99 | Only lists remote roles by design |
+
+### Per-source normalization logic
+
+Each source adapter passes specific fields into `infer_work_mode`:
+
+| Source | Signals passed |
+|---|---|
+| **Greenhouse** | job `location`, job `description` (NLP inference) |
+| **Lever** | `categories.workplaceType`, job `location` |
+| **Ashby** | `isRemote` boolean (confidence 0.95 if true) |
+| **Workable** | `workplace` field: `"remote"→REMOTE`, `"hybrid"→HYBRID`, others→`ONSITE` |
+| **RemoteOK** | Source default (always REMOTE, confidence 0.99) |
+| **HackerNews** | Comment text, pipe-separated location field |
+| **YCombinator** | Company description, `isRemote` hint |
+| **WorkAtAStartup** | Job description, location |
+| **Wellfound** | Job description, remote tags |
+| **GitHubDiscovery** | Repo description (low-confidence; usually UNKNOWN) |
+| **AI Discovery** | AI-generated `remote_friendly` / `headquarters` fields |
+| **Crunchbase** | HQ location, description |
+
+### Company-level inference
+
+`normalize_company_work_mode()` walks all `open_positions`, runs `infer_work_mode` on each job, then aggregates to a company-level `work_mode`:
+
+- If **all** jobs are remote → company `work_mode = REMOTE`, confidence = min(job confidences)
+- If **majority** are remote → company `work_mode = REMOTE`, confidence dampened by hybrid ratio
+- If **any** hybrid → `HYBRID`
+- If **all** onsite → `ONSITE`
+- If **no positions** → infer from company-level fields (description, HQ, culture tags)
+
+`remote_confidence` for non-remote companies is capped at `0.49` to prevent borderline cases from passing the `0.8` threshold.
+
+---
+
+## Discovery Sources — Detailed
+
+### Greenhouse (job board API)
+
+Queries the Greenhouse job board API (`boards.greenhouse.io/v1/boards/{slug}/jobs`) for companies whose tech stacks and role descriptions match the expanded queries. Work mode is inferred from NLP on job `location` and `description` fields — Greenhouse has no explicit remote flag.
+
+### Lever (postings API)
+
+Queries `jobs.lever.co/v0/postings/{company}` for open postings. Uses `categories.workplaceType` when present (values: `"Remote"`, `"Hybrid"`, `"In-person"`). Falls back to location field NLP.
+
+### Ashby (job board API)
+
+Queries `jobs.ashbyhq.com/api/non-user-graphql` for postings. Uses the `isRemote: true/false` boolean field directly with confidence 0.95 (explicit flag from the employer).
+
+### Workable (accounts API)
+
+Queries `apply.workable.com/api/v3/accounts/{slug}/jobs`. Uses the `workplace` field: `"remote"→REMOTE`, `"hybrid"→HYBRID`, everything else→`ONSITE`.
+
+### RemoteOK
+
+`https://remoteok.com/api` — public JSON feed of remote job listings. Every company from this source is treated as `REMOTE` with confidence 0.99. Groups listings by company and matches skill/role tags.
+
+### Hacker News ("Who is Hiring?")
+
+1. Queries Algolia HN API for the latest "Ask HN: Who is hiring?" story (filtered by `created_at_i > 1700000000` to avoid stale threads)
+2. Fetches comments for that story ID
+3. Parses pipe-delimited comment format: `CompanyName | Role | Location | Remote | ...`
+4. Extracts company name via regex: `^([A-Z][A-Za-z0-9 .,&!-]{2,40})\s*\|`
+5. Work mode inferred from location field and comment body
+
+### YCombinator Directory
+
+Queries YC's Algolia index (`YCCompany_production`) with `isHiring: true`. Returns company batch, description, funding stage. Falls back to a hardcoded list of well-known YC alumni on API failure.
+
+### Work at a Startup (YC job board)
+
+Scrapes `workatastartup.com/jobs` with BeautifulSoup. Parses job listings for YC-backed companies. Work mode inferred from job description text.
+
+### Wellfound / AngelList
+
+Queries `wellfound.com/jobs` with skill/role filters. Work mode inferred from job metadata and description tags.
+
+### GitHub Discovery
+
+Searches GitHub repos/organizations using the GitHub Search API (`github.com/search/repositories`) to find engineering orgs matching the user's tech stack. Less reliable for work-mode inference (usually returns `UNKNOWN`). Requires `GITHUB_TOKEN`.
+
+### Crunchbase
+
+Queries Crunchbase company search API for companies matching industry/tech keywords. HQ location is the primary work-mode signal.
+
+### AI Discovery (GPT-4o-mini)
+
+Builds a structured prompt from the full user profile and asks the model to generate 10–15 company recommendations as a JSON array. Each entry includes: `name`, `domain`, `description`, `industry`, `size`, `tech_stack`, `funding_stage`, `remote_friendly`, `headquarters`, `culture_tags`. Temperature is set low (0.3) for factual consistency. Falls back to a hardcoded list of 10 tech companies if the API key is not configured.
+
+---
+
+## Hard Constraints Engine
+
+**File:** `backend/services/filters/hard_constraints.py`
+
+### `apply_hard_constraints_with_diagnostics(companies, preferences) → HardConstraintResult`
+
+Central enforcement function. Called in two places:
+
+1. **Discovery pipeline** — in `CompanyDiscoveryService.discover()` and `discover_stream()`, after dedup and industry filter, **before** any company is yielded to `_persist_companies()`. Onsite/hybrid companies that don't match preferences are discarded here and never hit the database.
+2. **Workspace reads** — in `GET /company-finder/companies`, the saved workspace rows are re-filtered on every read. This handles companies that were discovered before a preference change (e.g., user later enables strict remote). They become `hidden_by_preferences` without any DB mutation.
+
+### Result shape
+
+```python
+@dataclass
+class HardConstraintResult:
+    visible_companies: list[dict]   # pass all constraints
+    hidden_companies:  list[dict]   # blocked, annotated with reasons
+    counts_by_source:  dict[str, dict[str, int]]  # telemetry per source
+```
+
+### Counts tracked per source
+
+```json
+{
+  "hard_constraints_filtered": 4,
+  "remote_filtered": 0,
+  "hybrid_filtered": 2,
+  "onsite_filtered": 1,
+  "unknown_filtered": 1,
+  "blocked_company_filtered": 0,
+  "visa_filtered": 0,
+  "salary_filtered": 0,
+  "location_filtered": 0,
+  "visible": 7
+}
+```
+
+---
+
+## Background Hydration
+
+After minimal records are persisted to Supabase, `_run_background_hydration()` runs as an `asyncio.Task` (fire-and-forget) with four sequential stages:
+
+| Stage | Worker | What it does | SSE event on complete |
+|---|---|---|---|
+| Enrichment | `run_enrichment_worker()` | Scrapes company website, extracts GitHub org signals, hiring velocity, tech stack depth | `refresh_companies: true` |
+| Ranking | `run_ranking_worker()` | Scores each company against profile + preferences using weighted algorithm; persists `ranking_score`, `ranking_explanation`, `ranking_metadata` to `user_companies` | `refresh_companies: true` |
+| Contacts | `run_contact_worker()` | Finds hiring managers / founders for top 15 companies; persists to `company_contacts` | `refresh_companies: true` |
+| Embeddings | `run_embedding_worker()` | Generates `text-embedding-3-small` vectors; persists to `company_embeddings` for semantic search | — |
+
+Each stage is fault-isolated — failure in enrichment does not block ranking. Stage failures are recorded in `stage_failures` and included in the final SSE event metadata.
+
+### Ranking signals
 
 | Signal | Weight |
 |---|---|
 | Tech stack overlap | High |
-| Role/domain match | High |
+| Role / domain match | High |
+| Visa / sponsorship availability | High (when required) |
 | Location fit | Medium |
-| Remote friendliness | Medium |
-| Company size preference | Low–Medium |
-| Visa/sponsorship availability | High (when required) |
+| Remote friendliness (confirmed) | Medium |
 | Industry preference | Medium |
+| Company size preference | Low–Medium |
 | Funding stage / stability | Low |
 
-Companies are sorted by composite score and the top N are returned (default: 25–50).
-
-### Step 5 — Contact Discovery
-
-The `ContactFinderService` attempts to find a relevant hiring contact or engineering leader at each ranked company. Results are attached to the company object for use by the Email Writer Agent.
-
 ---
 
-## Internet Scraping Sources
+## Workspace Visibility at Read Time
 
-### 1. Hacker News — "Who is Hiring?" Threads
+`GET /company-finder/companies` (main.py) applies `partition_workspace_companies()` on every read:
 
-**URL:** `https://hn.algolia.com/api/v1/search`  
-**Cost:** Free, no API key required  
-**Update frequency:** Monthly (HN posts a new hiring thread each month)
+```
+DB rows (all saved)
+        │
+        ├─ archived companies  ──────────────────────────→  archived[]
+        │
+        └─ active companies
+                │
+        apply_hard_constraints_with_diagnostics(active, current_prefs)
+                │
+                ├─ visible_companies  ────────────────────→  companies[]  (returned to UI)
+                └─ hidden_companies   ────────────────────→  hidden_by_preferences[]
+                                                             (count returned, not full objects)
+```
 
-**How it works:**
-1. Queries the Algolia HN API for the latest "Ask HN: Who is hiring?" story post
-2. Searches comments on that specific story thread that match the user's skills and target roles
-3. Parses hiring post comments using the standard HN format:
-   ```
-   CompanyName | Role | Location | Remote | Description...
-   ```
-4. Extracts company names via pipe-pattern regex: `^([A-Z][A-Za-z0-9 .,&!-]{2,40})\s*\|`
-
-**Strengths:** Real, actively-hiring companies posting directly on HN. Strong signal for tech startups, YC-backed companies, and engineering-led orgs.
-
-**Limitations:** Only captures companies that manually post on HN; skews toward engineering roles and startup culture.
-
----
-
-### 2. RemoteOK
-
-**URL:** `https://remoteok.com/api`  
-**Cost:** Free public API, no authentication  
-**Update frequency:** Near real-time job postings
-
-**How it works:**
-1. Fetches the public JSON feed of remote job listings
-2. Groups listings by company name
-3. Filters companies whose listed roles and tags overlap with the user's skills and target roles
-4. Extracts company metadata: name, website URL, open positions, remote status
-
-**Strengths:** Exclusively remote-friendly companies. Strong signal that the company actively hires remotely. Rich job tag data (React, Python, Go, etc.) enables precise skill matching.
-
-**Limitations:** Only covers companies advertising remote roles at the time of the request. Smaller and mid-size companies are over-represented.
-
----
-
-### 3. Y Combinator Companies Directory
-
-**URL:** `https://45bwzj1sgc-dsn.algolia.net` (Algolia index: `YCCompany_production`)  
-**Cost:** Free public API (no key required for basic search)  
-**Update frequency:** Maintained by YC, updated as companies apply/graduate
-
-**How it works:**
-1. Queries YC's Algolia-backed company search API
-2. Filters for `isHiring: true` to return only actively hiring companies
-3. Searches across company name, description, tags, and batch (e.g., W24, S23)
-4. Maps results to the standard company schema
-
-**Fallback:** If the YC API is unreachable, a hardcoded list of 12 well-known YC alumni companies is used (Airbnb, Stripe, Dropbox, etc.).
-
-**Strengths:** High-quality companies with known funding, mission, and growth trajectory. YC brand is a strong signal for engineering culture and growth opportunities.
-
-**Limitations:** Only covers YC-funded companies (~4,000 total). Not representative of the broader job market.
-
----
-
-### 4. AI-Powered Discovery (OpenAI GPT-4o-mini)
-
-**Model:** `gpt-4o-mini` (configurable via `OPENAI_MODEL` env var)  
-**Cost:** OpenAI API usage (paid)  
-**Update frequency:** Per-request, based on model's training data
-
-**How it works:**
-1. Builds a structured prompt from the user's full profile: skills, experience, preferences, salary range, location, target roles
-2. Asks GPT-4o-mini to generate a JSON array of 10–15 companies that would be a strong match
-3. Each company in the response includes: name, domain, description, industry, size, tech stack, funding stage, remote status, headquarters, culture tags
-4. Parses the structured JSON response and normalizes to the standard company schema
-
-**Prompt strategy:** The prompt explicitly instructs the model to output valid JSON only, specifying the exact schema fields. Temperature is kept low (0.3) to produce consistent, factual results rather than creative hallucinations.
-
-**Fallback:** If `OPENAI_API_KEY` is not configured or the API call fails, a hardcoded list of 10 well-known tech companies is used:
-
-> OpenAI, Anthropic, DeepMind, Cohere, Mistral AI, Databricks, Hugging Face, Figma, Notion, Cloudflare
-
-**Strengths:** Most personalized source. Can reason across all user signals simultaneously. Surfaces niche companies that don't post on job boards. Especially effective for specialized roles (AI/ML, research, DevRel, etc.).
-
-**Limitations:** Dependent on model training data cutoff — may not know about companies founded after the cutoff. Requires a paid OpenAI API key for production use.
+This means toggling strict remote mode immediately hides onsite companies on the next page load without requiring a re-discovery run or DB mutation.
 
 ---
 
 ## Real-Time Event Streaming
 
-The agent communicates its progress to the frontend via **Server-Sent Events (SSE)**.
-
 **Endpoint:** `GET /agent-events/stream`
 
-Each connected client (browser tab) gets its own dedicated event queue. Events are **broadcast** to all active subscribers simultaneously — opening the Agents page and the Company Finder page at the same time will not cause either to miss events.
+Each browser tab gets its own dedicated event queue. Events are broadcast to all active subscribers.
 
 ### Event structure
 
@@ -170,10 +368,23 @@ Each connected client (browser tab) gets its own dedicated event queue. Events a
   "id": "uuid",
   "agent_name": "CompanyFinderAgent",
   "task_id": "task-uuid",
-  "status": "in_progress",
-  "message": "Searching HackerNews Who's Hiring...",
-  "metadata": {},
-  "created_at": "2024-01-15T10:30:00.000Z"
+  "status": "running",
+  "message": "Greenhouse: +12 companies",
+  "metadata": {
+    "source": "Greenhouse",
+    "stage": "company_discovery",
+    "refresh_companies": true,
+    "source_counts": {
+      "raw_discovered": 18,
+      "duplicates_removed": 3,
+      "hard_constraints_filtered": 3,
+      "onsite_filtered": 2,
+      "hybrid_filtered": 1,
+      "persisted": 12
+    },
+    "visible_companies": 12
+  },
+  "created_at": "2026-05-08T10:30:00.000Z"
 }
 ```
 
@@ -182,30 +393,50 @@ Each connected client (browser tab) gets its own dedicated event queue. Events a
 | Status | Meaning |
 |---|---|
 | `started` | Pipeline has begun |
-| `in_progress` | A step is running (message describes the step) |
-| `completed` | All steps finished; `metadata.companies` contains the full ranked list |
+| `running` | A step is in progress (message + metadata describe it) |
+| `completed` | All background hydration done |
 | `error` | A step failed; `metadata.error` contains details |
 
-### Completed event payload
-
-When the pipeline finishes, the `completed` event's `metadata` includes the full company objects so the frontend can render results immediately without a separate API round-trip:
-
-```json
-{
-  "status": "completed",
-  "metadata": {
-    "companies": [ ...full company objects... ],
-    "company_names": ["Anthropic", "Figma", "Notion", ...],
-    "total": 25
-  }
-}
-```
+When `metadata.refresh_companies == true` the frontend re-fetches the workspace endpoint to update the company list incrementally.
 
 ---
 
 ## Data Persistence
 
-Discovered and ranked companies are persisted to **Supabase** for retrieval across sessions. When Supabase is not configured (no `SUPABASE_URL` env var), the backend maintains an **in-memory cache** (`_user_companies_cache`) keyed by `user_id`. The frontend always prefers companies delivered directly in the SSE `completed` event, avoiding any dependency on the database for the initial render.
+Companies are persisted to Supabase in two tables:
+
+| Table | Content |
+|---|---|
+| `companies` | Canonical company record (name, domain, description, work_mode, open_positions, …) |
+| `user_companies` | User-specific overlay: ranking score, status, contacts found, orchestration stage, work_mode metadata |
+
+`metadata` on both records carries `work_mode`, `remote_confidence`, `work_mode_reasoning`, and `preference_enforcement` so enforcement decisions are auditable.
+
+When Supabase is not configured (`SUPABASE_URL` not set), an in-memory cache (`_user_companies_cache`) is used as a fallback.
+
+---
+
+## Observability
+
+Per-session telemetry is written to `discovery_source_logs.metadata` by `update_discovery_source_log_counts()` after each source batch:
+
+```json
+{
+  "raw_discovered": 18,
+  "duplicates_removed": 3,
+  "already_seen_filtered": 1,
+  "industry_filtered": 0,
+  "hard_constraints_filtered": 3,
+  "onsite_filtered": 2,
+  "hybrid_filtered": 1,
+  "unknown_filtered": 0,
+  "ranking_filtered": 0,
+  "persistence_failed": 0,
+  "persisted": 11
+}
+```
+
+This lets you audit exactly why companies were dropped at each stage of the pipeline.
 
 ---
 
@@ -213,11 +444,11 @@ Discovered and ranked companies are persisted to **Supabase** for retrieval acro
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | Optional | Enables AI-powered discovery (Step 4). Without it, 10 fallback companies are used. |
-| `OPENAI_MODEL` | Optional | Model for AI discovery. Defaults to `gpt-4o-mini`. |
-| `SUPABASE_URL` | Optional | Persists company rankings across sessions. Without it, in-memory cache is used. |
-| `SUPABASE_ANON_KEY` | Optional | Required alongside `SUPABASE_URL`. |
-| `GITHUB_TOKEN` | Optional | Reserved for future GitHub org search source. |
+| `OPENAI_API_KEY` | Recommended | AI query expansion + AI Discovery source. Falls back to heuristic queries / hardcoded companies without it. |
+| `OPENAI_MODEL` | Optional | Model for AI operations. Defaults to `gpt-4o-mini`. |
+| `SUPABASE_URL` | Recommended | Persists companies and workspace state. Falls back to in-memory cache. |
+| `SUPABASE_ANON_KEY` | Required with URL | Supabase auth. |
+| `GITHUB_TOKEN` | Optional | Enables GitHub Discovery source (org/repo search). |
 
 ---
 
@@ -226,35 +457,86 @@ Discovered and ranked companies are persisted to **Supabase** for retrieval acro
 ```
 User Browser
     │
-    ├── POST /company-finder/run  ──────────────────────────────────────────┐
-    │                                                                        │
-    └── GET /agent-events/stream  ←── SSE broadcast ←── AgentEventLogger ←─┤
-                                                                            │
-                                                               CompanyFinderAgent
-                                                                    │
-                                          ┌─────────────────────────┤
-                                          │                         │
-                                    asyncio.gather()          AgentEventLogger
-                                          │                   (emits SSE events)
-                          ┌───────────────┼───────────────────────┐
-                          │               │               │       │
-                   HN Algolia      RemoteOK API     YC Algolia   OpenAI
-                   (comments       (job feed)      (companies)  (gpt-4o-mini)
-                   on hiring
-                   threads)
-                          │               │               │       │
-                          └───────────────┴───────────────┴───────┘
-                                          │
-                                  Deduplicate & Merge
-                                          │
-                                  CompanyRankerService
-                                  (weighted scoring)
-                                          │
-                                  ContactFinderService
-                                          │
-                               ┌──────────┴──────────┐
-                               │                     │
-                          Supabase             In-memory cache
-                          (persist)           (fallback when
-                                              DB not configured)
+    ├── POST /company-finder/run
+    │         │
+    │         ▼
+    │   CompanyFinderAgent.run_full_pipeline()
+    │         │
+    │   ┌─────┴──────────────────────────────────────────┐
+    │   │ Step 1: ResumeParserService (GPT-4o-mini)       │
+    │   │ Step 2: normalize_preference_payload()          │
+    │   │         + feedback learning merge               │
+    │   └─────┬──────────────────────────────────────────┘
+    │         │
+    │   ┌─────┴──────────────────────────────────────────┐
+    │   │ Step 3: CompanyDiscoveryService.discover_stream()│
+    │   │                                                 │
+    │   │  Phase 1: QueryExpansionService (GPT-4o-mini)   │
+    │   │           → N expanded search queries           │
+    │   │                                                 │
+    │   │  Phase 2: SourceOrchestrator (asyncio, ≤8 conc) │
+    │   │  ┌─────────────────────────────────────────┐   │
+    │   │  │  Greenhouse   Lever      Ashby           │   │
+    │   │  │  Workable     Crunchbase GitHubDiscovery │   │
+    │   │  │  RemoteOK     HackerNews YCombinator     │   │
+    │   │  │  WorkAtAStartup  Wellfound  AI Discovery  │   │
+    │   │  └──────────────────┬──────────────────────┘   │
+    │   │                     │ raw company dicts          │
+    │   │  Phase 3: Deduplicate by normalized domain       │
+    │   │           + RecursiveExpansionService            │
+    │   │                                                 │
+    │   │  Phase 4: Feedback loop (up to 3 rounds)        │
+    │   │           if < 35 companies / < 4 sources        │
+    │   │                                                 │
+    │   │  Phase 4.5: Industry mismatch filter (soft)     │
+    │   │                                                 │
+    │   │  Phase 4.6: ◀ HARD CONSTRAINT GATE ▶            │
+    │   │  apply_hard_constraints_with_diagnostics()      │
+    │   │    • work_mode != remote → BLOCKED              │
+    │   │    • remote_confidence < 0.8 → BLOCKED          │
+    │   │    • blocked company/domain → BLOCKED           │
+    │   │    • sponsorship unavailable → BLOCKED          │
+    │   │    • salary below minimum → BLOCKED             │
+    │   │    • excluded location → BLOCKED                │
+    │   │  visible_companies only pass through ↓          │
+    │   │                                                 │
+    │   │  Phase 4.7: Remove already-in-workspace domains │
+    │   │                                                 │
+    │   │  Phase 5: Priority sort (startup score)         │
+    │   └─────┬──────────────────────────────────────────┘
+    │         │ per-source batches yielded incrementally
+    │   ┌─────┴──────────────────────────────────────────┐
+    │   │ _persist_companies() per batch                  │
+    │   │   upsert companies + user_companies             │
+    │   │   store: work_mode, remote_confidence,          │
+    │   │          work_mode_reasoning, preference_       │
+    │   │          enforcement                            │
+    │   └─────┬──────────────────────────────────────────┘
+    │         │
+    │   ┌─────┴──────────────────────────────────────────┐
+    │   │ asyncio.create_task(_run_background_hydration) │
+    │   │   run_enrichment_worker()   → website signals  │
+    │   │   run_ranking_worker()      → match scores     │
+    │   │   run_contact_worker()      → hiring contacts  │
+    │   │   run_embedding_worker()    → semantic vectors │
+    │   └─────────────────────────────────────────────────┘
+    │
+    └── GET /agent-events/stream  ←── SSE ←── AgentEventLogger
+              (refresh_companies: true on each hydration stage)
+
+    GET /company-finder/companies
+              │
+        DB rows (all saved companies)
+              │
+        partition_workspace_companies(rows, current_prefs)
+              │
+        ┌─────┴────────────────────────────────┐
+        │  apply_hard_constraints() on active  │
+        │  rows re-enforces preferences on     │
+        │  every read (retroactive filtering)  │
+        └─────┬────────────────────────────────┘
+              │
+        visible_companies  →  returned to UI
+        hidden_by_preferences  →  count only (no DB mutation)
+        archived  →  separate list
 ```
