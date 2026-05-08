@@ -24,42 +24,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-# Support both direct and relative imports
-try:
-    from .event_logger import AgentEventLogger
-    from ..services.resume_parser import ResumeParserService
-    from ..services.preference_collector import PreferenceCollectorService
-    from ..services.company_discovery import CompanyDiscoveryService
-    from ..services.company_ranker import CompanyRankerService
-    from ..services.company_enrichment import CompanyEnrichmentService
-    from ..services.company_scoring import CompanyScoringService
-    from ..services.contact_finder import ContactFinderService
-    from ..services.background_jobs import (
-        run_contact_worker,
-        run_embedding_worker,
-        run_enrichment_worker,
-        run_ranking_worker,
-    )
-    from ..services.filters import apply_hard_constraints, normalize_preference_payload
-    from ..db.supabase import supabase_client
-except ImportError:
-    sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
-    from backend.agents.event_logger import AgentEventLogger
-    from backend.services.resume_parser import ResumeParserService
-    from backend.services.preference_collector import PreferenceCollectorService
-    from backend.services.company_discovery import CompanyDiscoveryService
-    from backend.services.company_ranker import CompanyRankerService
-    from backend.services.company_enrichment import CompanyEnrichmentService
-    from backend.services.company_scoring import CompanyScoringService
-    from backend.services.contact_finder import ContactFinderService
-    from backend.services.background_jobs import (
-        run_contact_worker,
-        run_embedding_worker,
-        run_enrichment_worker,
-        run_ranking_worker,
-    )
-    from backend.services.filters import apply_hard_constraints, normalize_preference_payload
-    from backend.db.supabase import supabase_client
+# Ensure backend root is in Python path for both local and Vercel deployments
+_backend_root = str(Path(__file__).resolve().parent.parent)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+
+from agents.event_logger import AgentEventLogger
+from services.resume_parser import ResumeParserService
+from services.preference_collector import PreferenceCollectorService
+from services.company_discovery import CompanyDiscoveryService
+from services.company_ranker import CompanyRankerService
+from services.company_enrichment import CompanyEnrichmentService
+from services.company_scoring import CompanyScoringService
+from services.contact_finder import ContactFinderService
+from services.background_jobs import (
+    run_contact_worker,
+    run_embedding_worker,
+    run_enrichment_worker,
+    run_ranking_worker,
+)
+from services.filters import apply_hard_constraints, normalize_preference_payload
+from db.supabase import supabase_client
 
 
 class CompanyFinderAgent:

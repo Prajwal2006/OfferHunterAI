@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
 from typing import Any
 
-try:
-    from ..embedding_service import EmbeddingService
-except ImportError:
-    from backend.services.embedding_service import EmbeddingService
+# Ensure backend root is in Python path for both local and Vercel deployments
+_backend_root = str(Path(__file__).resolve().parent.parent.parent)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+
+from services.embedding_service import EmbeddingService
 
 
 async def run_embedding_worker(

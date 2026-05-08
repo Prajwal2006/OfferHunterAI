@@ -13,7 +13,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Any
+
+# Ensure backend root is in Python path for both local and Vercel deployments
+_backend_root = str(Path(__file__).resolve().parent.parent)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 import httpx
 
@@ -24,13 +31,7 @@ _embedding_service_instance = None
 def _get_embedding_service():
     global _embedding_service_instance
     if _embedding_service_instance is None:
-        try:
-            from .embedding_service import EmbeddingService
-        except ImportError:
-            import sys
-            from pathlib import Path
-            sys.path.append(str(Path(__file__).resolve().parent.parent))
-            from backend.services.embedding_service import EmbeddingService
+        from services.embedding_service import EmbeddingService
         _embedding_service_instance = EmbeddingService()
     return _embedding_service_instance
 

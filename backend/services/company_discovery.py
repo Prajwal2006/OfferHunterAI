@@ -20,42 +20,31 @@ import asyncio
 import json
 import os
 import re
+import sys
+from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import quote, urljoin, urlparse
+
+# Ensure backend root is in Python path for both local and Vercel deployments
+_backend_root = str(Path(__file__).resolve().parent.parent)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 import httpx
 from bs4 import BeautifulSoup
 
-# ─── New service imports ───────────────────────────────────────────────────────
-try:
-    from .query_expansion import QueryExpansionService
-    from .discovery import RecursiveExpansionService, SourceOrchestrator, SourceRegistry
-    from .filters import apply_hard_constraints_with_diagnostics, normalize_preference_payload
-    from .company_sources import (
-        HackerNewsSource,
-        RemoteOKSource,
-        WorkAtAStartupSource,
-        WellfoundSource,
-        YCCompaniesSource,
-        AIDiscoverySource,
-    )
-    from ..db.supabase import supabase_client
-except ImportError:
-    import sys
-    from pathlib import Path
-    sys.path.append(str(Path(__file__).resolve().parent.parent))
-    from backend.services.query_expansion import QueryExpansionService
-    from backend.services.discovery import RecursiveExpansionService, SourceOrchestrator, SourceRegistry
-    from backend.services.filters import apply_hard_constraints_with_diagnostics, normalize_preference_payload
-    from backend.services.company_sources import (
-        HackerNewsSource,
-        RemoteOKSource,
-        WorkAtAStartupSource,
-        WellfoundSource,
-        YCCompaniesSource,
-        AIDiscoverySource,
-    )
-    from backend.db.supabase import supabase_client
+from services.query_expansion import QueryExpansionService
+from services.discovery import RecursiveExpansionService, SourceOrchestrator, SourceRegistry
+from services.filters import apply_hard_constraints_with_diagnostics, normalize_preference_payload
+from services.company_sources import (
+    HackerNewsSource,
+    RemoteOKSource,
+    WorkAtAStartupSource,
+    WellfoundSource,
+    YCCompaniesSource,
+    AIDiscoverySource,
+)
+from db.supabase import supabase_client
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
