@@ -20,21 +20,13 @@ import { RequireAuth } from "@/components/RequireAuth";
 import { useAuth } from "@/components/AuthProvider";
 import {
   fetchDiscoveredCompanies,
-  fetchParsedProfile,
-  fetchUserPreferences,
-  getPreferenceOpener,
-  fetchConversationHistory,
   runCompanyFinder,
-  fetchResumes,
   handoffToAgent,
   addManualCompany,
   updateWorkspaceCompany,
   sendCompanyFeedback,
   continueCompanyDiscovery,
-  fetchOrchestrationState,
-  fetchDiscoverySessions,
   fetchDiscoverySourceLogs,
-  repairCompanyWorkspace,
 } from "@/lib/api";
 import {
   Company,
@@ -155,6 +147,38 @@ type StreamedAgentEvent = {
   metadata?: Record<string, unknown>;
 };
 
+type SourcePipelineBreakdown = {
+  raw_discovered: number;
+  duplicates_removed: number;
+  already_seen_filtered: number;
+  ranking_filtered: number;
+  persistence_failed: number;
+  persisted: number;
+};
+
+function getPipelineBreakdown(log: DiscoverySourceLog): SourcePipelineBreakdown | null {
+  const metadata = log.metadata || {};
+  const raw = Number((metadata as Record<string, unknown>).raw_discovered);
+  const duplicates = Number((metadata as Record<string, unknown>).duplicates_removed);
+  const alreadySeen = Number((metadata as Record<string, unknown>).already_seen_filtered);
+  const rankingFiltered = Number((metadata as Record<string, unknown>).ranking_filtered);
+  const failed = Number((metadata as Record<string, unknown>).persistence_failed);
+  const persisted = Number((metadata as Record<string, unknown>).persisted);
+
+  if ([raw, duplicates, alreadySeen, rankingFiltered, failed, persisted].every((v) => Number.isNaN(v))) {
+    return null;
+  }
+
+  return {
+    raw_discovered: Number.isFinite(raw) ? raw : 0,
+    duplicates_removed: Number.isFinite(duplicates) ? duplicates : 0,
+    already_seen_filtered: Number.isFinite(alreadySeen) ? alreadySeen : 0,
+    ranking_filtered: Number.isFinite(rankingFiltered) ? rankingFiltered : 0,
+    persistence_failed: Number.isFinite(failed) ? failed : 0,
+    persisted: Number.isFinite(persisted) ? persisted : Number(log.result_count || 0),
+  };
+}
+
 function stageLabel(stage: string): string {
   const normalized = stage.trim().toLowerCase();
   const labels: Record<string, string> = {
@@ -165,6 +189,8 @@ function stageLabel(stage: string): string {
     ranking: "Ranking companies for your profile",
     contact_discovery: "Finding recruiter and founder contacts",
     persistence: "Saving results to your workspace",
+    embeddings: "Generating semantic embeddings",
+    background_hydration: "Hydrating company intelligence in background",
   };
   return labels[normalized] || "Processing";
 }
@@ -314,11 +340,11 @@ function CompanyFinderContent() {
   const [discoverySessions, setDiscoverySessions] = useState<DiscoverySession[]>([]);
   const [sourceLogs, setSourceLogs] = useState<DiscoverySourceLog[]>([]);
   const [sourceMode, setSourceMode] = useState<string>("all");
+  const [initAttempt, setInitAttempt] = useState(0);
   const esRef = useRef<EventSource | null>(null);
   const activeTaskIdRef = useRef<string | null>(null);
   const currentStageRef = useRef<string>("company_discovery");
   const stageStartedAtRef = useRef<number>(Date.now());
-  const initializedUserRef = useRef<string | null>(null);
   const repairRequestedForUserRef = useRef<string | null>(null);
   // Track whether the running state was triggered by "Find More" (merge) vs fresh run (replace)
   const isContinuingRef = useRef(false);
@@ -326,22 +352,59 @@ function CompanyFinderContent() {
   // ── Initial load ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!userId) return;
-    if (initializedUserRef.current === userId) return;
-    initializedUserRef.current = userId;
     let cancelled = false;
-    const abortController = new AbortController();
+    const activeControllers = new Set<AbortController>();
     const FETCH_TIMEOUT_MS = 15_000;
 
     // Wraps fetch with a per-call timeout so a slow/hung API never blocks "checking" forever.
-    function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-      const timeoutId = setTimeout(() => abortController.abort(), FETCH_TIMEOUT_MS);
-      return fetch(input, { ...init, signal: abortController.signal }).finally(() =>
-        clearTimeout(timeoutId)
-      );
+    async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const controller = new AbortController();
+      activeControllers.add(controller);
+      const timeoutId = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS);
+
+      try {
+        return await fetch(input, { ...init, signal: controller.signal });
+      } catch (err) {
+        if (controller.signal.aborted && controller.signal.reason === "timeout") {
+          throw new Error("Request timed out");
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeoutId);
+        activeControllers.delete(controller);
+      }
+    }
+
+    async function fetchJsonWithTimeout<T>(
+      input: RequestInfo | URL,
+      init?: RequestInit,
+      fallback?: T
+    ): Promise<T> {
+      try {
+        const response = await fetchWithTimeout(input, init);
+        if (!response.ok) {
+          throw new Error(`Request failed with status ${response.status}`);
+        }
+        return (await response.json()) as T;
+      } catch (err) {
+        if (fallback !== undefined) {
+          return fallback;
+        }
+        throw err;
+      }
+    }
+
+    function isCleanupAbortError(err: unknown): boolean {
+      return (
+        err instanceof DOMException && err.name === "AbortError"
+      ) || (err instanceof Error && /aborted|aborterror/i.test(err.message));
     }
 
     async function init() {
       try {
+        setError(null);
+        setAgentMessage("");
+
         // 1. Check for resume
         const resumeRes = await fetchWithTimeout(
           `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/resumes?user_id=${encodeURIComponent(userId)}`
@@ -374,9 +437,21 @@ function CompanyFinderContent() {
         setPreferences(prefsData.preferences);
 
         const [orchestration, sessions, logs] = await Promise.all([
-          fetchOrchestrationState(userId).catch(() => ({ state: null })),
-          fetchDiscoverySessions(userId, { limit: 8 }).catch(() => ({ sessions: [] })),
-          fetchDiscoverySourceLogs(userId, { limit: 24 }).catch(() => ({ logs: [] })),
+          fetchJsonWithTimeout<{ state: OrchestrationState | null }>(
+            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/orchestration/${encodeURIComponent(userId)}`,
+            undefined,
+            { state: null }
+          ),
+          fetchJsonWithTimeout<{ sessions: DiscoverySession[] }>(
+            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/discovery-sessions/${encodeURIComponent(userId)}?limit=8`,
+            undefined,
+            { sessions: [] }
+          ),
+          fetchJsonWithTimeout<{ logs: DiscoverySourceLog[] }>(
+            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/source-logs/${encodeURIComponent(userId)}?limit=24`,
+            undefined,
+            { logs: [] }
+          ),
         ]);
         if (cancelled) return;
         setOrchestrationState(orchestration.state ?? null);
@@ -386,26 +461,52 @@ function CompanyFinderContent() {
         if (!prefsData.preferences?.conversation_complete) {
           // Need to collect preferences
           const [opener, histData] = await Promise.all([
-            getPreferenceOpener(userId),
-            fetchConversationHistory(userId),
+            fetchJsonWithTimeout<{ message: string }>(
+              `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/preferences/opener?user_id=${encodeURIComponent(userId)}`,
+              undefined,
+              { message: "What kinds of roles are you targeting?" }
+            ),
+            fetchJsonWithTimeout<{ history: ConversationMessage[] }>(
+              `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/conversation/${encodeURIComponent(userId)}`,
+              undefined,
+              { history: [] }
+            ),
           ]);
           if (cancelled) return;
-          setPrefOpener(opener);
+          setPrefOpener(opener.message ?? "What kinds of roles are you targeting?");
           setPrefHistory(histData.history ?? []);
           setStep("preferences");
           return;
         }
 
         // 4. Check for existing companies — show them without auto-running discovery
-        const companyData = await fetchDiscoveredCompanies(userId, { limit: 1000 });
+        const companyData = await fetchJsonWithTimeout<{ companies: Company[] }>(
+          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=1000`,
+          undefined,
+          { companies: [] }
+        );
         if (cancelled) return;
         setCompanies((prev) => mergeCompanies(prev, companyData.companies));
         setStep("results");
         if (repairRequestedForUserRef.current !== userId) {
           repairRequestedForUserRef.current = userId;
-          void repairCompanyWorkspace(userId)
+          void fetchJsonWithTimeout<{ status: string; user_id: string }>(
+            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/companies/repair`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ user_id: userId }),
+            },
+            { status: "skipped", user_id: userId }
+          )
             .then(() => new Promise((resolve) => setTimeout(resolve, 2500)))
-            .then(() => fetchDiscoveredCompanies(userId, { limit: 1000 }))
+            .then(() =>
+              fetchJsonWithTimeout<{ companies: Company[] }>(
+                `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=1000`,
+                undefined,
+                { companies: [] }
+              )
+            )
             .then((data) => {
               if (!cancelled) {
                 setCompanies((prev) => mergeCompanies(prev, data.companies));
@@ -417,6 +518,7 @@ function CompanyFinderContent() {
         }
       } catch (err) {
         if (cancelled) return;
+        if (isCleanupAbortError(err)) return;
         setError(err instanceof Error ? err.message : "Initialization failed");
         setStep("error");
       }
@@ -425,10 +527,11 @@ function CompanyFinderContent() {
     init();
     return () => {
       cancelled = true;
-      abortController.abort();
-      initializedUserRef.current = null;
+      for (const controller of activeControllers) {
+        controller.abort("cleanup");
+      }
     };
-  }, [userId]);
+  }, [userId, initAttempt]);
 
   // ── SSE Event Stream for agent progress ────────────────────────────────────
   useEffect(() => {
@@ -450,6 +553,21 @@ function CompanyFinderContent() {
             stageStartedAtRef.current = Date.now();
           }
           setAgentMessage(buildAgentBannerMessage(data));
+
+          const shouldRefreshCompanies = Boolean((data.metadata || {}).refresh_companies);
+          if (shouldRefreshCompanies) {
+            fetchDiscoveredCompanies(userId, { limit: 1000 })
+              .then((res) => {
+                setCompanies((prev) => mergeCompanies(prev, res.companies));
+                void fetchDiscoverySourceLogs(userId, { limit: 24 }).then((logs) =>
+                  setSourceLogs(logs.logs ?? [])
+                );
+              })
+              .catch(() => {
+                // best-effort refresh only
+              });
+          }
+
           if (data.status === "completed") {
             isContinuingRef.current = false;
             // Always reload from DB so persisted state is the source of truth
@@ -750,6 +868,7 @@ function CompanyFinderContent() {
           onClick={() => {
             setError(null);
             setStep("checking");
+            setInitAttempt((value) => value + 1);
           }}
           className="inline-flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-xl font-medium hover:bg-primary/90 transition-colors"
         >
@@ -851,7 +970,7 @@ function CompanyFinderContent() {
           <div>
             <h1 className="text-2xl font-bold text-foreground">Company Finder</h1>
             <p className="text-xs text-muted-foreground">
-              {companies.length} companies discovered and ranked for you
+              {companies.length} companies discovered for you (progressively hydrated)
             </p>
           </div>
         </div>
@@ -1032,10 +1151,7 @@ function CompanyFinderContent() {
         {sourceLogs.length > 0 && (
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-2">
             {sourceLogs.slice(0, 6).map((log) => (
-              <div
-                key={log.id}
-                className="rounded-xl border border-border bg-muted/30 px-3 py-2 text-xs"
-              >
+              <div key={log.id} className="rounded-xl border border-border bg-muted/30 px-3 py-2 text-xs">
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-medium text-foreground truncate">{log.source}</span>
                   <span
@@ -1050,10 +1166,29 @@ function CompanyFinderContent() {
                     {log.status}
                   </span>
                 </div>
-                <div className="mt-1 text-muted-foreground">
-                  {log.result_count || 0} companies
-                  {log.duration_ms ? ` · ${Math.round(log.duration_ms / 1000)}s` : ""}
-                </div>
+                {(() => {
+                  const breakdown = getPipelineBreakdown(log);
+                  if (!breakdown) {
+                    return (
+                      <div className="mt-1 text-muted-foreground">
+                        {log.result_count || 0} companies
+                        {log.duration_ms ? ` · ${Math.round(log.duration_ms / 1000)}s` : ""}
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="mt-1 text-muted-foreground space-y-0.5">
+                      <div>
+                        raw {breakdown.raw_discovered} · dedupe -{breakdown.duplicates_removed} · already known -{breakdown.already_seen_filtered}
+                      </div>
+                      <div>
+                        filtered -{breakdown.ranking_filtered} · persist failed -{breakdown.persistence_failed} · visible {breakdown.persisted}
+                      </div>
+                      {log.duration_ms ? <div>{Math.round(log.duration_ms / 1000)}s</div> : null}
+                    </div>
+                  );
+                })()}
                 {log.error && (
                   <div className="mt-1 truncate text-red-600 dark:text-red-400">
                     {log.error}

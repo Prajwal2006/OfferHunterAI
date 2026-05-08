@@ -850,6 +850,55 @@ class SupabaseClient:
         result = query.execute()
         return result.data or []
 
+    async def update_discovery_source_log_counts(
+        self,
+        *,
+        user_id: str,
+        discovery_session_id: Optional[str],
+        source: str,
+        counts: dict[str, Any],
+    ) -> list[dict]:
+        """Update per-source pipeline counters for the active discovery session."""
+        client = self._get_client()
+        if not client:
+            return []
+
+        query = (
+            client.table("discovery_source_logs")
+            .select("id, metadata")
+            .eq("user_id", user_id)
+            .eq("source", source)
+            .order("started_at", desc=True)
+            .limit(1)
+        )
+        if discovery_session_id:
+            query = query.eq("discovery_session_id", discovery_session_id)
+
+        result = query.execute()
+        rows = result.data or []
+        if not rows:
+            return []
+
+        row = rows[0]
+        merged_metadata = {
+            **(row.get("metadata") or {}),
+            **counts,
+        }
+
+        update_payload = {
+            "metadata": merged_metadata,
+            "duplicate_count": counts.get("duplicates_removed"),
+            "filtered_count": (counts.get("already_seen_filtered", 0) + counts.get("ranking_filtered", 0)),
+            "result_count": counts.get("persisted", counts.get("raw_discovered", 0)),
+        }
+        updated = (
+            client.table("discovery_source_logs")
+            .update(update_payload)
+            .eq("id", row["id"])
+            .execute()
+        )
+        return updated.data or []
+
     async def get_agent_events_for_task(
         self,
         task_id: str,

@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import uuid
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -875,12 +876,14 @@ async def _persist_recovered_workspace_companies(
     for raw in companies:
         if not isinstance(raw, dict) or not raw.get("name"):
             continue
-        company = dict(raw)
-        ranking = company.pop("ranking", {}) or {}
-        contacts = company.pop("contacts", []) or []
-        company.pop("workspace", None)
-        company.pop("company_contacts", None)
-        company.pop("_persistence_error", None)
+        snapshot = deepcopy(raw)
+        ranking = deepcopy(snapshot.get("ranking") or {})
+        contacts = deepcopy(snapshot.get("contacts") or [])
+        company = {
+            k: v
+            for k, v in snapshot.items()
+            if k not in {"ranking", "contacts", "workspace", "company_contacts", "_persistence_error"}
+        }
         company["domain"] = _normalize_company_domain(company) or re.sub(
             r"[^a-zA-Z0-9]",
             "",

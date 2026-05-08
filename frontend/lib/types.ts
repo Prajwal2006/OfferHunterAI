@@ -126,7 +126,15 @@ export interface DiscoverySourceLog {
   filtered_count?: number;
   error?: string;
   duration_ms?: number;
-  metadata?: Record<string, unknown>;
+  metadata?: {
+    raw_discovered?: number;
+    duplicates_removed?: number;
+    already_seen_filtered?: number;
+    ranking_filtered?: number;
+    persistence_failed?: number;
+    persisted?: number;
+    [key: string]: unknown;
+  };
   started_at?: string;
   completed_at?: string;
 }

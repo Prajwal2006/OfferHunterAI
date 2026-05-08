@@ -20,7 +20,7 @@ import asyncio
 import json
 import os
 import re
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
@@ -187,6 +187,11 @@ class CompanyDiscoveryService:
             "international": {"RemoteOK", "Lever", "Ashby", "Workable", "GitHubDiscovery", "AI Discovery"},
             "visa": {"Greenhouse", "Lever", "Ashby", "RemoteOK", "AI Discovery", "Wellfound", "HackerNews"},
         }
+        self._last_pipeline_metrics: dict[str, dict[str, int]] = {}
+
+    @property
+    def last_pipeline_metrics(self) -> dict[str, dict[str, int]]:
+        return self._last_pipeline_metrics
 
     async def discover(
         self,
@@ -256,9 +261,10 @@ class CompanyDiscoveryService:
             progress_callback,
             active_sources,
         )
+        raw_discovered = self._count_by_source(companies)
 
         # ── Phase 3: Dedup ────────────────────────────────────────────────────
-        companies = self._deduplicate(companies)
+        companies, duplicates_removed = self._deduplicate(companies)
         if progress_callback:
             await progress_callback("Discovery", f"Deduplicated to {len(companies)} unique companies")
 
@@ -277,25 +283,155 @@ class CompanyDiscoveryService:
         )
 
         # ── Phase 4.5: Filter clearly irrelevant industries ───────────────────
+        before_industry_filter = list(companies)
         companies = self._filter_industry_mismatch(companies, profile, preferences)
+        industry_filtered = self._removed_by_source(before_industry_filter, companies)
 
         # ── Phase 4.6: Remove companies already in the user's workspace ───────
+        already_seen_filtered: dict[str, int] = {}
         if excluded:
-            before = len(companies)
+            before = list(companies)
             companies = [
                 c for c in companies
                 if _domain_key(c.get("domain") or c.get("website_url") or "") not in excluded
             ]
-            if progress_callback and before != len(companies):
+            already_seen_filtered = self._removed_by_source(before, companies)
+            if progress_callback and len(before) != len(companies):
                 await progress_callback(
                     "Discovery",
-                    f"Filtered out {before - len(companies)} already-discovered companies — "
+                    f"Filtered out {len(before) - len(companies)} already-discovered companies — "
                     f"{len(companies)} new companies remaining",
                 )
 
         # ── Phase 5: Sort by startup priority + relevance ─────────────────────
         companies.sort(key=_startup_priority_score, reverse=True)
+
+        persisted_placeholder = {
+            source: max(
+                0,
+                raw_discovered.get(source, 0)
+                - duplicates_removed.get(source, 0)
+                - already_seen_filtered.get(source, 0)
+                - industry_filtered.get(source, 0),
+            )
+            for source in raw_discovered
+        }
+
+        self._last_pipeline_metrics = {
+            source: {
+                "raw_discovered": raw_discovered.get(source, 0),
+                "duplicates_removed": duplicates_removed.get(source, 0),
+                "already_seen_filtered": already_seen_filtered.get(source, 0),
+                "ranking_filtered": 0,
+                "persistence_failed": 0,
+                "persisted": persisted_placeholder.get(source, 0),
+                "industry_filtered": industry_filtered.get(source, 0),
+            }
+            for source in raw_discovered
+        }
+
         return companies[:discovery_target]
+
+    async def discover_stream(
+        self,
+        profile: dict[str, Any],
+        preferences: dict[str, Any],
+        target_count: int = 30,
+        progress_callback: Any = None,
+        excluded_domains: set[str] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield newly visible company batches as each source completes."""
+        requested_count = max(target_count, 1)
+        discovery_target = max(requested_count, 60)
+        excluded = {_domain_key(d) for d in (excluded_domains or []) if d}
+
+        prefs = dict(preferences)
+        prefs["_excluded_domains"] = list(excluded)
+        prefs["_excluded_names"] = list(prefs.get("_excluded_names") or [])
+        prefs["_discovery_round"] = int(prefs.get("_discovery_round") or 1)
+
+        if progress_callback:
+            await progress_callback("QueryExpansion", "Expanding search queries with AI...")
+        try:
+            queries = await self._query_expander.expand_queries(profile, prefs)
+        except Exception:
+            queries = self._query_expander._base_queries(profile, prefs)
+
+        if progress_callback:
+            await progress_callback(
+                "QueryExpansion",
+                f"Generated {len(queries)} search queries: {', '.join(queries[:5])}{'...' if len(queries) > 5 else ''}",
+            )
+
+        source_mode = str(preferences.get("source_mode") or "all").strip().lower()
+        allowed_sources = self._source_modes.get(source_mode, self._source_modes["all"])
+        active_sources = [s for s in self._sources if s.SOURCE_NAME in allowed_sources]
+
+        if progress_callback:
+            await progress_callback(
+                "Discovery",
+                "Searching sources and streaming companies into the workspace as they are found...",
+            )
+
+        self._last_pipeline_metrics = {}
+        seen_keys: set[str] = set()
+
+        async for source_name, source_companies, metric in self._source_orchestrator.stream(
+            sources=active_sources,
+            profile=profile,
+            preferences=prefs,
+            queries=queries,
+            progress_callback=progress_callback,
+        ):
+            await self._record_source_log(
+                metric.as_log_row(
+                    user_id=preferences.get("_user_id"),
+                    discovery_session_id=preferences.get("_discovery_session_id"),
+                    queries=queries,
+                )
+            )
+
+            unique_batch, duplicates_removed = self._deduplicate_stream_batch(source_companies, seen_keys)
+            before_industry = list(unique_batch)
+            unique_batch = self._filter_industry_mismatch(unique_batch, profile, preferences)
+            industry_filtered = self._removed_by_source(before_industry, unique_batch).get(source_name, 0)
+
+            already_seen_filtered = 0
+            if excluded:
+                before_excluded = len(unique_batch)
+                unique_batch = [
+                    company for company in unique_batch
+                    if _domain_key(company.get("domain") or company.get("website_url") or "") not in excluded
+                ]
+                already_seen_filtered = max(0, before_excluded - len(unique_batch))
+
+            unique_batch.sort(key=_startup_priority_score, reverse=True)
+            visible_batch = unique_batch[:discovery_target]
+
+            counts = {
+                "raw_discovered": len(source_companies),
+                "duplicates_removed": duplicates_removed,
+                "already_seen_filtered": already_seen_filtered,
+                "ranking_filtered": 0,
+                "persistence_failed": 0,
+                "persisted": len(visible_batch),
+                "industry_filtered": industry_filtered,
+            }
+            self._last_pipeline_metrics[source_name] = counts
+
+            if progress_callback:
+                await progress_callback(
+                    source_name,
+                    f"{source_name}: {counts['raw_discovered']} raw, {counts['persisted']} new visible companies",
+                )
+
+            yield {
+                "source": source_name,
+                "companies": visible_batch,
+                "counts": counts,
+                "metric": metric,
+                "queries": queries,
+            }
 
     # ─── Internal Pipeline Helpers ────────────────────────────────────────────
 
@@ -491,22 +627,156 @@ class CompanyDiscoveryService:
         return companies
 
     @staticmethod
-    def _deduplicate(companies: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Remove duplicate companies by domain (case-insensitive)."""
-        seen: set[str] = set()
-        unique: list[dict[str, Any]] = []
+    def _count_by_source(companies: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for company in companies:
+            source = str(company.get("source") or "Unknown")
+            counts[source] = counts.get(source, 0) + 1
+        return counts
+
+    @staticmethod
+    def _company_key(company: dict[str, Any]) -> str:
+        domain = _domain_key(company.get("domain") or company.get("website_url") or "")
+        if domain:
+            return domain
+        return (company.get("name") or "").lower().strip()
+
+    @staticmethod
+    def _removed_by_source(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, int]:
+        remaining = {id(company) for company in after}
+        removed: dict[str, int] = {}
+        for company in before:
+            if id(company) in remaining:
+                continue
+            source = str(company.get("source") or "Unknown")
+            removed[source] = removed.get(source, 0) + 1
+        return removed
+
+    @staticmethod
+    def _merge_discovery_signals(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+        existing_positions = existing.get("open_positions") or []
+        incoming_positions = incoming.get("open_positions") or []
+        all_positions = [
+            p for p in (existing_positions + incoming_positions)
+            if isinstance(p, dict)
+        ]
+
+        def _position_key(position: dict[str, Any]) -> str:
+            return "|".join(
+                [
+                    str(position.get("title") or "").strip().lower(),
+                    str(position.get("url") or "").strip().lower(),
+                    str(position.get("location") or "").strip().lower(),
+                ]
+            )
+
+        deduped_positions: list[dict[str, Any]] = []
+        seen_position_keys: set[str] = set()
+        for position in all_positions:
+            key = _position_key(position)
+            if key and key in seen_position_keys:
+                continue
+            if key:
+                seen_position_keys.add(key)
+            deduped_positions.append(position)
+
+        existing["open_positions"] = deduped_positions
+
+        sources = set((existing.get("discovery_signals") or {}).get("sources") or [])
+        if existing.get("source"):
+            sources.add(str(existing.get("source")))
+        if incoming.get("source"):
+            sources.add(str(incoming.get("source")))
+
+        roles_found = {
+            str((position.get("title") or "")).strip()
+            for position in deduped_positions
+            if str((position.get("title") or "")).strip()
+        }
+        remote_roles = sum(
+            1
+            for position in deduped_positions
+            if "remote" in str(position.get("work_mode") or "").lower()
+            or "remote" in str(position.get("title") or "").lower()
+        )
+
+        existing["discovery_signals"] = {
+            "job_count": len(deduped_positions),
+            "sources": sorted(sources),
+            "roles_found": sorted(roles_found),
+            "remote_roles": remote_roles,
+        }
+
+    def _deduplicate_stream_batch(
+        self,
+        companies: list[dict[str, Any]],
+        seen_keys: set[str],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Deduplicate a source batch against itself and all previously yielded companies."""
+        unique_by_key: dict[str, dict[str, Any]] = {}
+        duplicates_removed = 0
+
+        for company in companies:
+            key = self._company_key(company)
+            if not key:
+                continue
+            if key in seen_keys:
+                duplicates_removed += 1
+                continue
+
+            existing = unique_by_key.get(key)
+            if not existing:
+                candidate = dict(company)
+                self._merge_discovery_signals(candidate, company)
+                unique_by_key[key] = candidate
+                continue
+
+            duplicates_removed += 1
+            if float(company.get("relevance_score") or 0) > float(existing.get("relevance_score") or 0):
+                merged = {**existing, **company}
+                unique_by_key[key] = merged
+                existing = unique_by_key[key]
+            else:
+                existing.update({k: v for k, v in company.items() if v not in (None, "", [], {})})
+
+            self._merge_discovery_signals(existing, company)
+
+        seen_keys.update(unique_by_key.keys())
+        return list(unique_by_key.values()), duplicates_removed
+
+    def _deduplicate(self, companies: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Remove duplicate companies by normalized domain/name and merge discovery signals."""
+        deduped: dict[str, dict[str, Any]] = {}
+        duplicates_removed: dict[str, int] = {}
+
         for company in companies:
             domain = _domain_key(company.get("domain") or company.get("website_url") or "")
-            if domain and domain not in seen:
-                seen.add(domain)
-                unique.append(company)
-            elif not domain:
-                # No domain — use name as dedup key
-                name_key = (company.get("name") or "").lower().strip()
-                if name_key and name_key not in seen:
-                    seen.add(name_key)
-                    unique.append(company)
-        return unique
+            name_key = (company.get("name") or "").lower().strip()
+            key = domain or name_key
+            if not key:
+                continue
+
+            source = str(company.get("source") or "Unknown")
+            existing = deduped.get(key)
+            if not existing:
+                base = dict(company)
+                self._merge_discovery_signals(base, company)
+                deduped[key] = base
+                continue
+
+            duplicates_removed[source] = duplicates_removed.get(source, 0) + 1
+
+            # Preserve the highest relevance while merging sparse metadata.
+            if float(company.get("relevance_score") or 0) > float(existing.get("relevance_score") or 0):
+                merged = {**company, **existing}
+                deduped[key] = merged
+                existing = deduped[key]
+            else:
+                existing.update({k: v for k, v in company.items() if v not in (None, "", [], {})})
+
+            self._merge_discovery_signals(existing, company)
+
+        return list(deduped.values()), duplicates_removed
 
     async def profile_company_website(self, website_url: str) -> dict[str, Any]:
         """Build a company profile from a user-supplied company website."""
