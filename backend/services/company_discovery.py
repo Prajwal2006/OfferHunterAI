@@ -30,6 +30,7 @@ from bs4 import BeautifulSoup
 try:
     from .query_expansion import QueryExpansionService
     from .discovery import RecursiveExpansionService, SourceOrchestrator, SourceRegistry
+    from .filters import apply_hard_constraints_with_diagnostics, normalize_preference_payload
     from .company_sources import (
         HackerNewsSource,
         RemoteOKSource,
@@ -45,6 +46,7 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from backend.services.query_expansion import QueryExpansionService
     from backend.services.discovery import RecursiveExpansionService, SourceOrchestrator, SourceRegistry
+    from backend.services.filters import apply_hard_constraints_with_diagnostics, normalize_preference_payload
     from backend.services.company_sources import (
         HackerNewsSource,
         RemoteOKSource,
@@ -223,7 +225,7 @@ class CompanyDiscoveryService:
 
         # ── Inject internal keys so AI source can vary its prompt ─────────────
         # Mutate a shallow copy so we don't pollute the caller's preferences dict.
-        prefs = dict(preferences)
+        prefs = normalize_preference_payload(preferences)
         prefs["_excluded_domains"] = list(excluded)
         prefs["_excluded_names"] = list(prefs.get("_excluded_names") or [])
         prefs["_discovery_round"] = int(prefs.get("_discovery_round") or 1)
@@ -287,6 +289,27 @@ class CompanyDiscoveryService:
         companies = self._filter_industry_mismatch(companies, profile, preferences)
         industry_filtered = self._removed_by_source(before_industry_filter, companies)
 
+        hard_constraint_result = apply_hard_constraints_with_diagnostics(companies, prefs)
+        companies = hard_constraint_result.visible_companies
+        hard_constraints_filtered = {
+            source: counts.get("hard_constraints_filtered", 0)
+            for source, counts in hard_constraint_result.counts_by_source.items()
+        }
+        if progress_callback and hard_constraint_result.hidden_companies:
+            removed = len(hard_constraint_result.hidden_companies)
+            onsite_removed = sum(counts.get("onsite_filtered", 0) for counts in hard_constraint_result.counts_by_source.values())
+            hybrid_removed = sum(counts.get("hybrid_filtered", 0) for counts in hard_constraint_result.counts_by_source.values())
+            unknown_removed = sum(counts.get("unknown_filtered", 0) for counts in hard_constraint_result.counts_by_source.values())
+            await progress_callback(
+                "Discovery",
+                f"Hard constraints removed {removed} companies before persistence"
+                + (
+                    f" ({onsite_removed} onsite, {hybrid_removed} hybrid, {unknown_removed} unknown)"
+                    if removed
+                    else ""
+                ),
+            )
+
         # ── Phase 4.6: Remove companies already in the user's workspace ───────
         already_seen_filtered: dict[str, int] = {}
         if excluded:
@@ -312,6 +335,7 @@ class CompanyDiscoveryService:
                 raw_discovered.get(source, 0)
                 - duplicates_removed.get(source, 0)
                 - already_seen_filtered.get(source, 0)
+                - hard_constraints_filtered.get(source, 0)
                 - industry_filtered.get(source, 0),
             )
             for source in raw_discovered
@@ -322,6 +346,11 @@ class CompanyDiscoveryService:
                 "raw_discovered": raw_discovered.get(source, 0),
                 "duplicates_removed": duplicates_removed.get(source, 0),
                 "already_seen_filtered": already_seen_filtered.get(source, 0),
+                "hard_constraints_filtered": hard_constraints_filtered.get(source, 0),
+                "remote_filtered": hard_constraint_result.counts_by_source.get(source, {}).get("remote_filtered", 0),
+                "hybrid_filtered": hard_constraint_result.counts_by_source.get(source, {}).get("hybrid_filtered", 0),
+                "onsite_filtered": hard_constraint_result.counts_by_source.get(source, {}).get("onsite_filtered", 0),
+                "unknown_filtered": hard_constraint_result.counts_by_source.get(source, {}).get("unknown_filtered", 0),
                 "ranking_filtered": 0,
                 "persistence_failed": 0,
                 "persisted": persisted_placeholder.get(source, 0),
@@ -345,7 +374,7 @@ class CompanyDiscoveryService:
         discovery_target = max(requested_count, 60)
         excluded = {_domain_key(d) for d in (excluded_domains or []) if d}
 
-        prefs = dict(preferences)
+        prefs = normalize_preference_payload(preferences)
         prefs["_excluded_domains"] = list(excluded)
         prefs["_excluded_names"] = list(prefs.get("_excluded_names") or [])
         prefs["_discovery_round"] = int(prefs.get("_discovery_round") or 1)
@@ -396,6 +425,9 @@ class CompanyDiscoveryService:
             unique_batch = self._filter_industry_mismatch(unique_batch, profile, preferences)
             industry_filtered = self._removed_by_source(before_industry, unique_batch).get(source_name, 0)
 
+            hard_constraint_result = apply_hard_constraints_with_diagnostics(unique_batch, prefs)
+            unique_batch = hard_constraint_result.visible_companies
+
             already_seen_filtered = 0
             if excluded:
                 before_excluded = len(unique_batch)
@@ -412,6 +444,11 @@ class CompanyDiscoveryService:
                 "raw_discovered": len(source_companies),
                 "duplicates_removed": duplicates_removed,
                 "already_seen_filtered": already_seen_filtered,
+                "hard_constraints_filtered": hard_constraint_result.counts_by_source.get(source_name, {}).get("hard_constraints_filtered", 0),
+                "remote_filtered": hard_constraint_result.counts_by_source.get(source_name, {}).get("remote_filtered", 0),
+                "hybrid_filtered": hard_constraint_result.counts_by_source.get(source_name, {}).get("hybrid_filtered", 0),
+                "onsite_filtered": hard_constraint_result.counts_by_source.get(source_name, {}).get("onsite_filtered", 0),
+                "unknown_filtered": hard_constraint_result.counts_by_source.get(source_name, {}).get("unknown_filtered", 0),
                 "ranking_filtered": 0,
                 "persistence_failed": 0,
                 "persisted": len(visible_batch),
@@ -422,7 +459,11 @@ class CompanyDiscoveryService:
             if progress_callback:
                 await progress_callback(
                     source_name,
-                    f"{source_name}: {counts['raw_discovered']} raw, {counts['persisted']} new visible companies",
+                    f"{source_name}: {counts['raw_discovered']} raw, "
+                    f"{counts['onsite_filtered']} onsite removed, "
+                    f"{counts['hybrid_filtered']} hybrid removed, "
+                    f"{counts['unknown_filtered']} unknown removed, "
+                    f"{counts['persisted']} new visible companies",
                 )
 
             yield {

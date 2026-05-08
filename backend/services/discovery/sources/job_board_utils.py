@@ -7,6 +7,8 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
+from ....models.work_mode import normalize_company_work_mode, normalize_job_work_mode
+
 from ...company_sources.utils import (
     extract_domain_from_url,
     infer_culture_tags,
@@ -162,9 +164,10 @@ def normalize_job_board_company(
     website_url: str = "",
     logo_url: str = "",
 ) -> dict[str, Any]:
+    normalized_jobs = [normalize_job_work_mode(job, source=source) for job in jobs]
     text = " ".join(
         str(v)
-        for job in jobs
+        for job in normalized_jobs
         for v in [job.get("title"), job.get("description"), job.get("content"), job.get("department")]
         if v
     )
@@ -175,8 +178,8 @@ def normalize_job_board_company(
         "industry": infer_industry(text),
         "tech_stack": infer_tech_stack(text),
         "hiring_status": "actively_hiring",
-        "remote_friendly": any(job_is_remote(job) for job in jobs),
-        "open_positions": jobs[:20],
+        "remote_friendly": any(job.get("work_mode") == "remote" for job in normalized_jobs) or any(job_is_remote(job) for job in normalized_jobs),
+        "open_positions": normalized_jobs[:20],
         "culture_tags": list(dict.fromkeys(["startup", *infer_culture_tags(text)]))[:6],
         "source_url": source_url,
         "website_url": website_url,
@@ -184,4 +187,4 @@ def normalize_job_board_company(
         "discovery_queries": [],
         "relevance_score": min(0.95, 0.55 + min(len(jobs), 8) * 0.04),
     }
-    return normalize_company(company, source)
+    return normalize_company_work_mode(normalize_company(company, source), source=source)

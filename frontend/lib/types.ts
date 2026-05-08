@@ -41,6 +41,9 @@ export interface Company {
   linkedin_url?: string;
   hiring_status?: "actively_hiring" | "hiring" | "unknown" | "not_hiring";
   remote_friendly?: boolean;
+  work_mode?: "remote" | "hybrid" | "onsite" | "unknown";
+  remote_confidence?: number;
+  work_mode_reasoning?: string[];
   sponsorship_available?: boolean;
   open_positions?: JobPosition[];
   recent_news?: NewsItem[];
@@ -53,6 +56,18 @@ export interface Company {
   company_contacts?: CompanyContact[];
   contacts?: CompanyContact[];
   workspace?: WorkspaceCompanyState;
+  preference_enforcement?: PreferenceEnforcement;
+}
+
+export interface PreferenceEnforcement {
+  hidden_by_preferences?: boolean;
+  reasons?: string[];
+  filtered_job_count?: number;
+  filtered_jobs?: Array<{
+    title: string;
+    work_mode: string;
+    reasons: string[];
+  }>;
 }
 
 export interface CompanyRanking {
@@ -98,6 +113,7 @@ export interface WorkspaceCompanyState {
   application_strategy?: string;
   ranking_score?: number;
   ranking_explanation?: string;
+  hidden_by_preferences?: boolean;
 }
 
 export interface DiscoverySession {
@@ -168,6 +184,8 @@ export interface JobPosition {
   url?: string;
   location?: string;
   work_mode?: string;
+  remote_confidence?: number;
+  work_mode_reasoning?: string[];
   employment_type?: string;
   salary_range?: string;
   posted_at?: string;

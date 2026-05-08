@@ -135,6 +135,7 @@ function ContactRow({ contact }: { contact: CompanyContact }) {
 }
 
 function JobRow({ job }: { job: JobPosition }) {
+  const remoteConfidence = Math.round((job.remote_confidence ?? 0) * 100);
   return (
     <a
       href={job.url || "#"}
@@ -150,9 +151,15 @@ function JobRow({ job }: { job: JobPosition }) {
         <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground mt-0.5">
           {job.location && <span>{job.location}</span>}
           {job.work_mode && <span className="capitalize">{job.work_mode}</span>}
+          {job.work_mode === "remote" && job.remote_confidence != null && (
+            <span>{remoteConfidence}% confidence</span>
+          )}
           {job.salary_range && <span>{job.salary_range}</span>}
           {job.posted_at && <span>{job.posted_at}</span>}
         </div>
+        {job.work_mode_reasoning?.[0] && (
+          <p className="text-[10px] text-muted-foreground mt-1">{job.work_mode_reasoning[0]}</p>
+        )}
       </div>
       {job.url && <ExternalLink className="w-3.5 h-3.5 text-muted-foreground shrink-0" />}
     </a>
@@ -171,6 +178,7 @@ export default function CompanyDetailModal({
   );
   const contacts = company.company_contacts ?? company.contacts ?? [];
   const jobs = company.open_positions ?? [];
+  const remoteConfidence = Math.round((company.remote_confidence ?? 0) * 100);
 
   // Close on backdrop click
   useEffect(() => {
@@ -257,6 +265,15 @@ export default function CompanyDetailModal({
                       {company.industry}
                     </span>
                   )}
+                  {company.work_mode && company.work_mode !== "unknown" && (
+                    <span className="flex items-center gap-1 capitalize">
+                      <Wifi className="w-3.5 h-3.5" />
+                      {company.work_mode}
+                    </span>
+                  )}
+                  {company.work_mode === "remote" && company.remote_confidence != null && (
+                    <span>{remoteConfidence}% remote confidence</span>
+                  )}
                   {company.headquarters && (
                     <span className="flex items-center gap-1">
                       <MapPin className="w-3.5 h-3.5" />
@@ -320,6 +337,9 @@ export default function CompanyDetailModal({
                     </span>
                   )}
                 </div>
+                {company.work_mode_reasoning?.[0] && (
+                  <p className="text-xs text-muted-foreground mt-2">{company.work_mode_reasoning[0]}</p>
+                )}
               </div>
 
               {/* Match Score Ring */}

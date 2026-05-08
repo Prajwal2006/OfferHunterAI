@@ -72,6 +72,11 @@ function HiringBadge({ status }: { status?: string }) {
   );
 }
 
+function formatWorkModeLabel(workMode?: string) {
+  if (!workMode) return null;
+  return workMode.charAt(0).toUpperCase() + workMode.slice(1);
+}
+
 export default function CompanyCard({
   company,
   index,
@@ -97,6 +102,8 @@ export default function CompanyCard({
       : matchPct >= 60
       ? "text-yellow-500"
       : "text-muted-foreground";
+  const workModeLabel = formatWorkModeLabel(company.work_mode);
+  const remoteConfidence = Math.round((company.remote_confidence ?? 0) * 100);
 
   return (
     <motion.div
@@ -155,19 +162,29 @@ export default function CompanyCard({
                 {company.size}
               </span>
             )}
-            {company.remote_friendly !== undefined && (
+            {workModeLabel && (
               <span className="flex items-center gap-1">
-                {company.remote_friendly ? (
+                {company.work_mode === "remote" ? (
                   <>
                     <Wifi className="w-3 h-3 text-green-500" />
-                    <span className="text-green-500">Remote</span>
+                    <span className="text-green-500">{workModeLabel}</span>
+                  </>
+                ) : company.work_mode === "onsite" ? (
+                  <>
+                    <WifiOff className="w-3 h-3" />
+                    {workModeLabel}
                   </>
                 ) : (
                   <>
-                    <WifiOff className="w-3 h-3" />
-                    Onsite
+                    <Wifi className="w-3 h-3" />
+                    {workModeLabel}
                   </>
                 )}
+              </span>
+            )}
+            {company.work_mode === "remote" && company.remote_confidence != null && (
+              <span className="text-[10px] px-2 py-0.5 rounded-md bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20">
+                {remoteConfidence}% confidence
               </span>
             )}
             {company.funding_stage && (
@@ -267,6 +284,11 @@ export default function CompanyCard({
         {company.source && (
           <span className="px-2 py-0.5 rounded-md bg-muted border border-border">
             {company.source}
+          </span>
+        )}
+        {company.work_mode_reasoning?.[0] && (
+          <span className="px-2 py-0.5 rounded-md bg-muted border border-border max-w-full truncate">
+            {company.work_mode_reasoning[0]}
           </span>
         )}
         {ranking?.exploration_reason && (

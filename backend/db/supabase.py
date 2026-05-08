@@ -888,7 +888,12 @@ class SupabaseClient:
         update_payload = {
             "metadata": merged_metadata,
             "duplicate_count": counts.get("duplicates_removed"),
-            "filtered_count": (counts.get("already_seen_filtered", 0) + counts.get("ranking_filtered", 0)),
+            "filtered_count": (
+                counts.get("already_seen_filtered", 0)
+                + counts.get("ranking_filtered", 0)
+                + counts.get("industry_filtered", 0)
+                + counts.get("hard_constraints_filtered", 0)
+            ),
             "result_count": counts.get("persisted", counts.get("raw_discovered", 0)),
         }
         updated = (

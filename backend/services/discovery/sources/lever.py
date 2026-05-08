@@ -48,7 +48,9 @@ class LeverSource(CompanySource):
                             "department": categories.get("team", ""),
                             "description": raw.get("descriptionPlain", "") or raw.get("description", ""),
                             "posted_at": raw.get("createdAt", ""),
-                            "work_mode": categories.get("commitment", ""),
+                            "employment_type": categories.get("commitment", ""),
+                            "work_mode": raw.get("workplaceType", ""),
+                            "source_work_mode_hint": categories.get("location", ""),
                         }
                         if job_matches(job, queries, profile, preferences):
                             matched_jobs.append(job)

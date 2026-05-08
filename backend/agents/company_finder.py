@@ -40,6 +40,7 @@ try:
         run_enrichment_worker,
         run_ranking_worker,
     )
+    from ..services.filters import apply_hard_constraints, normalize_preference_payload
     from ..db.supabase import supabase_client
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -57,6 +58,7 @@ except ImportError:
         run_enrichment_worker,
         run_ranking_worker,
     )
+    from backend.services.filters import apply_hard_constraints, normalize_preference_payload
     from backend.db.supabase import supabase_client
 
 
@@ -443,6 +445,10 @@ class CompanyFinderAgent:
         await self._emit("running", task_id, "Scraping company website and extracting profile...")
 
         company = await self._discovery.profile_company_website(website_url)
+        filtered = apply_hard_constraints([company], normalize_preference_payload(preferences))
+        if not filtered:
+            raise ValueError("This company does not satisfy the current hard preference constraints.")
+        company = filtered[0]
 
         await self._emit("running", task_id, f"Ranking {company.get('name', 'company')} against your profile...")
         ranked = await self._ranker.rank([company], profile=profile, preferences=preferences)
@@ -699,6 +705,10 @@ class CompanyFinderAgent:
                             "metadata": {
                                 "discovery_signals": company.get("discovery_signals", {}),
                                 "source_url": company.get("source_url", ""),
+                                "work_mode": company.get("work_mode", "unknown"),
+                                "remote_confidence": company.get("remote_confidence", 0.0),
+                                "work_mode_reasoning": company.get("work_mode_reasoning", []),
+                                "preference_enforcement": company.get("preference_enforcement", {}),
                             },
                             "user_id": user_id,
                         }),
@@ -732,6 +742,10 @@ class CompanyFinderAgent:
                             "metadata": {
                                 "domain": company.get("domain"),
                                 "discovery_signals": company.get("discovery_signals", {}),
+                                "work_mode": company.get("work_mode", "unknown"),
+                                "remote_confidence": company.get("remote_confidence", 0.0),
+                                "work_mode_reasoning": company.get("work_mode_reasoning", []),
+                                "preference_enforcement": company.get("preference_enforcement", {}),
                                 "minimal_persisted_at": datetime.utcnow().isoformat(),
                             },
                         }),

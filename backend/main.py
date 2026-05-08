@@ -29,6 +29,8 @@ try:
     from .agents.follow_up import FollowUpAgent
     from .agents.response_classifier import ResponseClassifierAgent
     from .services.resume_parser import ResumeParserService
+    from .services.filters import apply_hard_constraints, normalize_preference_payload, partition_workspace_companies
+    from .models.work_mode import normalize_company_work_mode
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from backend.db.supabase import supabase_client
@@ -41,6 +43,8 @@ except ImportError:
     from backend.agents.follow_up import FollowUpAgent
     from backend.agents.response_classifier import ResponseClassifierAgent
     from backend.services.resume_parser import ResumeParserService
+    from backend.services.filters import apply_hard_constraints, normalize_preference_payload, partition_workspace_companies
+    from backend.models.work_mode import normalize_company_work_mode
 
 # In-memory company results cache (user_id -> companies list)
 # Used as fallback when Supabase is not configured or rankings table is empty
@@ -72,6 +76,20 @@ def _merge_user_company_cache(user_id: str, incoming: list[dict[str, Any]]) -> l
             merged[key] = {**merged.get(key, {}), **company}
     _user_companies_cache[user_id] = list(merged.values())
     return _user_companies_cache[user_id]
+
+
+def _hydrate_company_work_mode(company: dict[str, Any]) -> dict[str, Any]:
+    hydrated = dict(company)
+    metadata = hydrated.get("metadata") or {}
+    if "work_mode" not in hydrated and metadata.get("work_mode"):
+        hydrated["work_mode"] = metadata.get("work_mode")
+    if "remote_confidence" not in hydrated and metadata.get("remote_confidence") is not None:
+        hydrated["remote_confidence"] = metadata.get("remote_confidence")
+    if "work_mode_reasoning" not in hydrated and metadata.get("work_mode_reasoning"):
+        hydrated["work_mode_reasoning"] = metadata.get("work_mode_reasoning")
+    if metadata.get("preference_enforcement") and "preference_enforcement" not in hydrated:
+        hydrated["preference_enforcement"] = metadata.get("preference_enforcement")
+    return normalize_company_work_mode(hydrated, source=str(hydrated.get("source") or ""))
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ SSE Broadcast Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 # Each SSE connection gets its own queue so every subscriber receives every event.
@@ -355,6 +373,7 @@ async def run_agents(request: RunAgentsRequest):
             preferences: dict = {}
             if request.user_id:
                 preferences = await supabase_client.get_user_preferences(request.user_id) or {}
+            preferences = normalize_preference_payload(preferences)
             # Inject job_title into preferences if not already set
             if not preferences.get("preferred_roles") and request.job_title:
                 preferences["preferred_roles"] = [request.job_title]
@@ -615,7 +634,7 @@ async def run_company_finder(request: CompanyFinderRunRequest):
 
     async def run_pipeline():
         try:
-            preferences = dict(request.preferences or {})
+            preferences = normalize_preference_payload(request.preferences)
             excluded_domains: set[str] | None = None
             if not request.rediscover:
                 memory = await _load_company_memory(request.user_id)
@@ -664,7 +683,7 @@ async def discover_companies(request: CompanyFinderRunRequest):
         or await supabase_client.get_user_preferences(request.user_id)
         or {}
     )
-    preferences = dict(preferences)
+    preferences = normalize_preference_payload(preferences)
 
     excluded_domains: set[str] | None = None
     if not request.rediscover:
@@ -745,9 +764,10 @@ async def preference_opener(user_id: str):
 async def save_preferences(request: SavePreferencesRequest):
     """Save user preferences directly (for bulk updates)."""
     try:
+        normalized_preferences = normalize_preference_payload(request.preferences)
         result = await supabase_client.upsert_user_preferences({
             "user_id": request.user_id,
-            **request.preferences,
+            **normalized_preferences,
         })
         return {"preferences": result}
     except Exception as e:
@@ -812,7 +832,7 @@ async def get_parsed_profile(user_id: str):
 
 
 def _workspace_row_to_company(row: dict[str, Any]) -> dict[str, Any]:
-    company = dict(row.get("companies") or {})
+    company = _hydrate_company_work_mode(dict(row.get("companies") or {}))
     metadata = row.get("metadata") or {}
 
     if not company:
@@ -821,7 +841,11 @@ def _workspace_row_to_company(row: dict[str, Any]) -> dict[str, Any]:
             "domain": metadata.get("domain", ""),
             "source": row.get("source", "unknown"),
             "relevance_score": row.get("ranking_score") or 0,
+            "work_mode": metadata.get("work_mode", "unknown"),
+            "remote_confidence": metadata.get("remote_confidence", 0.0),
+            "work_mode_reasoning": metadata.get("work_mode_reasoning", []),
         }
+        company = _hydrate_company_work_mode(company)
 
     # Prefer ranking data stored directly on the user_companies row
     # (avoids a fragile cross-table join that doesn't work reliably with supabase-py)
@@ -857,7 +881,10 @@ def _workspace_row_to_company(row: dict[str, Any]) -> dict[str, Any]:
         "application_strategy": row.get("application_strategy") or "",
         "ranking_score": row.get("ranking_score"),
         "ranking_explanation": row.get("ranking_explanation") or "",
+        "hidden_by_preferences": bool((metadata.get("preference_enforcement") or {}).get("hidden_by_preferences")),
     }
+    if metadata.get("preference_enforcement"):
+        company["preference_enforcement"] = metadata.get("preference_enforcement")
     return company
 
 
@@ -1082,7 +1109,9 @@ async def get_discovered_companies(
     Get discovered and ranked companies for a user.
     Includes rankings and contacts.
     """
+    preferences: dict[str, Any] = {}
     try:
+        preferences = normalize_preference_payload(await supabase_client.get_user_preferences(user_id) or {})
         rows = await supabase_client.get_user_companies(
             user_id=user_id,
             limit=limit,
@@ -1106,8 +1135,17 @@ async def get_discovered_companies(
             if score >= min_score:
                 companies.append(company)
 
-        if companies:
-            return {"companies": companies, "total": len(companies), "offset": offset, "limit": limit}
+        visible_companies, hidden_by_preferences, archived_companies = partition_workspace_companies(companies, preferences)
+        if visible_companies or hidden_by_preferences or archived_companies:
+            return {
+                "companies": visible_companies,
+                "visible_companies": visible_companies,
+                "hidden_by_preferences": hidden_by_preferences,
+                "archived_companies": archived_companies,
+                "total": len(visible_companies),
+                "offset": offset,
+                "limit": limit,
+            }
 
         # ── Fallback 1: legacy company_rankings table ──────────────────────────
         # user_companies might be empty if migration 005 hasn't been run or
@@ -1124,15 +1162,34 @@ async def get_discovered_companies(
                     if k not in {"id", "company_id", "user_id", "created_at", "updated_at", "companies"}
                 }
                 c["match_score"] = row.get("match_score", 0)
-                legacy.append(c)
+                legacy.append(_hydrate_company_work_mode(c))
             if legacy:
-                return {"companies": legacy[:limit], "total": len(legacy), "offset": 0, "limit": limit}
+                visible_companies, hidden_by_preferences, archived_companies = partition_workspace_companies(legacy, preferences)
+                return {
+                    "companies": visible_companies[:limit],
+                    "visible_companies": visible_companies[:limit],
+                    "hidden_by_preferences": hidden_by_preferences,
+                    "archived_companies": archived_companies,
+                    "total": len(visible_companies),
+                    "offset": 0,
+                    "limit": limit,
+                }
 
         # ── Fallback 2: in-memory cache (cleared on server restart) ───────────
         cached = _user_companies_cache.get(user_id, [])
         if cached:
-            filtered = [c for c in cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
-            return {"companies": filtered[:limit], "total": len(filtered), "offset": 0, "limit": limit}
+            hydrated_cached = [_hydrate_company_work_mode(c) for c in cached]
+            filtered = [c for c in hydrated_cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
+            visible_companies, hidden_by_preferences, archived_companies = partition_workspace_companies(filtered, preferences)
+            return {
+                "companies": visible_companies[:limit],
+                "visible_companies": visible_companies[:limit],
+                "hidden_by_preferences": hidden_by_preferences,
+                "archived_companies": archived_companies,
+                "total": len(visible_companies),
+                "offset": 0,
+                "limit": limit,
+            }
 
         return {"companies": [], "total": 0, "offset": offset, "limit": limit}
     except Exception as e:
@@ -1141,8 +1198,16 @@ async def get_discovered_companies(
         # Fall back to in-memory cache on any DB error
         cached = _user_companies_cache.get(user_id, [])
         if cached:
-            filtered = [c for c in cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
-            return {"companies": filtered[:limit], "total": len(filtered)}
+            hydrated_cached = [_hydrate_company_work_mode(c) for c in cached]
+            filtered = [c for c in hydrated_cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
+            visible_companies, hidden_by_preferences, archived_companies = partition_workspace_companies(filtered, preferences)
+            return {
+                "companies": visible_companies[:limit],
+                "visible_companies": visible_companies[:limit],
+                "hidden_by_preferences": hidden_by_preferences,
+                "archived_companies": archived_companies,
+                "total": len(visible_companies),
+            }
         return {"companies": [], "total": 0, "error": str(e)}
 
 
@@ -1215,13 +1280,20 @@ async def add_manual_company(request: ManualCompanyRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/company-finder/companies/{company_id}")
-async def get_company_detail(company_id: str):
+async def get_company_detail(company_id: str, user_id: Optional[str] = Query(None)):
     """Get full company detail including contacts, jobs, and ranking."""
     try:
         company = await supabase_client.get_company_detail(company_id)
         if not company:
             raise HTTPException(status_code=404, detail="Company not found")
-        return {"company": company}
+        hydrated = _hydrate_company_work_mode(company)
+        if user_id:
+            preferences = normalize_preference_payload(await supabase_client.get_user_preferences(user_id) or {})
+            visible = apply_hard_constraints([hydrated], preferences)
+            if not visible:
+                raise HTTPException(status_code=404, detail="Company hidden by current preferences")
+            hydrated = visible[0]
+        return {"company": hydrated}
     except HTTPException:
         raise
     except Exception as e:

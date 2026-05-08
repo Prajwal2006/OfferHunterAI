@@ -1,5 +1,13 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+export interface CompanyWorkspaceResponse {
+  companies: import("./types").Company[];
+  visible_companies?: import("./types").Company[];
+  hidden_by_preferences?: import("./types").Company[];
+  archived_companies?: import("./types").Company[];
+  total: number;
+}
+
 export async function fetchAgentEvents(limit = 50) {
   const res = await fetch(`${API_URL}/agent-events?limit=${limit}`);
   if (!res.ok) throw new Error("Failed to fetch agent events");
@@ -190,7 +198,7 @@ export async function fetchDiscoveredCompanies(
   if (opts?.source) params.set("source", opts.source);
   const res = await fetch(`${API_URL}/company-finder/companies?${params}`);
   if (!res.ok) throw new Error("Failed to fetch companies");
-  return res.json() as Promise<{ companies: import("./types").Company[]; total: number }>;
+  return res.json() as Promise<CompanyWorkspaceResponse>;
 }
 
 export async function repairCompanyWorkspace(userId: string) {
@@ -309,8 +317,11 @@ export async function saveOrchestrationState(
   return res.json() as Promise<{ state: import("./types").OrchestrationState }>;
 }
 
-export async function fetchCompanyDetail(companyId: string) {
-  const res = await fetch(`${API_URL}/company-finder/companies/${companyId}`);
+export async function fetchCompanyDetail(companyId: string, userId?: string) {
+  const params = new URLSearchParams();
+  if (userId) params.set("user_id", userId);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetch(`${API_URL}/company-finder/companies/${companyId}${suffix}`);
   if (!res.ok) throw new Error("Failed to fetch company detail");
   return res.json() as Promise<{ company: import("./types").Company }>;
 }

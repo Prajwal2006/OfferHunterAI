@@ -49,6 +49,7 @@ class WorkableSource(CompanySource):
                             "description": raw.get("description", ""),
                             "posted_at": raw.get("published", ""),
                             "work_mode": raw.get("workplace", ""),
+                            "source_work_mode_hint": raw.get("location", ""),
                         }
                         if job_matches(job, queries, profile, preferences):
                             matched_jobs.append(job)

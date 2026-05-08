@@ -48,7 +48,8 @@ class AshbySource(CompanySource):
                             "department": raw.get("department", ""),
                             "description": raw.get("descriptionPlain", "") or raw.get("descriptionHtml", ""),
                             "posted_at": raw.get("publishedDate", ""),
-                            "work_mode": "remote" if raw.get("isRemote") else "",
+                            "work_mode": raw.get("workplaceType", ""),
+                            "is_remote": raw.get("isRemote"),
                         }
                         if job_matches(job, queries, profile, preferences):
                             matched_jobs.append(job)

@@ -10,6 +10,8 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from ...models.work_mode import normalize_company_work_mode
+
 
 # ─── HTTP Headers ─────────────────────────────────────────────────────────────
 
@@ -50,7 +52,7 @@ def normalize_company(raw: dict[str, Any], source: str) -> dict[str, Any]:
 
     All source connectors must return dicts passing through this function.
     """
-    return {
+    company = {
         "name": raw.get("name", ""),
         "domain": raw.get("domain") or slugify_domain(raw.get("name", "unknown")),
         "description": raw.get("description", ""),
@@ -76,6 +78,7 @@ def normalize_company(raw: dict[str, Any], source: str) -> dict[str, Any]:
         "discovery_queries": raw.get("discovery_queries") or [],
         "enrichment_version": raw.get("enrichment_version", 0),
     }
+    return normalize_company_work_mode(company, source=source)
 
 
 def startup_priority_score(company: dict[str, Any]) -> tuple[float, float]:

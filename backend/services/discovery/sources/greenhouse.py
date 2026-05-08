@@ -48,7 +48,8 @@ class GreenhouseSource(CompanySource):
                             "department": (raw.get("departments") or [{}])[0].get("name", ""),
                             "description": raw.get("content", ""),
                             "posted_at": raw.get("updated_at", ""),
-                            "work_mode": "remote" if "remote" in str(raw).lower() else "",
+                            "work_mode": (raw.get("metadata") or {}).get("workplace_type", ""),
+                            "source_work_mode_hint": str(raw),
                         }
                         if job_matches(job, queries, profile, preferences):
                             matched_jobs.append(job)
