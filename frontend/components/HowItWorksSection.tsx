@@ -111,12 +111,11 @@ export function HowItWorksSection() {
                     <motion.div
                       animate={{
                         scale: i === activeStep ? 1.1 : 1,
-                        borderColor: isActive ? "rgb(var(--primary))" : "rgb(var(--border))",
                       }}
                       className={`w-16 h-16 rounded-2xl border-2 flex items-center justify-center transition-colors ${
                         isActive
-                          ? "bg-gradient-to-br from-primary to-secondary"
-                          : "bg-card"
+                          ? "border-primary bg-gradient-to-br from-primary to-secondary"
+                          : "border-border bg-card"
                       }`}
                     >
                       <Icon

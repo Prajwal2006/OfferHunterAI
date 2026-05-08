@@ -5,24 +5,24 @@ export const MOCK_AGENTS: AgentInfo[] = [
     name: "CompanyFinderAgent",
     displayName: "Company Finder",
     description: "Discovers relevant companies based on your skills",
-    status: "completed",
-    currentTask: "Found 12 companies matching Python/ML skills",
+    status: "idle",
+    currentTask: undefined,
     icon: "🔍",
   },
   {
     name: "PersonalizationAgent",
     displayName: "Personalization",
     description: "Extracts company insights and personalizes context",
-    status: "completed",
-    currentTask: "Analyzed Stripe engineering blog",
+    status: "idle",
+    currentTask: undefined,
     icon: "🎯",
   },
   {
     name: "EmailWriterAgent",
     displayName: "Email Writer",
     description: "Generates personalized outreach emails",
-    status: "running",
-    currentTask: "Drafting email for OpenAI",
+    status: "idle",
+    currentTask: undefined,
     icon: "✍️",
   },
   {
@@ -59,71 +59,8 @@ export const MOCK_AGENTS: AgentInfo[] = [
   },
 ];
 
-export const MOCK_EVENTS: AgentEvent[] = [
-  {
-    id: "1",
-    agent_name: "CompanyFinderAgent",
-    task_id: "task-001",
-    status: "completed",
-    message: "Found 12 companies matching skills: Python, ML, FastAPI",
-    metadata: { count: 12, skills: ["Python", "ML", "FastAPI"] },
-    created_at: new Date(Date.now() - 300000).toISOString(),
-  },
-  {
-    id: "2",
-    agent_name: "PersonalizationAgent",
-    task_id: "task-002",
-    status: "completed",
-    message: "Extracted insights for Stripe — fintech, Series H, 8000 employees",
-    metadata: { company: "Stripe", industry: "fintech" },
-    created_at: new Date(Date.now() - 240000).toISOString(),
-  },
-  {
-    id: "3",
-    agent_name: "PersonalizationAgent",
-    task_id: "task-003",
-    status: "completed",
-    message: "Extracted insights for Vercel — developer tools, unicorn startup",
-    metadata: { company: "Vercel", industry: "developer-tools" },
-    created_at: new Date(Date.now() - 200000).toISOString(),
-  },
-  {
-    id: "4",
-    agent_name: "EmailWriterAgent",
-    task_id: "task-004",
-    status: "completed",
-    message: "Drafted personalized email for Stripe",
-    metadata: { company: "Stripe", email_id: "email-001" },
-    created_at: new Date(Date.now() - 150000).toISOString(),
-  },
-  {
-    id: "5",
-    agent_name: "EmailWriterAgent",
-    task_id: "task-005",
-    status: "completed",
-    message: "Drafted personalized email for Vercel",
-    metadata: { company: "Vercel", email_id: "email-002" },
-    created_at: new Date(Date.now() - 120000).toISOString(),
-  },
-  {
-    id: "6",
-    agent_name: "EmailSenderAgent",
-    task_id: "task-006",
-    status: "started",
-    message: "Waiting for user approval before sending",
-    metadata: { pending_count: 3 },
-    created_at: new Date(Date.now() - 60000).toISOString(),
-  },
-  {
-    id: "7",
-    agent_name: "EmailWriterAgent",
-    task_id: "task-007",
-    status: "running",
-    message: "Drafting email for OpenAI — highlighting ML research background",
-    metadata: { company: "OpenAI", step: "writing" },
-    created_at: new Date(Date.now() - 10000).toISOString(),
-  },
-];
+// No pre-populated events — real events come from the SSE stream or simulation
+export const MOCK_EVENTS: AgentEvent[] = [];
 
 export const MOCK_COMPANIES: Company[] = [
   {

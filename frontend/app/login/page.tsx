@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
 import { LogIn, UserPlus } from "lucide-react";
 import { supabase } from "@/lib/supabase";
@@ -9,23 +9,23 @@ import { useAuth } from "@/components/AuthProvider";
 
 export default function LoginPage() {
   const router = useRouter();
-  const { session } = useAuth();
+  const searchParams = useSearchParams();
+  const { session, loading: authLoading } = useAuth();
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [next, setNext] = useState("/agents");
+  const next = searchParams.get("next") || "/agents";
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const params = new URLSearchParams(window.location.search);
-    setNext(params.get("next") || "/agents");
-  }, []);
+    if (!authLoading && session) {
+      router.replace(next);
+    }
+  }, [authLoading, next, router, session]);
 
-  if (session) {
-    router.replace(next);
+  if (authLoading || session) {
     return null;
   }
 

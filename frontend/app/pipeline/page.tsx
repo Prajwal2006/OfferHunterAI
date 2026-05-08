@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { GitBranch, ExternalLink, Search } from "lucide-react";
-import { MOCK_COMPANIES } from "@/lib/mockData";
+import { GitBranch, ExternalLink, Loader2, Search } from "lucide-react";
 import { Company } from "@/lib/types";
 import { RequireAuth } from "@/components/RequireAuth";
+import { useAuth } from "@/components/AuthProvider";
+import { fetchDiscoveredCompanies } from "@/lib/api";
 
 type StatusFilter = "all" | Company["status"];
 
@@ -28,12 +29,59 @@ const pipelineColumns: { id: Company["status"]; label: string; icon: string }[] 
   { id: "replied", label: "Replied", icon: "💬" },
 ];
 
+function stageToStatus(stage?: string): Company["status"] {
+  switch (stage) {
+    case "Personalization":
+      return "personalized";
+    case "EmailWriter":
+      return "email_drafted";
+    case "Review":
+      return "pending_approval";
+    case "Sender":
+      return "sent";
+    default:
+      return "discovered";
+  }
+}
+
 export default function PipelinePage() {
+  const { session } = useAuth();
   const [view, setView] = useState<"board" | "list">("board");
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [companies, setCompanies] = useState<Company[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const filtered = MOCK_COMPANIES.filter((c) => {
+  useEffect(() => {
+    const userId = session?.user?.id;
+    if (!userId) {
+      setLoading(false);
+      return;
+    }
+    const resolvedUserId = userId;
+
+    async function loadPipeline() {
+      setLoading(true);
+      try {
+        const result = await fetchDiscoveredCompanies(resolvedUserId, {
+          limit: 200,
+          includeArchived: true,
+        });
+        setCompanies(
+          result.companies.map((company) => ({
+            ...company,
+            status: stageToStatus(company.workspace?.orchestration_stage),
+          }))
+        );
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    void loadPipeline();
+  }, [session?.user?.id]);
+
+  const filtered = companies.filter((c) => {
     const matchesSearch =
       search === "" ||
       c.name.toLowerCase().includes(search.toLowerCase()) ||
@@ -99,7 +147,7 @@ export default function PipelinePage() {
       {/* Stats summary */}
       <div className="grid grid-cols-3 sm:grid-cols-6 gap-3 mb-8">
         {pipelineColumns.map((col, i) => {
-          const count = MOCK_COMPANIES.filter((c) => c.status === col.id).length;
+          const count = companies.filter((c) => c.status === col.id).length;
           const cfg = statusConfig[col.id];
           return (
             <motion.div
@@ -120,7 +168,14 @@ export default function PipelinePage() {
       </div>
 
       {/* Board view */}
-      {view === "board" && (
+      {loading && (
+        <div className="flex items-center justify-center py-16 text-muted-foreground">
+          <Loader2 className="w-5 h-5 animate-spin mr-2" />
+          Loading pipeline
+        </div>
+      )}
+
+      {!loading && view === "board" && (
         <div className="flex gap-4 overflow-x-auto pb-4">
           {pipelineColumns.map((col) => {
             const companies = filtered.filter((c) => c.status === col.id);
@@ -189,7 +244,7 @@ export default function PipelinePage() {
       )}
 
       {/* List view */}
-      {view === "list" && (
+      {!loading && view === "list" && (
         <div className="glass border border-border rounded-2xl overflow-hidden">
           <table className="w-full">
             <thead>

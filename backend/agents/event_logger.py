@@ -45,11 +45,11 @@ class AgentEventLogger:
             "created_at": datetime.utcnow().isoformat(),
         }
 
-        # Push to SSE stream
+        # Push to SSE stream (supports both asyncio.Queue and broadcast queue)
         if self._queue is not None:
             try:
                 self._queue.put_nowait(event)
-            except asyncio.QueueFull:
+            except (asyncio.QueueFull, AttributeError):
                 pass
 
         # Persist to Supabase (best-effort)

@@ -2,11 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Mail, CheckCircle, XCircle, Edit3, Send, Shield, ChevronDown, ChevronUp } from "lucide-react";
+import { Mail, CheckCircle, XCircle, Edit3, Send, Shield, ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 import { Email, ResumeVersion } from "@/lib/types";
-import { MOCK_EMAILS } from "@/lib/mockData";
 import { RequireAuth } from "@/components/RequireAuth";
-import { editEmail, fetchResumes } from "@/lib/api";
+import { approveEmail, editEmail, fetchEmails, fetchResumes, rejectEmail, sendEmail } from "@/lib/api";
 import { useAuth } from "@/components/AuthProvider";
 
 type ReviewStatus = "pending" | "approved" | "rejected" | "sent";
@@ -19,35 +18,45 @@ interface EmailWithLocalStatus extends Email {
 
 export default function ReviewPage() {
   const { session } = useAuth();
-  const [emails, setEmails] = useState<EmailWithLocalStatus[]>(
-    MOCK_EMAILS.map((e) => ({
-      ...e,
-      localStatus:
-        e.status === "pending_approval"
-          ? "pending"
-          : e.status === "sent"
-          ? "sent"
-          : "pending",
-    }))
-  );
-  const [expandedId, setExpandedId] = useState<string | null>(emails[0]?.id ?? null);
+  const [emails, setEmails] = useState<EmailWithLocalStatus[]>([]);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [resumes, setResumes] = useState<ResumeVersion[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    async function loadResumes() {
+    async function loadReviewData() {
       const userId = session?.user?.id;
       if (!userId) return;
 
       try {
-        const result = await fetchResumes(userId);
-        setResumes(result.resumes ?? []);
+        const [resumeResult, emailResult] = await Promise.all([
+          fetchResumes(userId),
+          fetchEmails(),
+        ]);
+        const loadedEmails = (emailResult.emails ?? []).map((e: Email) => ({
+          ...e,
+          localStatus:
+            e.status === "pending_approval"
+              ? "pending"
+              : e.status === "sent"
+              ? "sent"
+              : e.status === "approved"
+              ? "approved"
+              : "rejected",
+        }));
+        setResumes(resumeResult.resumes ?? []);
+        setEmails(loadedEmails);
+        setExpandedId(loadedEmails[0]?.id ?? null);
       } catch {
         setResumes([]);
+        setEmails([]);
+      } finally {
+        setLoading(false);
       }
     }
 
-    loadResumes();
+    loadReviewData();
   }, [session?.user?.id]);
 
   const pending = emails.filter((e) => e.localStatus === "pending");
@@ -55,19 +64,29 @@ export default function ReviewPage() {
   const sent = emails.filter((e) => e.localStatus === "sent");
   const rejected = emails.filter((e) => e.localStatus === "rejected");
 
-  function approve(id: string) {
+  async function approve(id: string) {
     setEmails((prev) =>
       prev.map((e) => (e.id === id ? { ...e, localStatus: "approved" } : e))
     );
+    try {
+      await approveEmail(id);
+    } catch {
+      // Keep optimistic state; SSE/backend errors are surfaced elsewhere.
+    }
   }
 
-  function reject(id: string) {
+  async function reject(id: string) {
     setEmails((prev) =>
       prev.map((e) => (e.id === id ? { ...e, localStatus: "rejected" } : e))
     );
+    try {
+      await rejectEmail(id);
+    } catch {
+      // Keep optimistic state.
+    }
   }
 
-  function markSent(id: string) {
+  async function markSent(id: string) {
     setEmails((prev) =>
       prev.map((e) =>
         e.id === id
@@ -75,6 +94,11 @@ export default function ReviewPage() {
           : e
       )
     );
+    try {
+      await sendEmail(id);
+    } catch {
+      // Keep optimistic state.
+    }
   }
 
   function startEdit(id: string) {
@@ -175,9 +199,20 @@ export default function ReviewPage() {
       </motion.div>
 
       {/* Email List */}
+      {loading && (
+        <div className="flex items-center justify-center py-16 text-muted-foreground">
+          <Loader2 className="w-5 h-5 animate-spin mr-2" />
+          Loading email drafts
+        </div>
+      )}
+      {!loading && emails.length === 0 && (
+        <div className="text-center py-16 text-sm text-muted-foreground">
+          No email drafts are waiting for review.
+        </div>
+      )}
       <div className="space-y-4">
         <AnimatePresence>
-          {emails.map((email, index) => {
+          {!loading && emails.map((email, index) => {
             const isExpanded = expandedId === email.id;
             const isEditing = editingId === email.id;
 
@@ -243,10 +278,10 @@ export default function ReviewPage() {
                           <EmailViewer
                             email={email}
                             resumes={resumes}
-                            onApprove={() => approve(email.id)}
-                            onReject={() => reject(email.id)}
+                            onApprove={() => void approve(email.id)}
+                            onReject={() => void reject(email.id)}
                             onEdit={() => startEdit(email.id)}
-                            onSend={() => markSent(email.id)}
+                            onSend={() => void markSent(email.id)}
                             onResumeChange={(resumeVersionId) =>
                               setResumeVersion(email.id, resumeVersionId)
                             }

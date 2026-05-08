@@ -44,9 +44,10 @@ const statusConfig: Record<
 interface AgentCardProps {
   agent: AgentInfo;
   index: number;
+  onClick?: (agent: AgentInfo) => void;
 }
 
-export default function AgentCard({ agent, index }: AgentCardProps) {
+export default function AgentCard({ agent, index, onClick }: AgentCardProps) {
   const cfg = statusConfig[agent.status];
 
   return (
@@ -55,10 +56,11 @@ export default function AgentCard({ agent, index }: AgentCardProps) {
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, delay: index * 0.05 }}
       whileHover={{ y: -4, scale: 1.01 }}
-      className={`relative p-5 rounded-2xl border ${cfg.border} glass overflow-hidden group cursor-default`}
+      onClick={() => onClick?.(agent)}
+      className={`relative p-5 rounded-2xl border ${cfg.border} glass overflow-hidden group ${onClick ? "cursor-pointer" : "cursor-default"}`}
     >
       {/* Gradient background on hover */}
-      <div className={`absolute inset-0 bg-gradient-to-br ${cfg.gradient} opacity-0 group-hover:opacity-100 transition-opacity duration-300`} />
+      <div className={`absolute inset-0 bg-linear-to-br ${cfg.gradient} opacity-0 group-hover:opacity-100 transition-opacity duration-300`} />
 
       {/* Subtle glow for running agents */}
       {agent.status === "running" && (
@@ -94,7 +96,7 @@ export default function AgentCard({ agent, index }: AgentCardProps) {
           {agent.currentTask && (
             <div className="flex items-center gap-2 text-xs">
               <div
-                className={`w-1.5 h-1.5 rounded-full ${cfg.dot} flex-shrink-0`}
+                className={`w-1.5 h-1.5 rounded-full ${cfg.dot} shrink-0`}
               />
               <span className={`${cfg.color} truncate font-medium`}>
                 {agent.currentTask}
@@ -108,7 +110,7 @@ export default function AgentCard({ agent, index }: AgentCardProps) {
       {agent.status === "running" && (
         <div className="relative z-10 mt-4 h-1 bg-muted/30 rounded-full overflow-hidden">
           <motion.div
-            className="h-full bg-gradient-to-r from-emerald-500 to-emerald-400 rounded-full"
+            className="h-full bg-linear-to-r from-emerald-500 to-emerald-400 rounded-full"
             initial={{ width: "0%" }}
             animate={{ width: "70%" }}
             transition={{ duration: 2, repeat: Infinity, repeatType: "reverse" }}
