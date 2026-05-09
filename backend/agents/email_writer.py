@@ -83,7 +83,7 @@ class EmailWriterAgent:
 
         # Store in DB (best-effort)
         try:
-            from ..db.supabase import supabase_client
+            from db.supabase import supabase_client
             await supabase_client.insert_email(email)
         except Exception:
             pass

@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from ...models.work_mode import STRICT_REMOTE_CONFIDENCE, WorkMode, normalize_company_work_mode
+from models.work_mode import STRICT_REMOTE_CONFIDENCE, WorkMode, normalize_company_work_mode
 
 
 @dataclass

@@ -54,7 +54,7 @@ class AgentEventLogger:
 
         # Persist to Supabase (best-effort)
         try:
-            from ..db.supabase import supabase_client
+            from db.supabase import supabase_client
             await supabase_client.insert_agent_event(event)
         except Exception:
             pass

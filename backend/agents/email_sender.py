@@ -41,7 +41,7 @@ class EmailSenderAgent:
 
         # Verify approval status (safety check)
         try:
-            from ..db.supabase import supabase_client
+            from db.supabase import supabase_client
             email = await supabase_client.get_email(email_id)
             if not email or email.get("status") != "approved":
                 await self.logger.emit(

@@ -7,7 +7,7 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
-from ....models.work_mode import normalize_company_work_mode, normalize_job_work_mode
+from models.work_mode import normalize_company_work_mode, normalize_job_work_mode
 
 from ...company_sources.utils import (
     extract_domain_from_url,

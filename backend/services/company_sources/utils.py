@@ -10,7 +10,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from ...models.work_mode import normalize_company_work_mode
+from models.work_mode import normalize_company_work_mode
 
 
 # ─── HTTP Headers ─────────────────────────────────────────────────────────────
