@@ -99,6 +99,218 @@ class SupabaseClient:
         )
         return result.data[0] if result.data else {}
 
+    # ─── Outreach Drafts / Personalization Profiles ─────────────────────────
+
+    async def upsert_personalization_profile(self, profile: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return profile
+        result = (
+            client.table("personalization_profiles")
+            .upsert(profile, on_conflict="user_id,company_id")
+            .execute()
+        )
+        return result.data[0] if result.data else profile
+
+    async def get_personalization_profile(self, user_id: str, company_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("personalization_profiles")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("company_id", company_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    async def upsert_email_draft(self, draft: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            draft.setdefault("version_number", 1)
+            return draft
+        result = (
+            client.table("email_drafts")
+            .upsert(draft, on_conflict="user_id,company_id")
+            .execute()
+        )
+        return result.data[0] if result.data else draft
+
+    async def insert_email_draft(self, draft: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            draft.setdefault("version_number", 1)
+            return draft
+        result = client.table("email_drafts").insert(draft).execute()
+        return result.data[0] if result.data else draft
+
+    async def get_email_draft(self, draft_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("email_drafts")
+            .select("*")
+            .eq("id", draft_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    async def get_email_draft_for_company(self, user_id: str, company_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("email_drafts")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("company_id", company_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    async def get_email_drafts(self, user_id: str, status: Optional[str] = None) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        query = (
+            client.table("email_drafts")
+            .select("*, companies(name, domain, industry, logo_url)")
+            .eq("user_id", user_id)
+            .order("last_edited_at", desc=True)
+        )
+        if status:
+            query = query.eq("status", status)
+        result = query.execute()
+        return result.data or []
+
+    async def update_email_draft(self, draft_id: str, updates: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return {"id": draft_id, **updates}
+        result = (
+            client.table("email_drafts")
+            .update(updates)
+            .eq("id", draft_id)
+            .execute()
+        )
+        return result.data[0] if result.data else {"id": draft_id, **updates}
+
+    async def insert_email_version(self, version: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return version
+        result = client.table("email_versions").insert(version).execute()
+        return result.data[0] if result.data else version
+
+    async def get_email_versions(self, draft_id: str) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("email_versions")
+            .select("*")
+            .eq("draft_id", draft_id)
+            .order("version_number", desc=True)
+            .execute()
+        )
+        return result.data or []
+
+    async def get_email_version(self, version_id: str) -> Optional[dict]:
+        client = self._get_client()
+        if not client:
+            return None
+        result = (
+            client.table("email_versions")
+            .select("*")
+            .eq("id", version_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    async def insert_generated_subjects(self, draft_id: str, subjects: list[dict[str, Any]]) -> list[dict]:
+        rows = [{"draft_id": draft_id, **subject} for subject in subjects]
+        client = self._get_client()
+        if not client:
+            return rows
+        result = client.table("generated_subjects").insert(rows).execute()
+        return result.data or rows
+
+    async def get_generated_subjects(self, draft_id: str) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("generated_subjects")
+            .select("*")
+            .eq("draft_id", draft_id)
+            .order("created_at")
+            .execute()
+        )
+        return result.data or []
+
+    async def insert_ai_edit_request(self, request: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return request
+        result = client.table("ai_edit_requests").insert(request).execute()
+        return result.data[0] if result.data else request
+
+    async def update_ai_edit_request(self, request_id: str, updates: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return {"id": request_id, **updates}
+        result = (
+            client.table("ai_edit_requests")
+            .update(updates)
+            .eq("id", request_id)
+            .execute()
+        )
+        return result.data[0] if result.data else {"id": request_id, **updates}
+
+    async def insert_edit_history(self, row: dict[str, Any]) -> dict:
+        client = self._get_client()
+        if not client:
+            return row
+        result = client.table("edit_history").insert(row).execute()
+        return result.data[0] if result.data else row
+
+    async def upsert_outreach_contacts(self, contacts: list[dict[str, Any]]) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return contacts
+        if not contacts:
+            return []
+        result = (
+            client.table("outreach_contacts")
+            .upsert(contacts, on_conflict="user_id,company_id,email")
+            .execute()
+        )
+        return result.data or contacts
+
+    async def get_outreach_contacts(self, user_id: str, company_id: str) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+        result = (
+            client.table("outreach_contacts")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("company_id", company_id)
+            .order("priority_score", desc=True)
+            .execute()
+        )
+        return result.data or []
+
     # ─── Resume Versions ─────────────────────────────────────────────────────
 
     async def insert_resume(self, resume: dict[str, Any]) -> dict:

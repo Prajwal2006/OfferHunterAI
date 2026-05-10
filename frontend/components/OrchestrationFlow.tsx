@@ -19,7 +19,7 @@ const steps: OrchestrationStep[] = [
   {
     id: "EmailWriter",
     label: "Email Writer",
-    description: "Generates outreach emails",
+    description: "Contacts + cold email drafts",
     status: "pending",
   },
   {

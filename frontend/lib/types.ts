@@ -296,6 +296,77 @@ export interface Email {
   resume_skills?: string[];
 }
 
+export interface PersonalizationProfile {
+  id: string;
+  user_id: string;
+  company_id: string;
+  fit_score: number;
+  outreach_type: string;
+  tone: string;
+  company_alignment: string[];
+  relevant_projects: Array<Record<string, unknown>>;
+  relevant_skills: string[];
+  suggested_links: Array<{ type?: string; url?: string; reason?: string }>;
+  recommended_hooks: string[];
+  email_strategy: Record<string, unknown>;
+  key_points_to_mention: string[];
+  personalization_summary: string;
+  evidence?: Record<string, unknown>;
+}
+
+export interface OutreachContact {
+  id?: string;
+  user_id?: string;
+  company_id?: string;
+  name: string;
+  role: string;
+  title?: string;
+  email: string;
+  confidence: number;
+  source: string;
+  priority_score: number;
+  verified: boolean;
+  contact_type: "recruiter" | "founder" | "hiring_manager" | "engineer" | "hr" | "other";
+}
+
+export interface EmailDraft {
+  id: string;
+  user_id: string;
+  company_id: string;
+  company_name: string;
+  outreach_type: string;
+  tone: string;
+  selected_variant: string;
+  subject: string;
+  body: string;
+  variants: Record<string, string>;
+  subjects: Array<{ label: string; subject: string; selected?: boolean }>;
+  recipient_email?: string;
+  status: "draft" | "pending_approval" | "approved" | "rejected" | "scheduled" | "sent" | "failed";
+  version_number: number;
+  resume_version_id?: string | null;
+  resume_skills?: string[];
+  generation_metadata?: Record<string, unknown>;
+  companies?: Partial<Company>;
+  created_at?: string;
+  updated_at?: string;
+  last_edited_at?: string;
+}
+
+export interface EmailVersion {
+  id: string;
+  draft_id: string;
+  version_number: number;
+  subject: string;
+  body: string;
+  selected_variant: string;
+  recipient_email?: string;
+  event_type: string;
+  editor: "user" | "ai" | "system";
+  changes?: Record<string, unknown>;
+  created_at: string;
+}
+
 export interface ResumeVersion {
   id: string;
   user_id: string;

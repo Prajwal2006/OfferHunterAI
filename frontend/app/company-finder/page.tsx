@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { RequireAuth } from "@/components/RequireAuth";
 import { useAuth } from "@/components/AuthProvider";
+import { useRouter } from "next/navigation";
 import {
   fetchDiscoveredCompanies,
   runCompanyFinder,
@@ -28,9 +29,12 @@ import {
   continueCompanyDiscovery,
   fetchDiscoverySourceLogs,
   buildApiUrl,
+  fetchEmailDrafts,
+  generateEmailDraft,
 } from "@/lib/api";
 import {
   Company,
+  EmailDraft,
   UserPreferences,
   ConversationMessage,
   OrchestrationState,
@@ -105,6 +109,136 @@ function AgentStatusBanner({
           <X className="w-4 h-4" />
         </button>
       )}
+    </motion.div>
+  );
+}
+
+function ColdEmailProgressPanel({
+  companyName,
+  events,
+  draft,
+  typedBody,
+  onOpenAgents,
+  onOpenReview,
+  onDismiss,
+}: {
+  companyName: string;
+  events: StreamedAgentEvent[];
+  draft: EmailDraft | null;
+  typedBody: string;
+  onOpenAgents: () => void;
+  onOpenReview: () => void;
+  onDismiss: () => void;
+}) {
+  const steps = [
+    { agent: "PersonalizationAgent", label: "Personalization", description: "Matching your resume, profile, links, and company context" },
+    { agent: "ContactDiscoveryAgent", label: "Contact discovery", description: "Finding and ranking the best people to email" },
+    { agent: "EmailWriterAgent", label: "Cold email draft", description: "Generating subject lines and short, medium, and founder-style variants" },
+    { agent: "HumanReviewAgent", label: "Human review", description: "Saving the draft with version history for review" },
+  ];
+
+  function statusFor(agent: string) {
+    const agentEvents = events.filter((event) => event.agent_name === agent);
+    if (agentEvents.some((event) => event.status === "failed")) return "failed";
+    if (agentEvents.some((event) => event.status === "completed")) return "completed";
+    if (agentEvents.some((event) => event.status === "started" || event.status === "running")) return "running";
+    return "pending";
+  }
+
+  const latest = events[events.length - 1];
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="rounded-2xl border border-primary/25 bg-primary/5 p-4"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-foreground">Generating cold email for {companyName}</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {latest?.message || "Starting the outreach agents..."}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="rounded-lg p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className="mt-4 grid gap-2 sm:grid-cols-4">
+        {steps.map((step) => {
+          const status = statusFor(step.agent);
+          const tone =
+            status === "completed"
+              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600"
+              : status === "running"
+              ? "border-primary/30 bg-primary/10 text-primary"
+              : status === "failed"
+              ? "border-red-500/30 bg-red-500/10 text-red-600"
+              : "border-border bg-card text-muted-foreground";
+          return (
+            <div key={step.agent} className={`rounded-xl border p-3 ${tone}`}>
+              <div className="flex items-center gap-2 text-xs font-semibold">
+                {status === "running" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : status === "completed" ? (
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                ) : status === "failed" ? (
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                ) : (
+                  <span className="h-2 w-2 rounded-full bg-current opacity-40" />
+                )}
+                {step.label}
+              </div>
+              <p className="mt-1 text-[11px] leading-4 opacity-80">{step.description}</p>
+            </div>
+          );
+        })}
+      </div>
+
+      {draft && (
+        <div className="mt-4 rounded-xl border border-border bg-background p-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Draft preview
+              </p>
+              <p className="mt-1 text-sm font-medium text-foreground">{draft.subject}</p>
+            </div>
+            <button
+              type="button"
+              onClick={onOpenReview}
+              className="inline-flex items-center gap-2 rounded-xl bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"
+            >
+              Open Review
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          </div>
+          <pre className="max-h-72 overflow-auto whitespace-pre-wrap font-mono text-sm leading-6 text-foreground">
+            {typedBody}
+            {typedBody.length < draft.body.length ? "|" : ""}
+          </pre>
+        </div>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={onOpenAgents}
+          className="rounded-xl border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          Open Agent Dashboard
+        </button>
+        {!draft && (
+          <span className="text-xs text-muted-foreground">
+            This can take a moment when contact discovery scans company pages.
+          </span>
+        )}
+      </div>
     </motion.div>
   );
 }
@@ -316,6 +450,7 @@ function FilterBar({
 
 function CompanyFinderContent() {
   const { session } = useAuth();
+  const router = useRouter();
   const userId = session?.user?.id ?? "";
 
   const [step, setStep] = useState<FlowStep>("checking");
@@ -342,20 +477,28 @@ function CompanyFinderContent() {
   const [sourceLogs, setSourceLogs] = useState<DiscoverySourceLog[]>([]);
   const [sourceMode, setSourceMode] = useState<string>("all");
   const [initAttempt, setInitAttempt] = useState(0);
+  const [handoffLoading, setHandoffLoading] = useState<"email-writer" | "resume-tailor" | null>(null);
+  const [handoffTaskId, setHandoffTaskId] = useState<string | null>(null);
+  const [handoffCompany, setHandoffCompany] = useState<Company | null>(null);
+  const [handoffEvents, setHandoffEvents] = useState<StreamedAgentEvent[]>([]);
+  const [handoffDraft, setHandoffDraft] = useState<EmailDraft | null>(null);
+  const [typedDraftBody, setTypedDraftBody] = useState("");
   const esRef = useRef<EventSource | null>(null);
+  const handoffEsRef = useRef<EventSource | null>(null);
   const activeTaskIdRef = useRef<string | null>(null);
   const currentStageRef = useRef<string>("company_discovery");
-  const stageStartedAtRef = useRef<number>(Date.now());
+  const stageStartedAtRef = useRef<number>(0);
   const repairRequestedForUserRef = useRef<string | null>(null);
   // Track whether the running state was triggered by "Find More" (merge) vs fresh run (replace)
   const isContinuingRef = useRef(false);
+  const [isContinuing, setIsContinuing] = useState(false);
 
   // ── Initial load ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!userId) return;
     let cancelled = false;
     const activeControllers = new Set<AbortController>();
-    const FETCH_TIMEOUT_MS = 15_000;
+    const FETCH_TIMEOUT_MS = 30_000;
 
     // Wraps fetch with a per-call timeout so a slow/hung API never blocks "checking" forever.
     async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -571,6 +714,7 @@ function CompanyFinderContent() {
 
           if (data.status === "completed") {
             isContinuingRef.current = false;
+            setIsContinuing(false);
             // Always reload from DB so persisted state is the source of truth
             fetchDiscoveredCompanies(userId, { limit: 1000 })
               .then((res) => {
@@ -591,6 +735,7 @@ function CompanyFinderContent() {
               });
           } else if (data.status === "failed") {
             isContinuingRef.current = false;
+            setIsContinuing(false);
             setError(data.message || "Agent failed");
             activeTaskIdRef.current = null;
             setStep("error");
@@ -606,6 +751,7 @@ function CompanyFinderContent() {
     // for companies after 4 minutes and exit the running state regardless.
     const fallbackTimer = setTimeout(() => {
       isContinuingRef.current = false;
+      setIsContinuing(false);
       fetchDiscoveredCompanies(userId, { limit: 1000 })
         .then((res) => {
           setCompanies((prev) => mergeCompanies(prev, res.companies));
@@ -630,8 +776,70 @@ function CompanyFinderContent() {
     };
   }, [step, userId]);
 
+  useEffect(() => {
+    if (!handoffTaskId || !userId) {
+      handoffEsRef.current?.close();
+      return;
+    }
+
+    handoffEsRef.current?.close();
+    const es = createEventSource((event: MessageEvent) => {
+      try {
+        const data = JSON.parse(event.data) as StreamedAgentEvent;
+        if (data.type === "connected" || data.task_id !== handoffTaskId) return;
+
+        setHandoffEvents((prev) => {
+          const id = `${data.agent_name || "agent"}-${data.status || "running"}-${data.message || ""}`;
+          if (prev.some((item) => `${item.agent_name || "agent"}-${item.status || "running"}-${item.message || ""}` === id)) {
+            return prev;
+          }
+          return [...prev, data];
+        });
+
+        const draftReady =
+          (data.agent_name === "EmailWriterAgent" && data.status === "completed") ||
+          data.agent_name === "HumanReviewAgent";
+        if (draftReady && handoffCompany?.id) {
+          fetchEmailDrafts(userId)
+            .then((result) => {
+              const draft = result.drafts.find((item) => item.company_id === handoffCompany.id);
+              if (draft) {
+                setHandoffDraft(draft);
+              }
+            })
+            .catch(() => {
+              // Draft preview is best effort; the saved draft remains available in Review.
+            });
+        }
+      } catch {
+        // ignore malformed SSE payloads
+      }
+    });
+    handoffEsRef.current = es;
+
+    return () => es.close();
+  }, [handoffCompany?.id, handoffTaskId, userId]);
+
+  useEffect(() => {
+    setTypedDraftBody("");
+    if (!handoffDraft?.body) return;
+
+    let index = 0;
+    const timer = setInterval(() => {
+      index = Math.min(index + 8, handoffDraft.body.length);
+      setTypedDraftBody(handoffDraft.body.slice(0, index));
+      if (index >= handoffDraft.body.length) {
+        clearInterval(timer);
+      }
+    }, 18);
+
+    return () => clearInterval(timer);
+  }, [handoffDraft?.body]);
+
   // ── Start discovery ────────────────────────────────────────────────────────
   const startDiscovery = useCallback(async (rediscover = false) => {
+    isContinuingRef.current = false;
+    setIsContinuing(false);
     setStep("running");
     currentStageRef.current = "company_discovery";
     stageStartedAtRef.current = Date.now();
@@ -660,15 +868,114 @@ function CompanyFinderContent() {
   const onHandoff = useCallback(
     async (
       companyId: string,
-      agent: "email-writer" | "resume-tailor" | "personalizer"
+      agent: "email-writer" | "resume-tailor"
     ) => {
+      const company = companies.find((item) => item.id === companyId) || selectedCompany;
+      setHandoffLoading(agent);
+      setHandoffCompany(company || null);
+      setHandoffTaskId(null);
+      setHandoffEvents([
+        {
+          task_id: "",
+          agent_name: agent === "email-writer" ? "PersonalizationAgent" : "ResumeTailorAgent",
+          status: "started",
+          message:
+            agent === "email-writer"
+              ? "Preparing your cold email workflow..."
+              : "Preparing resume tailoring workflow...",
+        },
+      ]);
+      setHandoffDraft(null);
+      setTypedDraftBody("");
       try {
-        await handoffToAgent(companyId, agent, userId);
-      } catch {
-        // silently fail for now
+        if (agent === "email-writer") {
+          setHandoffEvents([
+            {
+              task_id: "",
+              agent_name: "EmailWriterAgent",
+              status: "started",
+              message: "Writing your cold email draft...",
+            },
+          ]);
+          const result = await generateEmailDraft({
+            user_id: userId,
+            company_id: companyId,
+            outreach_type: "cold_email",
+          });
+          setHandoffDraft(result.draft);
+          setAgentMessage("Cold email draft is ready for review.");
+          setHandoffEvents([
+            {
+              task_id: "",
+              agent_name: "EmailWriterAgent",
+              status: "started",
+              message: "Writing your cold email draft...",
+            },
+            {
+              task_id: "",
+              agent_name: "EmailWriterAgent",
+              status: "completed",
+              message: `Cold email draft ready for ${result.draft.company_name || company?.name || "this company"}`,
+            },
+            {
+              task_id: "",
+              agent_name: "HumanReviewAgent",
+              status: "started",
+              message: "Draft is ready for human review",
+            },
+          ]);
+          setCompanies((prev) =>
+            prev.map((company) =>
+              company.id === companyId
+                ? {
+                    ...company,
+                    workspace: {
+                      ...(company.workspace || {}),
+                      orchestration_stage: "Review",
+                      personalization_completed: true,
+                      outreach_started: true,
+                    },
+                  }
+                : company
+            )
+          );
+          return;
+        }
+
+        const result = await handoffToAgent(companyId, agent, userId);
+        setHandoffTaskId(result.task_id);
+        setAgentMessage("Starting Resume Tailor agent...");
+        setCompanies((prev) =>
+          prev.map((company) =>
+            company.id === companyId
+              ? {
+                  ...company,
+                  workspace: {
+                    ...(company.workspace || {}),
+                    orchestration_stage: "Review",
+                    personalization_completed: company.workspace?.personalization_completed,
+                    outreach_started: company.workspace?.outreach_started,
+                  },
+                }
+              : company
+          )
+        );
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to start company action");
+        setHandoffEvents((prev) => [
+          ...prev,
+          {
+            task_id: "",
+            agent_name: agent === "email-writer" ? "EmailWriterAgent" : "ResumeTailorAgent",
+            status: "failed",
+            message: err instanceof Error ? err.message : "Failed to start company action",
+          },
+        ]);
+      } finally {
+        setHandoffLoading(null);
       }
     },
-    [userId]
+    [companies, selectedCompany, userId]
   );
 
   const onAddManualCompany = useCallback(async () => {
@@ -771,6 +1078,7 @@ function CompanyFinderContent() {
 
   const onFindMoreCompanies = useCallback(async () => {
     isContinuingRef.current = true;
+    setIsContinuing(true);
     setStep("running");
     currentStageRef.current = "company_discovery";
     stageStartedAtRef.current = Date.now();
@@ -785,6 +1093,7 @@ function CompanyFinderContent() {
       activeTaskIdRef.current = result.task_id;
     } catch (err) {
       isContinuingRef.current = false;
+      setIsContinuing(false);
       activeTaskIdRef.current = null;
       setError(err instanceof Error ? err.message : "Failed to continue discovery");
       setStep("results"); // Stay on results so existing companies remain visible
@@ -912,7 +1221,7 @@ function CompanyFinderContent() {
     );
   }
 
-  if (step === "running" && !isContinuingRef.current && companies.length === 0) {
+  if (step === "running" && !isContinuing && companies.length === 0) {
     // Fresh discovery with no existing results — show full skeleton screen
     return (
       <div className="max-w-3xl mx-auto py-8 px-4">
@@ -952,8 +1261,30 @@ function CompanyFinderContent() {
           message={agentMessage}
           onCancel={() => {
             isContinuingRef.current = false;
+            setIsContinuing(false);
             activeTaskIdRef.current = null;
             setStep("results");
+          }}
+        />
+      )}
+
+      {handoffCompany && handoffEvents.length > 0 && (
+        <ColdEmailProgressPanel
+          companyName={handoffCompany.name}
+          events={handoffEvents}
+          draft={handoffDraft}
+          typedBody={typedDraftBody}
+          onOpenAgents={() =>
+            router.push(handoffTaskId ? `/agents?task_id=${encodeURIComponent(handoffTaskId)}` : "/agents")
+          }
+          onOpenReview={() => router.push("/review")}
+          onDismiss={() => {
+            handoffEsRef.current?.close();
+            setHandoffTaskId(null);
+            setHandoffCompany(null);
+            setHandoffEvents([]);
+            setHandoffDraft(null);
+            setTypedDraftBody("");
           }}
         />
       )}
@@ -1275,6 +1606,7 @@ function CompanyFinderContent() {
             company={selectedCompany}
             onClose={() => setSelectedCompany(null)}
             onHandoff={onHandoff}
+            actionLoading={handoffLoading}
           />
         )}
       </AnimatePresence>

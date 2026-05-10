@@ -34,8 +34,9 @@ interface CompanyDetailModalProps {
   onClose: () => void;
   onHandoff: (
     companyId: string,
-    agent: "email-writer" | "resume-tailor" | "personalizer"
-  ) => void;
+    agent: "email-writer" | "resume-tailor"
+  ) => void | Promise<void>;
+  actionLoading?: "email-writer" | "resume-tailor" | null;
 }
 
 function ScoreBar({
@@ -170,6 +171,7 @@ export default function CompanyDetailModal({
   company,
   onClose,
   onHandoff,
+  actionLoading,
 }: CompanyDetailModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
   const ranking = company.ranking;
@@ -586,25 +588,20 @@ export default function CompanyDetailModal({
               </p>
               <div className="flex flex-wrap gap-3">
                 <button
-                  onClick={() => onHandoff(company.id, "email-writer")}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
-                >
-                  <Send className="w-4 h-4" />
-                  Generate Cold Email
-                </button>
-                <button
-                  onClick={() => onHandoff(company.id, "resume-tailor")}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-secondary text-secondary-foreground text-sm font-medium hover:bg-secondary/90 transition-colors"
+                  onClick={() => void onHandoff(company.id, "resume-tailor")}
+                  disabled={actionLoading != null}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-secondary text-secondary-foreground text-sm font-medium hover:bg-secondary/90 transition-colors disabled:opacity-60"
                 >
                   <FileText className="w-4 h-4" />
-                  Tailor Resume
+                  {actionLoading === "resume-tailor" ? "Starting..." : "Tailor Resume"}
                 </button>
                 <button
-                  onClick={() => onHandoff(company.id, "personalizer")}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl border border-border text-sm font-medium hover:bg-muted transition-colors"
+                  onClick={() => void onHandoff(company.id, "email-writer")}
+                  disabled={actionLoading != null}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors disabled:opacity-60"
                 >
-                  <Sparkles className="w-4 h-4" />
-                  Personalize
+                  <Send className="w-4 h-4" />
+                  {actionLoading === "email-writer" ? "Running Agents..." : "Generate Cold Email"}
                 </button>
               </div>
             </div>

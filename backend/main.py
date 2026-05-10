@@ -34,11 +34,17 @@ from agents.follow_up import FollowUpAgent
 from agents.response_classifier import ResponseClassifierAgent
 from services.resume_parser import ResumeParserService
 from services.filters import apply_hard_constraints, normalize_preference_payload, partition_workspace_companies
+from services.contact_discovery_service import ContactDiscoveryService
+from services.email_editor_service import EmailEditorService
+from services.email_writer_service import EmailWriterService
+from services.personalization_service import PersonalizationService
+from services.versioning_service import VersioningService
 from models.work_mode import normalize_company_work_mode
 
 # In-memory company results cache (user_id -> companies list)
 # Used as fallback when Supabase is not configured or rankings table is empty
 _user_companies_cache: dict[str, list] = {}
+_outreach_drafts_cache: dict[str, list[dict[str, Any]]] = {}
 _workspace_repairs_running: set[str] = set()
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -92,6 +98,255 @@ def _merge_user_company_cache(user_id: str, incoming: list[dict[str, Any]]) -> l
             merged[key] = {**merged.get(key, {}), **company}
     _user_companies_cache[user_id] = list(merged.values())
     return _user_companies_cache[user_id]
+
+
+def _merge_outreach_draft_cache(user_id: str, draft: dict[str, Any]) -> dict[str, Any]:
+    drafts = _outreach_drafts_cache.setdefault(user_id, [])
+    draft_id = draft.get("id")
+    company_id = draft.get("company_id")
+    merged = False
+    for index, existing in enumerate(drafts):
+        if (draft_id and existing.get("id") == draft_id) or (company_id and existing.get("company_id") == company_id):
+            drafts[index] = {**existing, **draft}
+            merged = True
+            break
+    if not merged:
+        drafts.insert(0, draft)
+    return draft
+
+
+async def _get_email_drafts_fast(user_id: str, status: Optional[str] = None, timeout: float = 3.0) -> list[dict[str, Any]]:
+    """Fetch drafts without allowing the synchronous Supabase client to hang the event loop."""
+    def fetch_db() -> list[dict[str, Any]]:
+        client = supabase_client._get_client()  # type: ignore[attr-defined]
+        if not client:
+            return []
+        query = (
+            client.table("email_drafts")
+            .select("*, companies(name, domain, industry, logo_url)")
+            .eq("user_id", user_id)
+            .order("last_edited_at", desc=True)
+        )
+        if status:
+            query = query.eq("status", status)
+        result = query.execute()
+        return result.data or []
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fetch_db), timeout=timeout)
+    except Exception:
+        return []
+
+
+async def _get_email_draft_fast(draft_id: str, timeout: float = 3.0) -> Optional[dict[str, Any]]:
+    def fetch_db() -> Optional[dict[str, Any]]:
+        client = supabase_client._get_client()  # type: ignore[attr-defined]
+        if not client:
+            return None
+        result = (
+            client.table("email_drafts")
+            .select("*")
+            .eq("id", draft_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fetch_db), timeout=timeout)
+    except Exception:
+        return None
+
+
+async def _get_email_versions_fast(draft_id: str, timeout: float = 2.0) -> list[dict[str, Any]]:
+    def fetch_db() -> list[dict[str, Any]]:
+        client = supabase_client._get_client()  # type: ignore[attr-defined]
+        if not client:
+            return []
+        result = (
+            client.table("email_versions")
+            .select("*")
+            .eq("draft_id", draft_id)
+            .order("version_number", desc=True)
+            .execute()
+        )
+        return result.data or []
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fetch_db), timeout=timeout)
+    except Exception:
+        return []
+
+
+def _find_cached_company(user_id: str, company_id: str) -> Optional[dict[str, Any]]:
+    for company in _user_companies_cache.get(user_id, []):
+        if str(company.get("id")) == str(company_id):
+            return company
+    return None
+
+
+async def _load_outreach_context_fast(user_id: str, company_id: str, timeout: float = 4.0) -> dict[str, Any]:
+    """Load only the data needed to write one selected-company email, with cache fallback."""
+    cached_company = _find_cached_company(user_id, company_id)
+
+    def fetch_db() -> dict[str, Any]:
+        client = supabase_client._get_client()  # type: ignore[attr-defined]
+        if not client:
+            return {}
+
+        def first(table: str, select: str = "*", **filters: str) -> Optional[dict[str, Any]]:
+            query = client.table(table).select(select)
+            for key, value in filters.items():
+                query = query.eq(key, value)
+            result = query.limit(1).execute()
+            rows = result.data or []
+            return rows[0] if rows else None
+
+        company_result = (
+            client.table("companies")
+            .select("*, company_contacts(*), discovered_jobs(*)")
+            .eq("id", company_id)
+            .limit(1)
+            .execute()
+        )
+        company_rows = company_result.data or []
+        return {
+            "company": company_rows[0] if company_rows else None,
+            "profile": first("parsed_profiles", user_id=user_id) or {},
+            "preferences": first("user_preferences", user_id=user_id) or {},
+            "resume": first("resume_versions", user_id=user_id, is_active=True) or {},
+        }
+
+    try:
+        data = await asyncio.wait_for(asyncio.to_thread(fetch_db), timeout=timeout)
+    except Exception:
+        data = {}
+
+    company = data.get("company") or cached_company
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return {
+        "company": company,
+        "profile": data.get("profile") or {},
+        "preferences": normalize_preference_payload(data.get("preferences") or {}),
+        "resume": data.get("resume") or {},
+    }
+
+
+async def _get_personalization_profile_fast(user_id: str, company_id: str, timeout: float = 1.5) -> Optional[dict[str, Any]]:
+    def fetch_db() -> Optional[dict[str, Any]]:
+        client = supabase_client._get_client()  # type: ignore[attr-defined]
+        if not client:
+            return None
+        result = (
+            client.table("personalization_profiles")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("company_id", company_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fetch_db), timeout=timeout)
+    except Exception:
+        return None
+
+
+async def _persist_email_draft_fast(user_id: str, draft_payload: dict[str, Any], timeout: float = 2.5) -> dict[str, Any]:
+    """Persist the draft when Supabase is responsive, but always return the cached draft."""
+    _merge_outreach_draft_cache(user_id, draft_payload)
+
+    def write_db() -> dict[str, Any]:
+        client = supabase_client._get_client()  # type: ignore[attr-defined]
+        if not client:
+            return draft_payload
+        result = (
+            client.table("email_drafts")
+            .upsert(draft_payload, on_conflict="user_id,company_id")
+            .execute()
+        )
+        return result.data[0] if result.data else draft_payload
+
+    try:
+        stored = await asyncio.wait_for(asyncio.to_thread(write_db), timeout=timeout)
+    except Exception:
+        stored = draft_payload
+    _merge_outreach_draft_cache(user_id, stored)
+    return stored
+
+
+async def _finalize_email_draft_storage(
+    *,
+    user_id: str,
+    company_id: str,
+    stored: dict[str, Any],
+    personalization: dict[str, Any],
+) -> None:
+    """Best-effort noncritical storage. Failure here must not break draft generation."""
+    def write_db() -> None:
+        client = supabase_client._get_client()  # type: ignore[attr-defined]
+        if not client:
+            return
+        try:
+            if personalization:
+                client.table("personalization_profiles").upsert(
+                    personalization,
+                    on_conflict="user_id,company_id",
+                ).execute()
+        except Exception:
+            pass
+        try:
+            version = VersioningService().create_version(
+                draft={**stored, "version_number": 0},
+                event_type="generated",
+                editor="ai",
+                changes={"personalization_profile_id": personalization.get("id")},
+            )
+            client.table("email_versions").insert(version).execute()
+        except Exception:
+            pass
+        try:
+            subjects = stored.get("subjects") or []
+            if stored.get("id") and subjects:
+                rows = [{"draft_id": stored.get("id"), **subject} for subject in subjects]
+                client.table("generated_subjects").insert(rows).execute()
+        except Exception:
+            pass
+        try:
+            client.table("user_companies").update(
+                {"outreach_started": True, "orchestration_stage": "Review"}
+            ).eq("user_id", user_id).eq("company_id", company_id).execute()
+        except Exception:
+            pass
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(write_db), timeout=4.0)
+    except Exception:
+        pass
+
+
+async def _get_generated_subjects_fast(draft_id: str, timeout: float = 2.0) -> list[dict[str, Any]]:
+    def fetch_db() -> list[dict[str, Any]]:
+        client = supabase_client._get_client()  # type: ignore[attr-defined]
+        if not client:
+            return []
+        result = (
+            client.table("generated_subjects")
+            .select("*")
+            .eq("draft_id", draft_id)
+            .order("created_at")
+            .execute()
+        )
+        return result.data or []
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fetch_db), timeout=timeout)
+    except Exception:
+        return []
 
 
 def _hydrate_company_work_mode(company: dict[str, Any]) -> dict[str, Any]:
@@ -196,6 +451,54 @@ class EmailUpdateRequest(BaseModel):
     subject: Optional[str] = None
     body: Optional[str] = None
     resume_version_id: Optional[str] = None
+
+
+class GeneratePersonalizationRequest(BaseModel):
+    user_id: str
+    company_id: str
+    job_id: Optional[str] = None
+    job: Optional[dict[str, Any]] = None
+
+
+class GenerateEmailDraftRequest(BaseModel):
+    user_id: str
+    company_id: str
+    personalization_profile_id: Optional[str] = None
+    job_id: Optional[str] = None
+    job: Optional[dict[str, Any]] = None
+    recipient: Optional[dict[str, Any]] = None
+    outreach_type: Optional[str] = None
+
+
+class DraftUpdateRequest(BaseModel):
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    selected_variant: Optional[str] = None
+    recipient_email: Optional[str] = None
+    status: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+class InlineAIEditRequest(BaseModel):
+    user_id: str
+    instruction: str
+    selected_text: str
+    full_body: str
+    subject: Optional[str] = ""
+    auto_apply: bool = False
+
+
+class ApplyAIEditRequest(BaseModel):
+    user_id: str
+    ai_edit_request_id: Optional[str] = None
+    replacement_text: str
+    original_text: str
+
+
+class DiscoverContactsRequest(BaseModel):
+    user_id: str
+    company_id: str
+    job: Optional[dict[str, Any]] = None
 
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Company Finder Models Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -429,20 +732,35 @@ async def run_agents(request: RunAgentsRequest):
 
             # 2. Personalization (per company)
             personalization_agent = PersonalizationAgent(logger=logger)
+            profile = await supabase_client.get_parsed_profile(request.user_id) if request.user_id else {}
+            active_resume_payload = {
+                "id": resume_version_id,
+                "extracted_text": resume_text or "",
+                "extracted_skills": resume_skills,
+            }
             for company in companies[:request.company_count]:
-                await personalization_agent.run(
+                insights = await personalization_agent.run(
                     task_id=str(uuid.uuid4()),
                     company=company,
+                    user_id=request.user_id or "anonymous",
+                    user_profile=profile or {},
+                    preferences=preferences,
+                    resume=active_resume_payload,
+                    job={"title": request.job_title},
                 )
 
-            # 3. Email Writer (per company)
-            email_writer = EmailWriterAgent(logger=logger)
-            for company in companies[:request.company_count]:
+                # 3. Email Writer (per company)
+                email_writer = EmailWriterAgent(logger=logger)
                 await email_writer.run(
                     task_id=str(uuid.uuid4()),
                     company=company,
                     skills=effective_skills,
                     job_title=request.job_title,
+                    personalization=insights,
+                    user_id=request.user_id or "anonymous",
+                    user_profile=profile or {},
+                    preferences=preferences,
+                    resume=active_resume_payload,
                     resume_text=resume_text,
                     resume_skills=resume_skills,
                     resume_version_id=resume_version_id,
@@ -556,6 +874,292 @@ async def send_email(email_id: str):
     task_id = str(uuid.uuid4())
     asyncio.create_task(sender.run(task_id=task_id, email_id=email_id))
     return {"email_id": email_id, "task_id": task_id, "status": "sending"}
+
+
+# ─── Production Outreach Workflow Endpoints ────────────────────────────────
+
+async def _load_outreach_context(user_id: str, company_id: str) -> dict[str, Any]:
+    company = await supabase_client.get_company_detail(company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    profile = await supabase_client.get_parsed_profile(user_id) or {}
+    preferences = await supabase_client.get_user_preferences(user_id) or {}
+    resume = await supabase_client.get_active_resume(user_id) or {}
+    return {
+        "company": company,
+        "profile": profile,
+        "preferences": normalize_preference_payload(preferences),
+        "resume": resume,
+    }
+
+
+async def _generate_selected_company_email(request: GenerateEmailDraftRequest) -> dict[str, Any]:
+    """
+    Fast selected-company draft generation.
+
+    The critical path intentionally avoids live AI and contact discovery. Those are useful
+    enrichments, but a user click on "Generate cold email" should always produce a draft.
+    """
+    context = await _load_outreach_context_fast(request.user_id, request.company_id)
+    personalization = await _get_personalization_profile_fast(request.user_id, request.company_id)
+    if not personalization:
+        personalization_model = await PersonalizationService().generate_profile(
+            user_id=request.user_id,
+            company=context["company"],
+            user_profile=context["profile"],
+            preferences=context["preferences"],
+            resume=context["resume"],
+            job=request.job,
+            use_ai=False,
+        )
+        personalization = personalization_model.model_dump()
+
+    draft_model = await EmailWriterService().generate_email(
+        user_id=request.user_id,
+        company=context["company"],
+        personalization=personalization,
+        user_profile=context["profile"],
+        preferences=context["preferences"],
+        resume=context["resume"],
+        job=request.job,
+        recipient=request.recipient,
+        outreach_type=request.outreach_type or "cold_email",
+        use_ai=False,
+    )
+    draft_payload = {**draft_model.model_dump(), "version_number": 1}
+    stored = await _persist_email_draft_fast(request.user_id, draft_payload)
+    asyncio.create_task(
+        _finalize_email_draft_storage(
+            user_id=request.user_id,
+            company_id=request.company_id,
+            stored=stored,
+            personalization=personalization,
+        )
+    )
+    return {"draft": stored, "personalization": personalization}
+
+
+@app.post("/outreach/personalization")
+async def generate_personalization(request: GeneratePersonalizationRequest):
+    """Generate and persist a structured personalization profile for one company."""
+    context = await _load_outreach_context(request.user_id, request.company_id)
+    service = PersonalizationService()
+    profile = await service.generate_profile(
+        user_id=request.user_id,
+        company=context["company"],
+        user_profile=context["profile"],
+        preferences=context["preferences"],
+        resume=context["resume"],
+        job=request.job,
+    )
+    stored = await supabase_client.upsert_personalization_profile(profile.model_dump())
+    await supabase_client.update_user_company(
+        request.user_id,
+        request.company_id,
+        {"personalization_completed": True, "orchestration_stage": "EmailWriter"},
+    )
+    return {"profile": stored}
+
+
+@app.get("/outreach/personalization/{company_id}")
+async def get_personalization(company_id: str, user_id: str = Query(...)):
+    profile = await supabase_client.get_personalization_profile(user_id, company_id)
+    return {"profile": profile}
+
+
+@app.post("/outreach/contacts/discover")
+async def discover_outreach_contacts(request: DiscoverContactsRequest):
+    """Discover, rank, and persist public outreach contacts for a company."""
+    company = await supabase_client.get_company_detail(request.company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    result = await ContactDiscoveryService().discover(company, request.job)
+    rows = [
+        {
+            "id": str(uuid.uuid4()),
+            "user_id": request.user_id,
+            "company_id": request.company_id,
+            "name": c.get("name") or "",
+            "role": c.get("role") or c.get("title") or "",
+            "title": c.get("title") or c.get("role") or "",
+            "email": c.get("email") or "",
+            "confidence": c.get("confidence") or 0,
+            "source": c.get("source") or "",
+            "priority_score": c.get("priority_score") or 0,
+            "verified": c.get("verified") or False,
+            "contact_type": c.get("contact_type") or "other",
+            "metadata": c,
+        }
+        for c in result.get("contacts", [])
+        if c.get("email")
+    ]
+    stored = await supabase_client.upsert_outreach_contacts(rows)
+    return {"contacts": stored}
+
+
+@app.get("/outreach/contacts/{company_id}")
+async def get_outreach_contacts(company_id: str, user_id: str = Query(...)):
+    contacts = await supabase_client.get_outreach_contacts(user_id, company_id)
+    return {"contacts": contacts}
+
+
+@app.post("/outreach/drafts/generate")
+async def generate_email_draft(request: GenerateEmailDraftRequest):
+    """Generate a selected-company cold email quickly and fail-soft."""
+    return await _generate_selected_company_email(request)
+
+
+@app.get("/outreach/drafts")
+async def get_email_drafts(user_id: str = Query(...), status: Optional[str] = None):
+    cached = _outreach_drafts_cache.get(user_id, [])
+    if status:
+        cached = [draft for draft in cached if draft.get("status") == status]
+    drafts = await _get_email_drafts_fast(user_id=user_id, status=status)
+    seen = {draft.get("id") for draft in drafts}
+    for draft in cached:
+        if draft.get("id") not in seen:
+            drafts.append(draft)
+    return {"drafts": drafts}
+
+
+@app.get("/outreach/drafts/{draft_id}")
+async def get_email_draft(draft_id: str):
+    draft = await _get_email_draft_fast(draft_id)
+    if not draft:
+        for drafts in _outreach_drafts_cache.values():
+            draft = next((item for item in drafts if item.get("id") == draft_id), None)
+            if draft:
+                break
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    versions = await _get_email_versions_fast(draft_id)
+    subjects = await _get_generated_subjects_fast(draft_id)
+    return {"draft": draft, "versions": versions, "subjects": subjects}
+
+
+@app.patch("/outreach/drafts/{draft_id}")
+async def update_email_draft(draft_id: str, request: DraftUpdateRequest):
+    """Autosave/manual edit. Every content edit creates an immutable version."""
+    current = await supabase_client.get_email_draft(draft_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    updates = {k: v for k, v in request.model_dump().items() if k != "user_id" and v is not None}
+    if not updates:
+        return {"draft": current}
+    updates["version_number"] = int(current.get("version_number") or 1) + 1
+    updates["last_edited_at"] = datetime.utcnow().isoformat()
+    updated = await supabase_client.update_email_draft(draft_id, updates)
+    snapshot = {**current, **updates, **updated}
+    version = VersioningService().create_version(
+        draft={**snapshot, "version_number": int(current.get("version_number") or 1)},
+        event_type="manual_edit",
+        editor="user",
+        changes=updates,
+    )
+    await supabase_client.insert_email_version(version)
+    await supabase_client.insert_edit_history(
+        {
+            "id": str(uuid.uuid4()),
+            "draft_id": draft_id,
+            "user_id": request.user_id or current.get("user_id"),
+            "edit_type": "manual",
+            "before": current,
+            "after": snapshot,
+            "metadata": {"changed_fields": list(updates.keys())},
+        }
+    )
+    return {"draft": snapshot, "version": version}
+
+
+@app.post("/outreach/drafts/{draft_id}/ai-edit")
+async def create_inline_ai_edit(draft_id: str, request: InlineAIEditRequest):
+    """Create an inline AI edit preview. Optionally apply immediately."""
+    draft = await supabase_client.get_email_draft(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    company_id = draft.get("company_id")
+    context: dict[str, Any] = {"draft": draft}
+    if company_id:
+        context["personalization"] = await supabase_client.get_personalization_profile(request.user_id, company_id)
+
+    edit_request = {
+        "id": str(uuid.uuid4()),
+        "draft_id": draft_id,
+        "user_id": request.user_id,
+        "instruction": request.instruction,
+        "selected_text": request.selected_text,
+        "status": "previewed",
+        "metadata": {"subject": request.subject},
+    }
+    stored_request = await supabase_client.insert_ai_edit_request(edit_request)
+    preview = await EmailEditorService().edit_selection(
+        instruction=request.instruction,
+        selected_text=request.selected_text,
+        full_body=request.full_body,
+        subject=request.subject or draft.get("subject") or "",
+        context=context,
+    )
+    await supabase_client.update_ai_edit_request(
+        stored_request.get("id"),
+        {"proposed_text": preview["replacement_text"], "diff": preview["diff"], "status": "previewed"},
+    )
+
+    if request.auto_apply:
+        apply_request = DraftUpdateRequest(
+            user_id=request.user_id,
+            body=preview["updated_body"],
+        )
+        update = await update_email_draft(draft_id, apply_request)
+        await supabase_client.update_ai_edit_request(stored_request.get("id"), {"status": "accepted"})
+        preview["applied"] = True
+        preview["draft"] = update["draft"]
+    else:
+        preview["applied"] = False
+    preview["ai_edit_request_id"] = stored_request.get("id")
+    return preview
+
+
+@app.post("/outreach/drafts/{draft_id}/ai-edit/apply")
+async def apply_inline_ai_edit(draft_id: str, request: ApplyAIEditRequest):
+    draft = await supabase_client.get_email_draft(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    body = draft.get("body") or ""
+    if request.original_text and request.original_text in body:
+        body = body.replace(request.original_text, request.replacement_text, 1)
+    else:
+        body = request.replacement_text
+    update = await update_email_draft(draft_id, DraftUpdateRequest(user_id=request.user_id, body=body))
+    if request.ai_edit_request_id:
+        await supabase_client.update_ai_edit_request(request.ai_edit_request_id, {"status": "accepted"})
+    return update
+
+
+@app.post("/outreach/drafts/{draft_id}/versions/{version_id}/restore")
+async def restore_email_version(draft_id: str, version_id: str, user_id: str = Query(...)):
+    version = await supabase_client.get_email_version(version_id)
+    if not version or version.get("draft_id") != draft_id:
+        raise HTTPException(status_code=404, detail="Version not found")
+    update = await update_email_draft(
+        draft_id,
+        DraftUpdateRequest(
+            user_id=user_id,
+            subject=version.get("subject"),
+            body=version.get("body"),
+            selected_variant=version.get("selected_variant"),
+            recipient_email=version.get("recipient_email"),
+        ),
+    )
+    return {"draft": update["draft"], "restored_from": version}
+
+
+@app.get("/outreach/drafts/{draft_id}/versions/compare")
+async def compare_email_versions(draft_id: str, left_version_id: str, right_version_id: str):
+    left = await supabase_client.get_email_version(left_version_id)
+    right = await supabase_client.get_email_version(right_version_id)
+    if not left or not right or left.get("draft_id") != draft_id or right.get("draft_id") != draft_id:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return VersioningService().compare(left, right)
 
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Resume Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -1517,84 +2121,235 @@ async def update_orchestration_state(user_id: str, request: OrchestrationStateUp
 @app.post("/company-finder/companies/{company_id}/handoff")
 async def handoff_to_agent(
     company_id: str,
-    target_agent: str = Query(..., description="Agent to hand off to: personalizer, email-writer, resume-tailor"),
+    target_agent: str = Query(..., description="Agent to hand off to: email-writer or resume-tailor"),
     user_id: str = Query(...),
 ):
     """
-    Hand off a company to another agent (Personalizer, Email Writer, etc).
-    Packages and sends complete context to the target agent.
+    Hand off a company to the next user-selected workflow.
+
+    email-writer runs the full cold-email pipeline:
+    Personalization -> Contact Discovery -> Email Writer -> Human Review.
     """
     task_id = str(uuid.uuid4())
     logger = AgentEventLogger(event_queue=_broadcast_queue)
+    target = target_agent.lower()
 
-    company = await supabase_client.get_company_detail(company_id)
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    profile = await supabase_client.get_parsed_profile(user_id) or {}
-    ranking = (await supabase_client.get_company_rankings(user_id, limit=1)) or [{}]
-
-    # Structured handoff context
-    handoff_context = {
-        "company": company,
-        "user_profile": profile,
-        "ranking": ranking[0] if ranking else {},
-        "contacts": company.get("company_contacts", []),
-        "matched_skills": profile.get("skills", []),
-        "relevant_projects": profile.get("projects", []),
-    }
-
-    agent_map = {
-        "personalizer": PersonalizationAgent,
-        "email-writer": EmailWriterAgent,
-        "resume-tailor": ResumeTailorAgent,
-    }
-
-    AgentClass = agent_map.get(target_agent.lower())
-    if not AgentClass:
+    if target not in {"email-writer", "resume-tailor"}:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown agent '{target_agent}'. Valid: {list(agent_map.keys())}",
+            detail="Company actions are limited to 'email-writer' and 'resume-tailor'",
         )
 
-    agent = AgentClass(logger=logger)
-    asyncio.create_task(agent.run(task_id=task_id, **handoff_context))
+    async def load_context() -> tuple[dict[str, Any], dict[str, Any]]:
+        company = await supabase_client.get_company_detail(company_id)
+        if not company:
+            raise ValueError("Company not found")
 
-    stage_map = {
-        "personalizer": "Personalization",
-        "email-writer": "EmailWriter",
-        "resume-tailor": "Review",
-    }
-    company_id_value = company.get("id")
-    if company_id_value:
-        await supabase_client.update_user_company(
-            user_id=user_id,
-            company_id=company_id_value,
-            updates={
-                "orchestration_stage": stage_map.get(target_agent.lower(), "Personalization"),
-                "personalization_completed": target_agent.lower() in {"personalizer", "email-writer", "resume-tailor"},
-                "outreach_started": target_agent.lower() in {"email-writer", "resume-tailor"},
-            },
-        )
+        profile = await supabase_client.get_parsed_profile(user_id) or {}
+        preferences = normalize_preference_payload(await supabase_client.get_user_preferences(user_id) or {})
+        resume = await supabase_client.get_active_resume(user_id) or {}
+        ranking = (await supabase_client.get_company_rankings(user_id, limit=1)) or [{}]
+        handoff_context = {
+            "company": company,
+            "user_id": user_id,
+            "user_profile": profile,
+            "preferences": preferences,
+            "resume": resume,
+            "ranking": ranking[0] if ranking else {},
+            "contacts": company.get("company_contacts", []),
+            "matched_skills": profile.get("skills", []),
+            "relevant_projects": profile.get("projects", []),
+        }
+        return company, handoff_context
 
-    await supabase_client.upsert_orchestration_state({
-        "user_id": user_id,
-        "current_stage": stage_map.get(target_agent.lower(), "Personalization"),
-        "active_agents": [target_agent],
-        "paused_state": False,
-        "last_task_id": task_id,
-        "progress": {
-            "step": "handoff",
-            "target_agent": target_agent,
-            "company_id": company_id,
-        },
-    })
+    async def run_cold_email_pipeline() -> None:
+        try:
+            await logger.emit(
+                agent_name="EmailWriterAgent",
+                task_id=task_id,
+                status="started",
+                message="Generating selected-company cold email draft",
+                metadata={"company_id": company_id},
+            )
+            result = await _generate_selected_company_email(
+                GenerateEmailDraftRequest(
+                    user_id=user_id,
+                    company_id=company_id,
+                    outreach_type="cold_email",
+                )
+            )
+            draft = result["draft"]
+            await logger.emit(
+                agent_name="EmailWriterAgent",
+                task_id=task_id,
+                status="completed",
+                message=f"Cold email draft ready for {draft.get('company_name', 'company')}",
+                metadata={"company_id": company_id, "draft_id": draft.get("id")},
+            )
+            await logger.emit(
+                agent_name="HumanReviewAgent",
+                task_id=task_id,
+                status="started",
+                message=f"Draft for {draft.get('company_name', 'company')} is ready for human review",
+                metadata={"company_id": company_id, "draft_id": draft.get("id")},
+            )
+            return
+
+            company, handoff_context = await load_context()
+            await supabase_client.upsert_orchestration_state({
+                "user_id": user_id,
+                "current_stage": "Personalization",
+                "active_agents": ["PersonalizationAgent"],
+                "paused_state": False,
+                "last_task_id": task_id,
+                "progress": {"step": "personalization", "company_id": company_id},
+            })
+            personalizer = PersonalizationAgent(logger=logger)
+            personalization = await personalizer.run(task_id=task_id, **handoff_context)
+
+            await supabase_client.upsert_orchestration_state({
+                "user_id": user_id,
+                "current_stage": "EmailWriter",
+                "active_agents": ["ContactDiscoveryAgent"],
+                "paused_state": False,
+                "last_task_id": task_id,
+                "progress": {"step": "contact_discovery", "company_id": company_id},
+            })
+            await logger.emit(
+                agent_name="ContactDiscoveryAgent",
+                task_id=task_id,
+                status="started",
+                message=f"Finding best people to contact at {company.get('name', 'this company')}",
+                metadata={"company_id": company_id, "company": company.get("name")},
+            )
+            contact_result = await ContactDiscoveryService().discover(company)
+            contacts = [
+                {
+                    "id": str(uuid.uuid4()),
+                    "user_id": user_id,
+                    "company_id": company_id,
+                    "name": c.get("name") or "",
+                    "role": c.get("role") or c.get("title") or "",
+                    "title": c.get("title") or c.get("role") or "",
+                    "email": c.get("email") or "",
+                    "confidence": c.get("confidence") or 0,
+                    "source": c.get("source") or "",
+                    "priority_score": c.get("priority_score") or 0,
+                    "verified": c.get("verified") or False,
+                    "contact_type": c.get("contact_type") or "other",
+                    "metadata": c,
+                }
+                for c in contact_result.get("contacts", [])
+                if c.get("email")
+            ]
+            stored_contacts = await supabase_client.upsert_outreach_contacts(contacts)
+            best_contact = stored_contacts[0] if stored_contacts else None
+            await logger.emit(
+                agent_name="ContactDiscoveryAgent",
+                task_id=task_id,
+                status="completed",
+                message=f"Ranked {len(stored_contacts)} outreach contacts for {company.get('name', 'company')}",
+                metadata={"company_id": company_id, "contacts": stored_contacts[:5]},
+            )
+
+            await supabase_client.upsert_orchestration_state({
+                "user_id": user_id,
+                "current_stage": "EmailWriter",
+                "active_agents": ["EmailWriterAgent"],
+                "paused_state": False,
+                "last_task_id": task_id,
+                "progress": {"step": "email_writer", "company_id": company_id},
+            })
+            writer = EmailWriterAgent(logger=logger)
+            draft = await writer.run(
+                task_id=task_id,
+                **handoff_context,
+                personalization=personalization,
+                recipient=best_contact,
+                outreach_type="cold_email",
+            )
+            _merge_outreach_draft_cache(user_id, draft)
+            await supabase_client.update_user_company(
+                user_id=user_id,
+                company_id=company_id,
+                updates={
+                    "orchestration_stage": "Review",
+                    "personalization_completed": True,
+                    "outreach_started": True,
+                },
+            )
+            await supabase_client.upsert_orchestration_state({
+                "user_id": user_id,
+                "current_stage": "Review",
+                "active_agents": ["HumanReviewAgent"],
+                "paused_state": True,
+                "last_task_id": task_id,
+                "progress": {
+                    "step": "human_review",
+                    "company_id": company_id,
+                    "draft_id": draft.get("id"),
+                },
+            })
+            await logger.emit(
+                agent_name="HumanReviewAgent",
+                task_id=task_id,
+                status="started",
+                message=f"Draft for {company.get('name', 'company')} is ready for human review",
+                metadata={"company_id": company_id, "draft_id": draft.get("id")},
+            )
+        except Exception as exc:
+            await logger.emit(
+                agent_name="EmailWriterAgent",
+                task_id=task_id,
+                status="failed",
+                message=f"Cold email pipeline failed: {str(exc)}",
+                metadata={"company_id": company_id},
+            )
+
+    if target == "email-writer":
+        asyncio.create_task(run_cold_email_pipeline())
+    else:
+        async def run_resume_tailor() -> None:
+            try:
+                company, handoff_context = await load_context()
+                await supabase_client.upsert_orchestration_state({
+                    "user_id": user_id,
+                    "current_stage": "Review",
+                    "active_agents": ["ResumeTailorAgent"],
+                    "paused_state": False,
+                    "last_task_id": task_id,
+                    "progress": {"step": "resume_tailor", "company_id": company_id},
+                })
+                await supabase_client.update_user_company(
+                    user_id=user_id,
+                    company_id=company_id,
+                    updates={"orchestration_stage": "Review"},
+                )
+                agent = ResumeTailorAgent(logger=logger)
+                await agent.run(task_id=task_id, **handoff_context)
+                await logger.emit(
+                    agent_name="HumanReviewAgent",
+                    task_id=task_id,
+                    status="started",
+                    message=f"Tailored resume for {company.get('name', 'company')} is ready for review",
+                    metadata={"company_id": company_id},
+                )
+            except Exception as exc:
+                await logger.emit(
+                    agent_name="ResumeTailorAgent",
+                    task_id=task_id,
+                    status="failed",
+                    message=f"Resume tailoring failed: {str(exc)}",
+                    metadata={"company_id": company_id},
+                )
+
+        asyncio.create_task(run_resume_tailor())
 
     return {
         "task_id": task_id,
         "status": "started",
         "target_agent": target_agent,
-        "company": company.get("name"),
+        "company": company_id,
     }
 
 

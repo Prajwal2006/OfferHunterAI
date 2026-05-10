@@ -1,14 +1,15 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { useEffect, useState } from "react";
 import { AgentEvent } from "@/lib/types";
 
 const agentColors: Record<string, string> = {
   CompanyFinderAgent: "text-cyan-500",
   PersonalizationAgent: "text-secondary",
+  ContactDiscoveryAgent: "text-sky-500",
   EmailWriterAgent: "text-primary",
   ResumeTailorAgent: "text-indigo-500",
+  HumanReviewAgent: "text-amber-500",
   EmailSenderAgent: "text-emerald-500",
   FollowUpAgent: "text-amber-500",
   ResponseClassifierAgent: "text-pink-500",

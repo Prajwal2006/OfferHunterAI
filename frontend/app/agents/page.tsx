@@ -18,8 +18,11 @@ import { useRouter } from "next/navigation";
 const AGENT_TO_STEP: Record<string, string> = {
   CompanyFinderAgent: "CompanyFinder",
   PersonalizationAgent: "Personalization",
+  ContactDiscoveryAgent: "EmailWriter",
   EmailWriterAgent: "EmailWriter",
+  HumanReviewAgent: "Review",
   ReviewAgent: "Review",
+  ResumeTailorAgent: "Review",
   EmailSenderAgent: "Sender",
 };
 
@@ -34,14 +37,21 @@ const AGENTS: AgentInfo[] = [
   {
     name: "PersonalizationAgent",
     displayName: "Personalization",
-    description: "Extracts company insights and personalizes context",
+    description: "Builds fit scores, hooks, projects, links, and outreach strategy",
     status: "idle",
     icon: "target",
   },
   {
+    name: "ContactDiscoveryAgent",
+    displayName: "Contact Discovery",
+    description: "Finds and ranks founders, recruiters, and hiring contacts",
+    status: "idle",
+    icon: "users",
+  },
+  {
     name: "EmailWriterAgent",
     displayName: "Email Writer",
-    description: "Generates personalized outreach emails",
+    description: "Generates cold email variants, subjects, and saved drafts",
     status: "idle",
     icon: "edit",
   },
@@ -53,25 +63,18 @@ const AGENTS: AgentInfo[] = [
     icon: "file",
   },
   {
+    name: "HumanReviewAgent",
+    displayName: "Human Review",
+    description: "Routes drafts to the review editor with version history",
+    status: "idle",
+    icon: "shield",
+  },
+  {
     name: "EmailSenderAgent",
     displayName: "Email Sender",
-    description: "Sends approved emails via Gmail API",
+    description: "Future Gmail, Outlook, SendGrid, and Resend delivery layer",
     status: "idle",
     icon: "mail",
-  },
-  {
-    name: "FollowUpAgent",
-    displayName: "Follow Up",
-    description: "Sends automated follow-ups after no response",
-    status: "idle",
-    icon: "refresh",
-  },
-  {
-    name: "ResponseClassifierAgent",
-    displayName: "Response Classifier",
-    description: "Classifies and prioritizes email responses",
-    status: "idle",
-    icon: "brain",
   },
 ];
 
@@ -118,9 +121,12 @@ function useAgentState() {
     { agent: "CompanyFinderAgent", msg: "Finding contact emails for top 10 companies...", status: "running" as const },
     { agent: "CompanyFinderAgent", msg: "Found 18 companies Â· Top match: Anthropic (94%)", status: "completed" as const },
     { agent: "PersonalizationAgent", msg: "Fetching Anthropic careers page & engineering blog...", status: "running" as const },
-    { agent: "PersonalizationAgent", msg: "Extracted key themes: safety-focused, research-heavy, Python/PyTorch", status: "completed" as const },
-    { agent: "EmailWriterAgent", msg: "Generating cold email for Anthropic â€” highlighting ML background...", status: "running" as const },
+    { agent: "PersonalizationAgent", msg: "Built personalization profile: fit score 92, 3 hooks, 2 relevant projects", status: "completed" as const },
+    { agent: "ContactDiscoveryAgent", msg: "Ranking founders, CTOs, recruiters, and careers contacts...", status: "running" as const },
+    { agent: "ContactDiscoveryAgent", msg: "Ranked 7 contacts. Best recipient: engineering recruiting.", status: "completed" as const },
+    { agent: "EmailWriterAgent", msg: "Generating cold email variants and subject lines for Anthropic...", status: "running" as const },
     { agent: "EmailWriterAgent", msg: "Email drafted for Anthropic. Awaiting your approval in Review.", status: "completed" as const },
+    { agent: "HumanReviewAgent", msg: "Draft is available in the review editor with version history.", status: "running" as const },
     { agent: "ResumeTailorAgent", msg: "Tailoring resume bullets for Anthropic job descriptions...", status: "running" as const },
     { agent: "ResumeTailorAgent", msg: "Resume tailored. Added 3 bullets matching safety/alignment focus.", status: "completed" as const },
   ];
@@ -253,6 +259,14 @@ export default function AgentsPage() {
                     : "pending",
               },
               {
+                agent: "Contact Discovery",
+                status: ["EmailWriter", "Review", "Sender"].includes(
+                  company.workspace?.orchestration_stage || ""
+                )
+                  ? "completed"
+                  : "pending",
+              },
+              {
                 agent: "Email Writer",
                 status: ["EmailWriter", "Review", "Sender"].includes(
                   company.workspace?.orchestration_stage || ""
@@ -306,8 +320,12 @@ export default function AgentsPage() {
         router.push("/company-finder");
         return;
       }
-      if (stepId === "Personalization" || stepId === "EmailWriter") {
-        router.push("/pipeline");
+      if (stepId === "Personalization") {
+        router.push("/company-finder");
+        return;
+      }
+      if (stepId === "EmailWriter") {
+        router.push("/review");
         return;
       }
       if (stepId === "Review") {

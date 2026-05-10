@@ -6,7 +6,10 @@ import { PipelineItem } from "@/lib/types";
 const agentColors: Record<string, string> = {
   CompanyFinder: "bg-cyan-500",
   Personalization: "bg-secondary",
+  "Contact Discovery": "bg-sky-500",
   EmailWriter: "bg-primary",
+  "Email Writer": "bg-primary",
+  "Human Review": "bg-amber-500",
   Review: "bg-amber-500",
   Sender: "bg-emerald-500",
 };

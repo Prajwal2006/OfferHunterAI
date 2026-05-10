@@ -1,21 +1,10 @@
 import type { Metadata, Viewport } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import Navigation from "@/components/Navigation";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import { AnimatedBackground } from "@/components/AnimatedBackground";
 import { Footer } from "@/components/Footer";
 import { AuthProvider } from "@/components/AuthProvider";
-
-const inter = Inter({ 
-  subsets: ["latin"],
-  variable: "--font-sans",
-});
-
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ["latin"],
-  variable: "--font-mono",
-});
 
 export const metadata: Metadata = {
   title: "OfferHunter AI | AI-Powered Job Discovery & Outreach",
@@ -44,7 +33,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning data-scroll-behavior="smooth" className={`${inter.variable} ${jetbrainsMono.variable} bg-background`}>
+    <html lang="en" suppressHydrationWarning data-scroll-behavior="smooth" className="bg-background">
       <body className="min-h-screen flex flex-col bg-background text-foreground antialiased">
         <ThemeProvider
           attribute="class"

@@ -1,478 +1,1260 @@
-"use client";
+﻿"use client";
 
-import { useEffect, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Mail, CheckCircle, XCircle, Edit3, Send, Shield, ChevronDown, ChevronUp, Loader2 } from "lucide-react";
-import { Email, ResumeVersion } from "@/lib/types";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
+import {
+  AlertCircle,
+  Bot,
+  Check,
+  ChevronRight,
+  Clock,
+  Copy,
+  GitCompare,
+  History,
+  Loader2,
+  Mail,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Send,
+  Sparkles,
+  Star,
+  UserRound,
+  Wand2,
+  X,
+  Zap,
+} from "lucide-react";
 import { RequireAuth } from "@/components/RequireAuth";
-import { approveEmail, editEmail, fetchEmails, fetchResumes, rejectEmail, sendEmail } from "@/lib/api";
 import { useAuth } from "@/components/AuthProvider";
+import {
+  compareEmailVersions,
+  discoverOutreachContacts,
+  fetchDiscoveredCompanies,
+  fetchEmailDraft,
+  fetchEmailDrafts,
+  fetchOutreachContacts,
+  fetchPersonalization,
+  generateEmailDraft,
+  requestInlineAIEdit,
+  restoreEmailVersion,
+  updateEmailDraft,
+} from "@/lib/api";
+import type {
+  Company,
+  EmailDraft,
+  EmailVersion,
+  OutreachContact,
+  PersonalizationProfile,
+} from "@/lib/types";
 
-type ReviewStatus = "pending" | "approved" | "rejected" | "sent";
+// â”€â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-interface EmailWithLocalStatus extends Email {
-  localStatus: ReviewStatus;
-  editedSubject?: string;
-  editedBody?: string;
+const QUICK_ACTIONS = [
+  "make this shorter",
+  "sound more confident",
+  "make this friendlier",
+  "rewrite professionally",
+  "make this startup-style",
+  "remove fluff",
+  "mention my AI experience",
+  "improve the opening",
+  "strengthen the CTA",
+];
+
+type RightTab = "personalization" | "contacts" | "history";
+
+interface ToolbarState {
+  x: number;
+  y: number;
+  selectedText: string;
 }
 
+interface DiffLine {
+  type: "added" | "removed" | "unchanged";
+  text: string;
+}
+
+interface GenerateState {
+  companyId: string;
+  outreachType: string;
+}
+
+// â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function parseDiff(diff: string): DiffLine[] {
+  return diff
+    .split("\n")
+    .filter((l) => !l.startsWith("---") && !l.startsWith("+++") && !l.startsWith("@@"))
+    .map((l) => ({
+      type: (l.startsWith("+") ? "added" : l.startsWith("-") ? "removed" : "unchanged") as DiffLine["type"],
+      text: l.startsWith("+") || l.startsWith("-") ? l.slice(1) : l,
+    }));
+}
+
+function formatDate(iso?: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+// â”€â”€â”€ Main Page â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 export default function ReviewPage() {
-  const { session } = useAuth();
-  const [emails, setEmails] = useState<EmailWithLocalStatus[]>([]);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [resumes, setResumes] = useState<ResumeVersion[]>([]);
+  const { session, loading: authLoading } = useAuth();
+  const userId = session?.user?.id;
+
+  // â”€â”€â”€ Data state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [drafts, setDrafts] = useState<EmailDraft[]>([]);
+  const [companies, setCompanies] = useState<Company[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedDraft, setSelectedDraft] = useState<EmailDraft | null>(null);
+  const [versions, setVersions] = useState<EmailVersion[]>([]);
+  const [contacts, setContacts] = useState<OutreachContact[]>([]);
+  const [personalization, setPersonalization] = useState<PersonalizationProfile | null>(null);
+
+  // â”€â”€â”€ UI state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [generatingFor, setGeneratingFor] = useState<string | null>(null);
+
+  // â”€â”€â”€ AI editing state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [toolbar, setToolbar] = useState<ToolbarState | null>(null);
+  const [customInstruction, setCustomInstruction] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiPreview, setAiPreview] = useState<{
+    ai_edit_request_id: string;
+    original_text: string;
+    replacement_text: string;
+    updated_body: string;
+    diff: string;
+    rationale: string;
+  } | null>(null);
+
+  // â”€â”€â”€ Version compare state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [compareLeft, setCompareLeft] = useState<EmailVersion | null>(null);
+  const [compareRight, setCompareRight] = useState<EmailVersion | null>(null);
+  const [compareDiff, setCompareDiff] = useState<string | null>(null);
+  const [comparing, setComparing] = useState(false);
+
+  // â”€â”€â”€ Panel state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [rightTab, setRightTab] = useState<RightTab>("personalization");
+
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const saveDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // â”€â”€â”€ Effects â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  useEffect(() => {
+    if (authLoading) return;
+    if (!userId) {
+      setLoading(false);
+      setLoadError("Sign in to review your drafts.");
+      return;
+    }
+    void loadAll(userId);
+  }, [authLoading, userId]);
 
   useEffect(() => {
-    async function loadReviewData() {
-      const userId = session?.user?.id;
-      if (!userId) return;
+    if (!selectedId || !userId) return;
+    void loadSelected(selectedId, userId);
+  }, [selectedId, userId]);
 
-      try {
-        const [resumeResult, emailResult] = await Promise.all([
-          fetchResumes(userId),
-          fetchEmails(),
-        ]);
-        const loadedEmails = (emailResult.emails ?? []).map((e: Email) => ({
-          ...e,
-          localStatus:
-            e.status === "pending_approval"
-              ? "pending"
-              : e.status === "sent"
-              ? "sent"
-              : e.status === "approved"
-              ? "approved"
-              : "rejected",
-        }));
-        setResumes(resumeResult.resumes ?? []);
-        setEmails(loadedEmails);
-        setExpandedId(loadedEmails[0]?.id ?? null);
-      } catch {
-        setResumes([]);
-        setEmails([]);
-      } finally {
-        setLoading(false);
+  // Dismiss floating toolbar when clicking outside
+  useEffect(() => {
+    function onMouseDown(e: MouseEvent) {
+      if (
+        toolbarRef.current &&
+        !toolbarRef.current.contains(e.target as Node) &&
+        textareaRef.current &&
+        !textareaRef.current.contains(e.target as Node)
+      ) {
+        setToolbar(null);
       }
     }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, []);
 
-    loadReviewData();
-  }, [session?.user?.id]);
-
-  const pending = emails.filter((e) => e.localStatus === "pending");
-  const approved = emails.filter((e) => e.localStatus === "approved");
-  const sent = emails.filter((e) => e.localStatus === "sent");
-  const rejected = emails.filter((e) => e.localStatus === "rejected");
-
-  async function approve(id: string) {
-    setEmails((prev) =>
-      prev.map((e) => (e.id === id ? { ...e, localStatus: "approved" } : e))
-    );
+  // â”€â”€â”€ Data loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function loadAll(uid: string) {
+    setLoading(true);
+    setLoadError(null);
     try {
-      await approveEmail(id);
-    } catch {
-      // Keep optimistic state; SSE/backend errors are surfaced elsewhere.
+      const [draftsRes, companiesRes] = await Promise.allSettled([
+        fetchEmailDrafts(uid),
+        fetchDiscoveredCompanies(uid, { limit: 100 }),
+      ]);
+      const loadedDrafts = draftsRes.status === "fulfilled" ? draftsRes.value.drafts : [];
+      const loadedCompanies =
+        companiesRes.status === "fulfilled"
+          ? (companiesRes.value.visible_companies ?? companiesRes.value.companies ?? [])
+          : [];
+      setDrafts(loadedDrafts);
+      setCompanies(loadedCompanies);
+      if (loadedDrafts.length > 0) {
+        setSelectedId((cur) => {
+          if (cur && loadedDrafts.some((d) => d.id === cur)) return cur;
+          return loadedDrafts[0].id;
+        });
+      }
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Failed to load.");
+    } finally {
+      setLoading(false);
     }
   }
 
-  async function reject(id: string) {
-    setEmails((prev) =>
-      prev.map((e) => (e.id === id ? { ...e, localStatus: "rejected" } : e))
-    );
+  async function loadSelected(draftId: string, uid: string) {
     try {
-      await rejectEmail(id);
-    } catch {
-      // Keep optimistic state.
+      const result = await fetchEmailDraft(draftId);
+      setSelectedDraft(result.draft);
+      setVersions(result.versions);
+      setAiPreview(null);
+      setToolbar(null);
+      setCompareLeft(null);
+      setCompareRight(null);
+      setCompareDiff(null);
+      const [profileRes, contactsRes] = await Promise.allSettled([
+        fetchPersonalization(result.draft.company_id, uid),
+        fetchOutreachContacts(result.draft.company_id, uid),
+      ]);
+      setPersonalization(profileRes.status === "fulfilled" ? profileRes.value.profile : null);
+      setContacts(contactsRes.status === "fulfilled" ? contactsRes.value.contacts : []);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Failed to load draft.");
     }
   }
 
-  async function markSent(id: string) {
-    setEmails((prev) =>
-      prev.map((e) =>
-        e.id === id
-          ? { ...e, localStatus: "sent", sent_at: new Date().toISOString() }
-          : e
-      )
-    );
-    try {
-      await sendEmail(id);
-    } catch {
-      // Keep optimistic state.
+  // â”€â”€â”€ Save helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const persistSave = useCallback(
+    async (updates: Partial<EmailDraft>) => {
+      if (!selectedDraft || !userId) return;
+      setSaving(true);
+      const optimistic = { ...selectedDraft, ...updates };
+      setSelectedDraft(optimistic);
+      setDrafts((prev) => prev.map((d) => (d.id === optimistic.id ? optimistic : d)));
+      try {
+        const res = await updateEmailDraft(selectedDraft.id, { user_id: userId, ...updates });
+        setSelectedDraft(res.draft);
+        setDrafts((prev) => prev.map((d) => (d.id === res.draft.id ? res.draft : d)));
+        if ("body" in updates || "subject" in updates) {
+          const refreshed = await fetchEmailDraft(selectedDraft.id);
+          setVersions(refreshed.versions);
+        }
+      } catch {
+        setSelectedDraft(selectedDraft); // revert
+      } finally {
+        setSaving(false);
+      }
+    },
+    [selectedDraft, userId]
+  );
+
+  const debouncedSave = useCallback(
+    (updates: Partial<EmailDraft>) => {
+      if (saveDebounce.current) clearTimeout(saveDebounce.current);
+      saveDebounce.current = setTimeout(() => void persistSave(updates), 1500);
+    },
+    [persistSave]
+  );
+
+  function handleBodyChange(value: string) {
+    if (!selectedDraft) return;
+    setSelectedDraft({ ...selectedDraft, body: value });
+    debouncedSave({ body: value });
+  }
+
+  function handleSubjectChange(value: string) {
+    if (!selectedDraft) return;
+    setSelectedDraft({ ...selectedDraft, subject: value });
+    debouncedSave({ subject: value });
+  }
+
+  // â”€â”€â”€ Selection / floating toolbar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  function onTextareaMouseUp(e: React.MouseEvent<HTMLTextAreaElement>) {
+    const node = e.currentTarget;
+    const start = node.selectionStart;
+    const end = node.selectionEnd;
+    if (end > start) {
+      const text = node.value.slice(start, end);
+      setToolbar({ x: e.clientX, y: e.clientY, selectedText: text });
+      setCustomInstruction("");
+      setAiPreview(null);
+    } else {
+      setToolbar(null);
     }
   }
 
-  function startEdit(id: string) {
-    setEditingId(id);
-    setExpandedId(id);
-  }
-
-  function saveEdit(id: string, subject: string, body: string) {
-    setEmails((prev) =>
-      prev.map((e) =>
-        e.id === id ? { ...e, editedSubject: subject, editedBody: body } : e
-      )
-    );
-    setEditingId(null);
-  }
-
-  async function setResumeVersion(id: string, resumeVersionId: string) {
-    setEmails((prev) =>
-      prev.map((e) => (e.id === id ? { ...e, resume_version_id: resumeVersionId } : e))
-    );
-
+  // â”€â”€â”€ AI editing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function runAIEdit(instruction: string) {
+    if (!selectedDraft || !userId) return;
+    const selected = toolbar?.selectedText ?? selectedDraft.body;
+    setAiLoading(true);
+    setToolbar(null);
     try {
-      await editEmail(id, { resume_version_id: resumeVersionId });
-    } catch {
-      // Keep optimistic UI state even if backend is in demo mode.
+      const preview = await requestInlineAIEdit(selectedDraft.id, {
+        user_id: userId,
+        instruction,
+        selected_text: selected,
+        full_body: selectedDraft.body,
+        subject: selectedDraft.subject,
+      });
+      setAiPreview(preview);
+    } finally {
+      setAiLoading(false);
     }
   }
 
-  const statusColor = {
-    pending: "border-amber-500/30 bg-amber-500/5",
-    approved: "border-emerald-500/30 bg-emerald-500/5",
-    rejected: "border-red-500/30 bg-red-500/5",
-    sent: "border-primary/30 bg-primary/5",
-  };
+  async function acceptAIEdit() {
+    if (!aiPreview) return;
+    await persistSave({ body: aiPreview.updated_body });
+    setAiPreview(null);
+  }
 
-  const statusBadge = {
-    pending: "bg-amber-500/20 text-amber-500 border-amber-500/30",
-    approved: "bg-emerald-500/20 text-emerald-500 border-emerald-500/30",
-    rejected: "bg-red-500/20 text-red-500 border-red-500/30",
-    sent: "bg-primary/20 text-primary border-primary/30",
-  };
+  // â”€â”€â”€ Version restore / compare â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function restoreVersion(version: EmailVersion) {
+    if (!selectedDraft || !userId) return;
+    const res = await restoreEmailVersion(selectedDraft.id, version.id, userId);
+    setSelectedDraft(res.draft);
+    if (userId) await loadSelected(selectedDraft.id, userId);
+  }
 
+  async function runVersionCompare(left: EmailVersion, right: EmailVersion) {
+    if (!selectedDraft) return;
+    setCompareLeft(left);
+    setCompareRight(right);
+    setComparing(true);
+    try {
+      const res = await compareEmailVersions(selectedDraft.id, left.id, right.id);
+      setCompareDiff(res.body_diff ?? null);
+    } catch {
+      setCompareDiff(null);
+    } finally {
+      setComparing(false);
+    }
+  }
+
+  // â”€â”€â”€ Generate draft for company â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function generateForCompany(company: Company, outreachType = "cold_email") {
+    if (!userId) return;
+    setGeneratingFor(company.id);
+    try {
+      const res = await generateEmailDraft({ user_id: userId, company_id: company.id, outreach_type: outreachType });
+      const newDraft = res.draft;
+      setDrafts((prev) => {
+        const exists = prev.find((d) => d.company_id === company.id);
+        return exists ? prev.map((d) => (d.company_id === company.id ? newDraft : d)) : [newDraft, ...prev];
+      });
+      setSelectedId(newDraft.id);
+    } catch (err) {
+      console.error("Failed to generate draft", err);
+    } finally {
+      setGeneratingFor(null);
+    }
+  }
+
+  // â”€â”€â”€ Refresh contacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function refreshContacts() {
+    if (!selectedDraft || !userId) return;
+    const res = await discoverOutreachContacts({ user_id: userId, company_id: selectedDraft.company_id });
+    setContacts(res.contacts);
+  }
+
+  // â”€â”€â”€ Derived state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const draftedCompanyIds = useMemo(() => new Set(drafts.map((d) => d.company_id)), [drafts]);
+  const companiesWithoutDraft = useMemo(
+    () => companies.filter((c) => !draftedCompanyIds.has(c.id)).slice(0, 30),
+    [companies, draftedCompanyIds]
+  );
+  const selectedSubjects = useMemo(
+    () =>
+      selectedDraft?.subjects?.length
+        ? selectedDraft.subjects
+        : selectedDraft
+        ? [{ label: "Current", subject: selectedDraft.subject }]
+        : [],
+    [selectedDraft]
+  );
+  const selectedVariants = useMemo(
+    () => (selectedDraft?.variants ? Object.keys(selectedDraft.variants) : []),
+    [selectedDraft]
+  );
+
+  // â”€â”€â”€ Render â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   return (
     <RequireAuth>
-      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      {/* Header */}
-      <motion.div
-        initial={{ opacity: 0, y: -10 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="mb-8"
-      >
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-3 mb-2">
-              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-secondary flex items-center justify-center">
-                <Mail className="w-5 h-5 text-primary-foreground" />
-              </div>
-              <h1 className="text-2xl font-bold text-foreground">
-                Email Review
-              </h1>
+      {/* Floating toolbar (portal-like fixed position) */}
+      {toolbar && !aiLoading && !aiPreview && (
+        <FloatingAIToolbar
+          ref={toolbarRef}
+          position={toolbar}
+          onAction={(a) => void runAIEdit(a)}
+          onDismiss={() => setToolbar(null)}
+        />
+      )}
+
+      <div className="flex min-h-[calc(100vh-4rem)] flex-col bg-background">
+        {/* Header */}
+        <header className="shrink-0 border-b border-border bg-card/70">
+          <div className="mx-auto flex max-w-400 items-center justify-between px-4 py-3 sm:px-6">
+            <div>
+              <h1 className="text-xl font-semibold text-foreground">Email Review</h1>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                AI-personalized drafts Â· inline editing Â· version history
+              </p>
             </div>
-            <p className="text-sm text-muted-foreground">
-              Review and approve AI-drafted emails before sending
-            </p>
-          </div>
-
-          {/* HITL Notice */}
-          <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-secondary/10 border border-secondary/30">
-            <Shield className="w-4 h-4 text-secondary flex-shrink-0" />
-            <span className="text-xs text-secondary font-medium">
-              Human-in-the-Loop Required
-            </span>
-          </div>
-        </div>
-
-        {/* Stats */}
-        <div className="grid grid-cols-4 gap-3 mt-6">
-          {[
-            { label: "Pending", count: pending.length, color: "text-amber-500", gradient: "from-amber-500/20 to-amber-500/5" },
-            { label: "Approved", count: approved.length, color: "text-emerald-500", gradient: "from-emerald-500/20 to-emerald-500/5" },
-            { label: "Sent", count: sent.length, color: "text-primary", gradient: "from-primary/20 to-primary/5" },
-            { label: "Rejected", count: rejected.length, color: "text-red-500", gradient: "from-red-500/20 to-red-500/5" },
-          ].map((s, i) => (
-            <motion.div
-              key={s.label}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: i * 0.05 }}
-              whileHover={{ scale: 1.02, y: -2 }}
-              className="glass border border-border rounded-xl p-4 text-center relative overflow-hidden group"
-            >
-              <div className={`absolute inset-0 bg-gradient-to-br ${s.gradient} opacity-0 group-hover:opacity-100 transition-opacity`} />
-              <div className={`relative z-10 text-2xl font-bold ${s.color}`}>{s.count}</div>
-              <div className="relative z-10 text-xs text-muted-foreground">{s.label}</div>
-            </motion.div>
-          ))}
-        </div>
-      </motion.div>
-
-      {/* Email List */}
-      {loading && (
-        <div className="flex items-center justify-center py-16 text-muted-foreground">
-          <Loader2 className="w-5 h-5 animate-spin mr-2" />
-          Loading email drafts
-        </div>
-      )}
-      {!loading && emails.length === 0 && (
-        <div className="text-center py-16 text-sm text-muted-foreground">
-          No email drafts are waiting for review.
-        </div>
-      )}
-      <div className="space-y-4">
-        <AnimatePresence>
-          {!loading && emails.map((email, index) => {
-            const isExpanded = expandedId === email.id;
-            const isEditing = editingId === email.id;
-
-            return (
-              <motion.div
-                key={email.id}
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: index * 0.05 }}
-                className={`glass border rounded-2xl overflow-hidden ${statusColor[email.localStatus]}`}
-              >
-                {/* Header row */}
+            <div className="flex items-center gap-3">
+              {saving && (
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Savingâ€¦
+                </span>
+              )}
+              {!saving && selectedDraft && (
+                <span className="flex items-center gap-1.5 text-xs text-emerald-600">
+                  <Check className="h-3.5 w-3.5" /> Saved
+                </span>
+              )}
+              {userId && (
                 <button
-                  onClick={() => setExpandedId(isExpanded ? null : email.id)}
-                  className="w-full flex items-center gap-4 p-4 text-left hover:bg-muted/30 transition-colors"
+                  onClick={() => void loadAll(userId)}
+                  className="rounded-md border border-border p-2 text-muted-foreground hover:text-foreground"
+                  title="Refresh"
                 >
-                  <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-primary/20 to-secondary/20 border border-border flex items-center justify-center text-lg font-bold text-foreground flex-shrink-0">
-                    {email.company_name[0]}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-semibold text-foreground">
-                        {email.company_name}
+                  <RefreshCw className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+          </div>
+        </header>
+
+        {/* Three-panel grid */}
+        <div className="flex-1 overflow-hidden lg:grid lg:grid-cols-[260px_minmax(0,1fr)_320px]">
+
+          {/* â”€â”€ Sidebar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+          <aside className="overflow-y-auto border-b border-border bg-card/40 lg:border-b-0 lg:border-r lg:max-h-[calc(100vh-7rem)]">
+            <div className="sticky top-0 z-10 border-b border-border/40 bg-card/80 px-4 py-2.5 backdrop-blur-sm">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                {drafts.length} Draft{drafts.length !== 1 ? "s" : ""}
+                {companiesWithoutDraft.length > 0 && ` Â· ${companiesWithoutDraft.length} pending`}
+              </span>
+            </div>
+
+            {loading ? (
+              <div className="flex items-center gap-2 px-4 py-8 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" /> Loadingâ€¦
+              </div>
+            ) : (
+              <>
+                {/* Existing drafts */}
+                {drafts.map((draft) => (
+                  <button
+                    key={draft.id}
+                    onClick={() => setSelectedId(draft.id)}
+                    className={`w-full border-l-2 px-4 py-3 text-left transition-colors ${
+                      draft.id === selectedId
+                        ? "border-primary bg-primary/8 text-foreground"
+                        : "border-transparent text-foreground/80 hover:bg-muted/40"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate text-sm font-medium">{draft.company_name}</span>
+                      <StatusPill status={draft.status} />
+                    </div>
+                    <div className="mt-0.5 truncate text-xs text-muted-foreground">{draft.subject}</div>
+                  </button>
+                ))}
+
+                {/* Companies needing drafts */}
+                {companiesWithoutDraft.length > 0 && (
+                  <>
+                    <div className="mt-1 border-t border-border/40 px-4 py-2">
+                      <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+                        Generate Draft
                       </span>
-                      <span
-                        className={`px-2 py-0.5 rounded-full text-xs font-medium border ${statusBadge[email.localStatus]}`}
+                    </div>
+                    {companiesWithoutDraft.map((company) => (
+                      <div
+                        key={company.id}
+                        className="flex items-center justify-between border-l-2 border-transparent px-4 py-2.5 hover:bg-muted/20"
                       >
-                        {email.localStatus.charAt(0).toUpperCase() + email.localStatus.slice(1)}
-                      </span>
-                    </div>
-                    <div className="text-xs text-muted-foreground mt-0.5 truncate">
-                      {email.editedSubject ?? email.subject}
-                    </div>
-                    {email.recipient_email && (
-                      <div className="text-xs text-muted-foreground/70 mt-0.5">
-                        To: {email.recipient_email}
+                        <span className="truncate text-sm text-muted-foreground">{company.name}</span>
+                        <button
+                          onClick={() => void generateForCompany(company)}
+                          disabled={generatingFor === company.id}
+                          className="ml-2 flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:border-primary/40 hover:text-primary disabled:opacity-40"
+                        >
+                          {generatingFor === company.id ? (
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          ) : (
+                            <Plus className="h-3 w-3" />
+                          )}
+                          {generatingFor === company.id ? "" : "Draft"}
+                        </button>
                       </div>
+                    ))}
+                  </>
+                )}
+
+                {!loading && drafts.length === 0 && companiesWithoutDraft.length === 0 && (
+                  <div className="space-y-2 px-4 py-8 text-sm text-muted-foreground">
+                    <p>{loadError ?? "No drafts yet. Run the Company Finder first."}</p>
+                    {userId && (
+                      <button
+                        onClick={() => void loadAll(userId)}
+                        className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted"
+                      >
+                        Retry
+                      </button>
                     )}
                   </div>
-                  <div className="text-muted-foreground flex-shrink-0">
-                    {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                  </div>
-                </button>
+                )}
+              </>
+            )}
+          </aside>
 
-                {/* Expanded content */}
-                <AnimatePresence>
-                  {isExpanded && (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: "auto", opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      transition={{ duration: 0.2 }}
-                      className="overflow-hidden"
+          {/* â”€â”€ Canvas Editor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+          <main className="overflow-y-auto lg:max-h-[calc(100vh-7rem)]">
+            {!selectedDraft ? (
+              <EmptyEditor loading={loading} error={loadError} onRetry={() => userId && void loadAll(userId)} />
+            ) : (
+              <div className="mx-auto max-w-3xl space-y-5 px-4 py-6 sm:px-6">
+
+                {/* Actions bar */}
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-64 space-y-1">
+                    <label className="text-xs font-medium text-muted-foreground">To</label>
+                    <select
+                      value={selectedDraft.recipient_email ?? ""}
+                      onChange={(e) => void persistSave({ recipient_email: e.target.value })}
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground"
                     >
-                      <div className="px-4 pb-4 border-t border-border/50">
-                        {isEditing ? (
-                          <EmailEditor
-                            email={email}
-                            onSave={(subject, body) => saveEdit(email.id, subject, body)}
-                            onCancel={() => setEditingId(null)}
-                          />
-                        ) : (
-                          <EmailViewer
-                            email={email}
-                            resumes={resumes}
-                            onApprove={() => void approve(email.id)}
-                            onReject={() => void reject(email.id)}
-                            onEdit={() => startEdit(email.id)}
-                            onSend={() => void markSent(email.id)}
-                            onResumeChange={(resumeVersionId) =>
-                              setResumeVersion(email.id, resumeVersionId)
-                            }
-                          />
-                        )}
+                      <option value="">Choose recipientâ€¦</option>
+                      {contacts.map((c) => (
+                        <option key={c.email} value={c.email}>
+                          {c.name ? `${c.name} (${c.role ?? ""})` : c.role} â€” {c.email}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => void persistSave({ status: "approved" })}
+                      className={`inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition ${
+                        selectedDraft.status === "approved"
+                          ? "bg-emerald-600 text-white"
+                          : "border border-emerald-600/40 text-emerald-600 hover:bg-emerald-600 hover:text-white"
+                      }`}
+                    >
+                      <Check className="h-4 w-4" />
+                      {selectedDraft.status === "approved" ? "Approved" : "Approve"}
+                    </button>
+                    <button
+                      onClick={() => void persistSave({ status: "sent" })}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"
+                    >
+                      <Send className="h-4 w-4" />
+                      Mark Sent
+                    </button>
+                    <button
+                      onClick={() => void persistSave({ status: "rejected" })}
+                      title="Reject"
+                      className="rounded-md border border-border p-2 text-muted-foreground hover:text-red-500"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Variant tabs */}
+                {selectedVariants.length > 0 && (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs text-muted-foreground">Variant:</span>
+                    {selectedVariants.map((key) => (
+                      <button
+                        key={key}
+                        onClick={() =>
+                          void persistSave({ selected_variant: key, body: selectedDraft.variants[key] ?? "" })
+                        }
+                        className={`rounded-md border px-3 py-1 text-xs font-medium transition ${
+                          selectedDraft.selected_variant === key
+                            ? "border-primary bg-primary/10 text-primary"
+                            : "border-border text-muted-foreground hover:border-primary/30 hover:text-foreground"
+                        }`}
+                      >
+                        {key.replace(/_/g, " ")}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* Subject */}
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <span className="w-14 shrink-0 text-xs text-muted-foreground">Subject</span>
+                    {selectedSubjects.length > 1 && (
+                      <select
+                        value={selectedDraft.subject}
+                        onChange={(e) => void persistSave({ subject: e.target.value })}
+                        className="max-w-52 rounded border border-border bg-background px-2 py-1 text-xs text-muted-foreground"
+                      >
+                        {selectedSubjects.map((s) => (
+                          <option key={`${s.label}|${s.subject}`} value={s.subject}>
+                            {s.label}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                  <input
+                    value={selectedDraft.subject}
+                    onChange={(e) => handleSubjectChange(e.target.value)}
+                    placeholder="Email subjectâ€¦"
+                    className="w-full rounded-md border border-border bg-background px-4 py-3 text-base font-medium text-foreground outline-none placeholder:text-muted-foreground/40 focus:ring-2 focus:ring-primary/30"
+                  />
+                </div>
+
+                {/* Body editor */}
+                <div className="relative">
+                  <textarea
+                    ref={textareaRef}
+                    value={selectedDraft.body}
+                    onChange={(e) => handleBodyChange(e.target.value)}
+                    onMouseUp={onTextareaMouseUp}
+                    rows={22}
+                    placeholder="Email bodyâ€¦"
+                    className="min-h-125 w-full resize-y rounded-md border border-border bg-background px-5 py-4 font-mono text-sm leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/30 focus:ring-2 focus:ring-primary/30"
+                  />
+                  {aiLoading && (
+                    <div className="absolute inset-0 flex items-center justify-center rounded-md bg-background/70">
+                      <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2.5 shadow-sm">
+                        <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                        <span className="text-sm">Generating AI editâ€¦</span>
                       </div>
-                    </motion.div>
+                    </div>
                   )}
-                </AnimatePresence>
-              </motion.div>
-            );
-          })}
-        </AnimatePresence>
-      </div>
+                </div>
+
+                {/* AI diff preview */}
+                {aiPreview && (
+                  <AIDiffPreview
+                    preview={aiPreview}
+                    onAccept={() => void acceptAIEdit()}
+                    onReject={() => setAiPreview(null)}
+                  />
+                )}
+
+                {/* AI toolbar (non-floating / always visible strip) */}
+                <div className="rounded-md border border-border bg-card/60 p-3 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Wand2 className="h-4 w-4 shrink-0 text-primary" />
+                    <input
+                      value={customInstruction}
+                      onChange={(e) => setCustomInstruction(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && customInstruction.trim()) void runAIEdit(customInstruction.trim());
+                      }}
+                      placeholder="Custom instruction (e.g. 'make the opening bold')â€¦ or select text above"
+                      className="min-w-48 flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-primary/30"
+                    />
+                    <button
+                      onClick={() => customInstruction.trim() && void runAIEdit(customInstruction.trim())}
+                      disabled={aiLoading || !customInstruction.trim()}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-50"
+                    >
+                      {aiLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                      Apply
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {QUICK_ACTIONS.slice(0, 7).map((a) => (
+                      <button
+                        key={a}
+                        onClick={() => void runAIEdit(a)}
+                        disabled={aiLoading}
+                        className="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground disabled:opacity-40"
+                      >
+                        {a}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Metadata footer */}
+                <div className="flex flex-wrap items-center gap-4 border-t border-border/40 pt-3 text-xs text-muted-foreground">
+                  <span>v{selectedDraft.version_number}</span>
+                  <span className="capitalize">{selectedDraft.outreach_type?.replace(/_/g, " ")}</span>
+                  {selectedDraft.last_edited_at && <span>Edited {formatDate(selectedDraft.last_edited_at)}</span>}
+                </div>
+              </div>
+            )}
+          </main>
+
+          {/* â”€â”€ Right Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+          <aside className="border-l border-border bg-card/30 overflow-y-auto lg:max-h-[calc(100vh-7rem)]">
+            {/* Tabs */}
+            <div className="sticky top-0 z-10 flex border-b border-border/40 bg-card/80 backdrop-blur-sm">
+              {(["personalization", "contacts", "history"] as RightTab[]).map((tab) => (
+                <button
+                  key={tab}
+                  onClick={() => setRightTab(tab)}
+                  className={`flex flex-1 items-center justify-center gap-1 py-2.5 text-xs font-medium capitalize transition ${
+                    rightTab === tab
+                      ? "border-b-2 border-primary text-primary"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {tab === "personalization" && <Bot className="h-3.5 w-3.5" />}
+                  {tab === "contacts" && <UserRound className="h-3.5 w-3.5" />}
+                  {tab === "history" && <History className="h-3.5 w-3.5" />}
+                  {tab === "personalization" ? "Fit" : tab.charAt(0).toUpperCase() + tab.slice(1)}
+                </button>
+              ))}
+            </div>
+
+            <div className="p-4">
+              {rightTab === "personalization" && <PersonalizationPanel profile={personalization} />}
+              {rightTab === "contacts" && (
+                <ContactsPanel
+                  contacts={contacts}
+                  selectedEmail={selectedDraft?.recipient_email ?? null}
+                  onSelect={(email) => selectedDraft && void persistSave({ recipient_email: email })}
+                  onRefresh={() => void refreshContacts()}
+                />
+              )}
+              {rightTab === "history" && (
+                <VersionPanel
+                  versions={versions}
+                  compareLeft={compareLeft}
+                  compareRight={compareRight}
+                  compareDiff={compareDiff}
+                  comparing={comparing}
+                  onRestore={(v) => void restoreVersion(v)}
+                  onCompare={(l, r) => void runVersionCompare(l, r)}
+                  onClearCompare={() => {
+                    setCompareLeft(null);
+                    setCompareRight(null);
+                    setCompareDiff(null);
+                  }}
+                />
+              )}
+            </div>
+          </aside>
+        </div>
       </div>
     </RequireAuth>
   );
 }
 
-function EmailViewer({
-  email,
-  resumes,
-  onApprove,
-  onReject,
-  onEdit,
-  onSend,
-  onResumeChange,
+// â”€â”€â”€ FloatingAIToolbar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+const FloatingAIToolbar = ({
+  ref,
+  position,
+  onAction,
+  onDismiss,
 }: {
-  email: EmailWithLocalStatus;
-  resumes: ResumeVersion[];
-  onApprove: () => void;
-  onReject: () => void;
-  onEdit: () => void;
-  onSend: () => void;
-  onResumeChange: (resumeVersionId: string) => void;
-}) {
-  const displaySubject = email.editedSubject ?? email.subject;
-  const displayBody = email.editedBody ?? email.body;
+  ref: React.RefObject<HTMLDivElement | null>;
+  position: ToolbarState;
+  onAction: (action: string) => void;
+  onDismiss: () => void;
+}) => {
+  // Keep inside viewport
+  const safeX = typeof window !== "undefined" ? Math.min(Math.max(8, position.x - 140), window.innerWidth - 300) : position.x;
+  const safeY = typeof window !== "undefined" ? Math.max(8, position.y - 80) : position.y;
 
   return (
-    <div className="mt-4 space-y-4">
-      {/* Subject */}
-      <div>
-        <div className="text-xs text-muted-foreground uppercase tracking-wider mb-1">Subject</div>
-        <div className="text-sm text-foreground font-medium">{displaySubject}</div>
+    <div
+      ref={ref}
+      style={{ position: "fixed", left: safeX, top: safeY, zIndex: 9999 }}
+      className="w-72 rounded-lg border border-border bg-card shadow-xl"
+    >
+      <div className="flex items-center justify-between border-b border-border/40 px-3 py-2">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+          <Sparkles className="h-3.5 w-3.5 text-primary" />
+          AI Edit Â· <span className="text-foreground">{position.selectedText.length} chars selected</span>
+        </div>
+        <button onClick={onDismiss} className="text-muted-foreground hover:text-foreground">
+          <X className="h-3.5 w-3.5" />
+        </button>
       </div>
-
-      {/* Body */}
-      <div>
-        <div className="text-xs text-muted-foreground uppercase tracking-wider mb-2">Email Body</div>
-        <div className="bg-muted/30 rounded-xl p-4 text-sm text-foreground/90 whitespace-pre-wrap font-mono leading-relaxed border border-border">
-          {displayBody}
-        </div>
+      <div className="flex flex-wrap gap-1.5 p-2.5">
+        {QUICK_ACTIONS.map((a) => (
+          <button
+            key={a}
+            onClick={() => onAction(a)}
+            className="rounded-full bg-muted px-2.5 py-0.5 text-xs text-foreground hover:bg-primary hover:text-primary-foreground transition"
+          >
+            {a}
+          </button>
+        ))}
       </div>
-
-      <div>
-        <div className="text-xs text-muted-foreground uppercase tracking-wider mb-1">
-          Resume Version For This Email
-        </div>
-        <select
-          value={email.resume_version_id ?? ""}
-          onChange={(e) => onResumeChange(e.target.value)}
-          className="w-full sm:w-auto bg-muted/30 border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
-        >
-          <option value="">No resume selected</option>
-          {resumes.map((resume) => (
-            <option key={resume.id} value={resume.id}>
-              {resume.version_label}{resume.is_active ? " (active)" : ""}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {/* Action buttons */}
-      {email.localStatus === "pending" && (
-        <div className="flex items-center gap-3 pt-2">
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={onApprove}
-            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 text-emerald-500 text-sm font-medium hover:bg-emerald-500/30 transition-colors"
-          >
-            <CheckCircle className="w-4 h-4" />
-            Approve
-          </motion.button>
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={onEdit}
-            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary/20 border border-primary/30 text-primary text-sm font-medium hover:bg-primary/30 transition-colors"
-          >
-            <Edit3 className="w-4 h-4" />
-            Edit
-          </motion.button>
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={onReject}
-            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-red-500/20 border border-red-500/30 text-red-500 text-sm font-medium hover:bg-red-500/30 transition-colors"
-          >
-            <XCircle className="w-4 h-4" />
-            Reject
-          </motion.button>
-        </div>
-      )}
-
-      {email.localStatus === "approved" && (
-        <div className="flex items-center gap-3 pt-2">
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={onSend}
-            className="btn-futuristic flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-primary to-secondary text-primary-foreground text-sm font-semibold shadow-lg shadow-primary/20"
-          >
-            <Send className="w-4 h-4" />
-            Send via Gmail
-          </motion.button>
-          <span className="text-xs text-emerald-500 font-medium">
-            Approved — ready to send
-          </span>
-        </div>
-      )}
-
-      {email.localStatus === "sent" && (
-        <div className="flex items-center gap-2 pt-2 text-sm text-primary">
-          <Send className="w-4 h-4" />
-          Sent{email.sent_at ? ` at ${new Date(email.sent_at).toLocaleString()}` : ""}
-        </div>
-      )}
-
-      {email.localStatus === "rejected" && (
-        <div className="flex items-center gap-2 pt-2 text-sm text-red-500">
-          <XCircle className="w-4 h-4" />
-          Rejected — email will not be sent
-        </div>
-      )}
     </div>
   );
-}
+};
 
-function EmailEditor({
-  email,
-  onSave,
-  onCancel,
+// â”€â”€â”€ AIDiffPreview â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function AIDiffPreview({
+  preview,
+  onAccept,
+  onReject,
 }: {
-  email: EmailWithLocalStatus;
-  onSave: (subject: string, body: string) => void;
-  onCancel: () => void;
+  preview: {
+    original_text: string;
+    replacement_text: string;
+    updated_body: string;
+    diff: string;
+    rationale: string;
+  };
+  onAccept: () => void;
+  onReject: () => void;
 }) {
-  const [subject, setSubject] = useState(email.editedSubject ?? email.subject);
-  const [body, setBody] = useState(email.editedBody ?? email.body);
-
+  const diffLines = useMemo(() => parseDiff(preview.diff), [preview.diff]);
   return (
-    <div className="mt-4 space-y-4">
-      <div>
-        <label className="block text-xs text-muted-foreground uppercase tracking-wider mb-1">
-          Subject
-        </label>
-        <input
-          value={subject}
-          onChange={(e) => setSubject(e.target.value)}
-          className="w-full bg-muted/30 border border-border rounded-xl px-4 py-2.5 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50 transition-all"
-        />
+    <div className="rounded-lg border border-primary/20 bg-card p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <Sparkles className="h-4 w-4 text-primary" />
+          AI Edit Preview
+        </div>
+        <button onClick={onReject} className="text-muted-foreground hover:text-foreground">
+          <X className="h-4 w-4" />
+        </button>
       </div>
-      <div>
-        <label className="block text-xs text-muted-foreground uppercase tracking-wider mb-1">
-          Body
-        </label>
-        <textarea
-          value={body}
-          onChange={(e) => setBody(e.target.value)}
-          rows={12}
-          className="w-full bg-muted/30 border border-border rounded-xl px-4 py-3 text-sm text-foreground font-mono leading-relaxed focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50 transition-all resize-none"
-        />
+
+      <div className="grid gap-3 md:grid-cols-2">
+        <div>
+          <div className="mb-1.5 text-xs font-semibold uppercase text-muted-foreground">Proposed</div>
+          <div className="max-h-48 overflow-auto rounded-md border border-border bg-muted/20 p-3 text-sm whitespace-pre-wrap">
+            {preview.replacement_text}
+          </div>
+        </div>
+        <div>
+          <div className="mb-1.5 text-xs font-semibold uppercase text-muted-foreground">Diff</div>
+          <div className="max-h-48 overflow-auto rounded-md border border-border bg-muted/20 p-2">
+            {diffLines.length > 0 ? (
+              diffLines.map((line, i) => (
+                <div
+                  key={i}
+                  className={`px-2 py-0.5 font-mono text-xs ${
+                    line.type === "added"
+                      ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                      : line.type === "removed"
+                      ? "bg-red-500/10 text-red-600 dark:text-red-400 line-through"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  {line.text || " "}
+                </div>
+              ))
+            ) : (
+              <p className="p-2 text-xs text-muted-foreground">Full replacement (no line diff).</p>
+            )}
+          </div>
+        </div>
       </div>
-      <div className="flex items-center gap-3">
-        <motion.button
-          whileHover={{ scale: 1.02 }}
-          whileTap={{ scale: 0.98 }}
-          onClick={() => onSave(subject, body)}
-          className="px-4 py-2 rounded-xl bg-primary/20 border border-primary/30 text-primary text-sm font-medium hover:bg-primary/30 transition-colors"
-        >
-          Save Changes
-        </motion.button>
+
+      {preview.rationale && <p className="text-xs italic text-muted-foreground">{preview.rationale}</p>}
+
+      <div className="flex gap-2">
         <button
-          onClick={onCancel}
-          className="px-4 py-2 rounded-xl text-muted-foreground text-sm hover:text-foreground transition-colors"
+          onClick={onAccept}
+          className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white"
         >
-          Cancel
+          <Check className="h-4 w-4" /> Accept
+        </button>
+        <button
+          onClick={onReject}
+          className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm text-muted-foreground"
+        >
+          <X className="h-4 w-4" /> Reject
         </button>
       </div>
     </div>
   );
 }
+
+// â”€â”€â”€ PersonalizationPanel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function PersonalizationPanel({ profile }: { profile: PersonalizationProfile | null }) {
+  if (!profile) {
+    return (
+      <div className="rounded-md border border-border/40 bg-muted/20 p-4 text-sm text-muted-foreground">
+        No personalization profile for this draft.
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-4 text-sm">
+      {/* Fit score */}
+      <div className="flex items-center justify-between rounded-md border border-border bg-background p-3">
+        <span className="font-medium text-foreground">Fit Score</span>
+        <div className="flex items-center gap-2">
+          <div className="h-2 w-24 overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-primary transition-all"
+              style={{ width: `${profile.fit_score}%` }}
+            />
+          </div>
+          <span className="font-semibold text-primary">{profile.fit_score}</span>
+        </div>
+      </div>
+
+      {/* Summary */}
+      <p className="text-xs leading-relaxed text-muted-foreground">{profile.personalization_summary}</p>
+
+      {/* Alignment */}
+      {profile.company_alignment.length > 0 && (
+        <div>
+          <div className="mb-1.5 text-xs font-semibold uppercase text-muted-foreground/60">Alignment</div>
+          <ul className="space-y-1">
+            {profile.company_alignment.map((a) => (
+              <li key={a} className="flex items-start gap-1.5 text-xs text-foreground">
+                <Zap className="mt-0.5 h-3 w-3 shrink-0 text-primary" />
+                {a}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Skills */}
+      {profile.relevant_skills.length > 0 && (
+        <div>
+          <div className="mb-1.5 text-xs font-semibold uppercase text-muted-foreground/60">Relevant Skills</div>
+          <div className="flex flex-wrap gap-1.5">
+            {profile.relevant_skills.slice(0, 10).map((s) => (
+              <span key={s} className="rounded bg-primary/10 px-2 py-0.5 text-xs text-primary">{s}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Hooks */}
+      {profile.recommended_hooks.length > 0 && (
+        <div>
+          <div className="mb-1.5 text-xs font-semibold uppercase text-muted-foreground/60">Hooks</div>
+          <ul className="space-y-1.5">
+            {profile.recommended_hooks.slice(0, 3).map((h) => (
+              <li key={h} className="rounded-md bg-muted/40 p-2 text-xs text-foreground">{h}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Suggested links */}
+      {profile.suggested_links.length > 0 && (
+        <div>
+          <div className="mb-1.5 text-xs font-semibold uppercase text-muted-foreground/60">Include Links</div>
+          <ul className="space-y-1">
+            {profile.suggested_links.map((l) => (
+              <li key={l.url ?? l.type} className="flex items-center gap-1.5 text-xs">
+                <ChevronRight className="h-3 w-3 text-muted-foreground" />
+                <span className="font-medium capitalize text-foreground">{l.type}</span>
+                <span className="truncate text-muted-foreground">{l.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// â”€â”€â”€ ContactsPanel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function ContactsPanel({
+  contacts,
+  selectedEmail,
+  onSelect,
+  onRefresh,
+}: {
+  contacts: OutreachContact[];
+  selectedEmail: string | null;
+  onSelect: (email: string) => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase text-muted-foreground/60">Ranked Contacts</span>
+        <button onClick={onRefresh} className="text-muted-foreground hover:text-foreground" title="Rediscover">
+          <RefreshCw className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      {contacts.length === 0 ? (
+        <div className="rounded-md border border-border/40 bg-muted/20 p-4 text-xs text-muted-foreground">
+          No contacts found. Click refresh to discover.
+        </div>
+      ) : (
+        contacts.map((c) => {
+          const isSelected = c.email === selectedEmail;
+          return (
+            <button
+              key={c.email}
+              onClick={() => onSelect(c.email)}
+              className={`w-full rounded-md border p-3 text-left transition ${
+                isSelected
+                  ? "border-primary bg-primary/8"
+                  : "border-border bg-background hover:border-primary/40"
+              }`}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium text-foreground">
+                    {c.name || c.email}
+                  </div>
+                  <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                    {c.role || c.contact_type} Â· {c.email}
+                  </div>
+                </div>
+                <div className="flex flex-col items-end gap-1 shrink-0">
+                  <span className="text-xs font-semibold text-primary">{c.priority_score}</span>
+                  <span className="text-[10px] text-muted-foreground">
+                    {Math.round(c.confidence * 100)}%
+                  </span>
+                </div>
+              </div>
+              <div className="mt-1.5 flex items-center gap-2">
+                <ContactTypeBadge type={c.contact_type} />
+                {c.verified && (
+                  <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
+                    Verified
+                  </span>
+                )}
+              </div>
+            </button>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+// â”€â”€â”€ VersionPanel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function VersionPanel({
+  versions,
+  compareLeft,
+  compareRight,
+  compareDiff,
+  comparing,
+  onRestore,
+  onCompare,
+  onClearCompare,
+}: {
+  versions: EmailVersion[];
+  compareLeft: EmailVersion | null;
+  compareRight: EmailVersion | null;
+  compareDiff: string | null;
+  comparing: boolean;
+  onRestore: (v: EmailVersion) => void;
+  onCompare: (l: EmailVersion, r: EmailVersion) => void;
+  onClearCompare: () => void;
+}) {
+  const [selectingCompare, setSelectingCompare] = useState(false);
+  const [firstPick, setFirstPick] = useState<EmailVersion | null>(null);
+
+  function pickVersion(v: EmailVersion) {
+    if (!selectingCompare) return;
+    if (!firstPick) {
+      setFirstPick(v);
+    } else if (firstPick.id !== v.id) {
+      onCompare(firstPick, v);
+      setSelectingCompare(false);
+      setFirstPick(null);
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase text-muted-foreground/60">Version History</span>
+        {versions.length >= 2 && (
+          <button
+            onClick={() => {
+              setSelectingCompare((v) => !v);
+              setFirstPick(null);
+              onClearCompare();
+            }}
+            className={`flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition ${
+              selectingCompare
+                ? "border-primary bg-primary/10 text-primary"
+                : "border-border text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            <GitCompare className="h-3 w-3" />
+            Compare
+          </button>
+        )}
+      </div>
+
+      {selectingCompare && (
+        <div className="rounded-md border border-primary/20 bg-primary/5 p-2 text-xs text-primary">
+          {!firstPick ? "Select first versionâ€¦" : `First: v${firstPick.version_number} â€” now select secondâ€¦`}
+        </div>
+      )}
+
+      {/* Diff result */}
+      {(comparing || compareDiff !== null) && (
+        <div className="rounded-md border border-border bg-background p-3 space-y-2">
+          <div className="flex items-center justify-between text-xs font-medium">
+            <span>
+              v{compareLeft?.version_number} â†’ v{compareRight?.version_number}
+            </span>
+            <button onClick={onClearCompare} className="text-muted-foreground hover:text-foreground">
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          {comparing ? (
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" /> Computing diffâ€¦
+            </div>
+          ) : compareDiff ? (
+            <div className="max-h-52 overflow-auto">
+              {parseDiff(compareDiff).map((line, i) => (
+                <div
+                  key={i}
+                  className={`px-2 py-0.5 font-mono text-[11px] ${
+                    line.type === "added"
+                      ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                      : line.type === "removed"
+                      ? "bg-red-500/10 text-red-600 dark:text-red-400 line-through"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  {line.text || " "}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">No differences.</p>
+          )}
+        </div>
+      )}
+
+      {/* Version list */}
+      {versions.length === 0 ? (
+        <div className="rounded-md border border-border/40 bg-muted/20 p-4 text-xs text-muted-foreground">
+          No versions saved yet.
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {versions.map((v) => {
+            const isFirstPick = firstPick?.id === v.id;
+            return (
+              <div
+                key={v.id}
+                onClick={() => pickVersion(v)}
+                className={`rounded-md border p-3 transition ${
+                  isFirstPick
+                    ? "border-primary bg-primary/8"
+                    : selectingCompare
+                    ? "cursor-pointer border-border hover:border-primary/40"
+                    : "border-border bg-background"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm font-medium text-foreground">Version {v.version_number}</div>
+                  {!selectingCompare && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRestore(v);
+                      }}
+                      className="text-muted-foreground hover:text-primary"
+                      title="Restore"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+                <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+                  <span className="capitalize">{v.event_type?.replace(/_/g, " ")}</span>
+                  <span>by {v.editor}</span>
+                  {v.created_at && <span>{formatDate(v.created_at)}</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// â”€â”€â”€ EmptyEditor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function EmptyEditor({
+  loading,
+  error,
+  onRetry,
+}: {
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="flex min-h-[60vh] flex-col items-center justify-center gap-4 p-8 text-center text-muted-foreground">
+      {loading ? (
+        <>
+          <Loader2 className="h-8 w-8 animate-spin" />
+          <span>Loading draftsâ€¦</span>
+        </>
+      ) : (
+        <>
+          <Mail className="h-12 w-12 text-muted-foreground/20" />
+          <div className="space-y-1">
+            <p className="font-medium text-foreground">No draft selected</p>
+            <p className="text-sm">{error ?? "Select a company from the sidebar or generate a new draft."}</p>
+          </div>
+          {error && (
+            <button
+              onClick={onRetry}
+              className="rounded-md border border-border px-4 py-2 text-sm hover:bg-muted"
+            >
+              Retry
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// â”€â”€â”€ StatusPill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function StatusPill({ status }: { status: EmailDraft["status"] }) {
+  const cls =
+    status === "approved"
+      ? "bg-emerald-500/10 text-emerald-600"
+      : status === "sent"
+      ? "bg-primary/10 text-primary"
+      : status === "rejected"
+      ? "bg-red-500/10 text-red-600"
+      : "bg-amber-500/10 text-amber-600";
+  return (
+    <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium capitalize ${cls}`}>
+      {status.replace(/_/g, " ")}
+    </span>
+  );
+}
+
+// â”€â”€â”€ ContactTypeBadge â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function ContactTypeBadge({ type }: { type: OutreachContact["contact_type"] }) {
+  const labels: Record<OutreachContact["contact_type"], { label: string; cls: string }> = {
+    founder: { label: "Founder", cls: "bg-violet-500/10 text-violet-600" },
+    recruiter: { label: "Recruiter", cls: "bg-blue-500/10 text-blue-600" },
+    hiring_manager: { label: "Hiring Mgr", cls: "bg-sky-500/10 text-sky-600" },
+    engineer: { label: "Engineer", cls: "bg-orange-500/10 text-orange-600" },
+    hr: { label: "HR", cls: "bg-pink-500/10 text-pink-600" },
+    other: { label: "Other", cls: "bg-muted text-muted-foreground" },
+  };
+  const { label, cls } = labels[type] ?? labels.other;
+  return <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}>{label}</span>;
+}
+

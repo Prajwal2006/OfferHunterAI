@@ -4,6 +4,20 @@ export function buildApiUrl(path: string): string {
   return `${API_URL}/${path.replace(/^\/+/, "")}`;
 }
 
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  timeoutMs = 10_000
+) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 export interface CompanyWorkspaceResponse {
   companies: import("./types").Company[];
   visible_companies?: import("./types").Company[];
@@ -54,6 +68,170 @@ export async function fetchEmails(status?: string) {
   const res = await fetch(url);
   if (!res.ok) throw new Error("Failed to fetch emails");
   return res.json();
+}
+
+export async function generatePersonalization(payload: {
+  user_id: string;
+  company_id: string;
+  job?: Record<string, unknown>;
+}) {
+  const res = await fetch(`${API_URL}/outreach/personalization`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to generate personalization");
+  return res.json() as Promise<{ profile: import("./types").PersonalizationProfile }>;
+}
+
+export async function fetchPersonalization(companyId: string, userId: string) {
+  const params = new URLSearchParams({ user_id: userId });
+  const res = await fetchWithTimeout(`${API_URL}/outreach/personalization/${companyId}?${params}`, undefined, 6_000);
+  if (!res.ok) throw new Error("Failed to fetch personalization");
+  return res.json() as Promise<{ profile: import("./types").PersonalizationProfile | null }>;
+}
+
+export async function discoverOutreachContacts(payload: {
+  user_id: string;
+  company_id: string;
+  job?: Record<string, unknown>;
+}) {
+  const res = await fetch(`${API_URL}/outreach/contacts/discover`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to discover contacts");
+  return res.json() as Promise<{ contacts: import("./types").OutreachContact[] }>;
+}
+
+export async function fetchOutreachContacts(companyId: string, userId: string) {
+  const params = new URLSearchParams({ user_id: userId });
+  const res = await fetchWithTimeout(`${API_URL}/outreach/contacts/${companyId}?${params}`, undefined, 6_000);
+  if (!res.ok) throw new Error("Failed to fetch contacts");
+  return res.json() as Promise<{ contacts: import("./types").OutreachContact[] }>;
+}
+
+export async function generateEmailDraft(payload: {
+  user_id: string;
+  company_id: string;
+  job?: Record<string, unknown>;
+  recipient?: Record<string, unknown>;
+  outreach_type?: string;
+}) {
+  const res = await fetchWithTimeout(`${API_URL}/outreach/drafts/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, 20_000);
+  if (!res.ok) {
+    let detail = "Failed to generate draft";
+    try {
+      const data = await res.json();
+      detail = data.detail || detail;
+    } catch {
+      // keep fallback
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{
+    draft: import("./types").EmailDraft;
+    personalization: import("./types").PersonalizationProfile;
+  }>;
+}
+
+export async function fetchEmailDrafts(userId: string, status?: string) {
+  const params = new URLSearchParams({ user_id: userId });
+  if (status) params.set("status", status);
+  const res = await fetchWithTimeout(`${API_URL}/outreach/drafts?${params}`, undefined, 8_000);
+  if (!res.ok) throw new Error("Failed to fetch drafts");
+  return res.json() as Promise<{ drafts: import("./types").EmailDraft[] }>;
+}
+
+export async function fetchEmailDraft(draftId: string) {
+  const res = await fetchWithTimeout(`${API_URL}/outreach/drafts/${draftId}`, undefined, 8_000);
+  if (!res.ok) throw new Error("Failed to fetch draft");
+  return res.json() as Promise<{
+    draft: import("./types").EmailDraft;
+    versions: import("./types").EmailVersion[];
+    subjects: Array<{ label: string; subject: string }>;
+  }>;
+}
+
+export async function updateEmailDraft(
+  draftId: string,
+  updates: {
+    user_id?: string;
+    subject?: string;
+    body?: string;
+    selected_variant?: string;
+    recipient_email?: string;
+    status?: string;
+  }
+) {
+  const res = await fetchWithTimeout(`${API_URL}/outreach/drafts/${draftId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+  }, 8_000);
+  if (!res.ok) throw new Error("Failed to update draft");
+  return res.json() as Promise<{ draft: import("./types").EmailDraft; version?: import("./types").EmailVersion }>;
+}
+
+export async function requestInlineAIEdit(
+  draftId: string,
+  payload: {
+    user_id: string;
+    instruction: string;
+    selected_text: string;
+    full_body: string;
+    subject?: string;
+    auto_apply?: boolean;
+  }
+) {
+  const res = await fetchWithTimeout(`${API_URL}/outreach/drafts/${draftId}/ai-edit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, 20_000);
+  if (!res.ok) throw new Error("Failed to create AI edit");
+  return res.json() as Promise<{
+    ai_edit_request_id: string;
+    original_text: string;
+    replacement_text: string;
+    updated_body: string;
+    diff: string;
+    rationale: string;
+    applied: boolean;
+  }>;
+}
+
+export async function restoreEmailVersion(draftId: string, versionId: string, userId: string) {
+  const params = new URLSearchParams({ user_id: userId });
+  const res = await fetch(`${API_URL}/outreach/drafts/${draftId}/versions/${versionId}/restore?${params}`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Failed to restore version");
+  return res.json() as Promise<{ draft: import("./types").EmailDraft }>;
+}
+
+export async function compareEmailVersions(
+  draftId: string,
+  leftVersionId: string,
+  rightVersionId: string
+) {
+  const params = new URLSearchParams({
+    left_version_id: leftVersionId,
+    right_version_id: rightVersionId,
+  });
+  const res = await fetch(`${API_URL}/outreach/drafts/${draftId}/versions/compare?${params}`);
+  if (!res.ok) throw new Error("Failed to compare versions");
+  return res.json() as Promise<{
+    subject_changed: boolean;
+    body_diff: string;
+    left: import("./types").EmailVersion;
+    right: import("./types").EmailVersion;
+  }>;
 }
 
 export async function approveEmail(emailId: string) {
@@ -369,16 +547,22 @@ export async function addManualCompany(payload: {
 
 export async function handoffToAgent(
   companyId: string,
-  targetAgent: string,
+  targetAgent: "email-writer" | "resume-tailor",
   userId: string
 ) {
   const params = new URLSearchParams({ target_agent: targetAgent, user_id: userId });
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${API_URL}/company-finder/companies/${companyId}/handoff?${params}`,
-    { method: "POST" }
+    { method: "POST" },
+    20_000
   );
   if (!res.ok) throw new Error("Failed to hand off to agent");
-  return res.json();
+  return res.json() as Promise<{
+    task_id: string;
+    status: string;
+    target_agent: string;
+    company: string;
+  }>;
 }
 
 export async function fetchParsedProfile(userId: string) {
