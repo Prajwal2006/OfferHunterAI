@@ -1,7 +1,107 @@
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/+$/, "");
+const FRONTEND_LOG_ENDPOINT = `${API_URL}/debug/logs/frontend`;
+const SSE_INACTIVITY_TIMEOUT_MS = 20_000;
+const SSE_TOTAL_TIMEOUT_MS = 45_000;
 
 export function buildApiUrl(path: string): string {
   return `${API_URL}/${path.replace(/^\/+/, "")}`;
+}
+
+function safeLogPayload(payload: unknown): unknown {
+  try {
+    const serialized = JSON.stringify(payload ?? {});
+    if (serialized.length <= 4000) return payload;
+    return `${serialized.slice(0, 4000)}...[truncated]`;
+  } catch {
+    return String(payload);
+  }
+}
+
+function isLogEndpoint(url: string): boolean {
+  return url.includes("/debug/logs/frontend");
+}
+
+function sendFrontendLog(
+  source: "frontend-action" | "frontend-api",
+  event: string,
+  payload?: Record<string, unknown>,
+  level: "info" | "error" = "info"
+) {
+  if (typeof window === "undefined") return;
+  const body = JSON.stringify({
+    source,
+    event,
+    level,
+    payload: safeLogPayload(payload ?? {}) as Record<string, unknown>,
+  });
+  if ("sendBeacon" in navigator) {
+    navigator.sendBeacon(
+      FRONTEND_LOG_ENDPOINT,
+      new Blob([body], { type: "application/json" })
+    );
+    return;
+  }
+  void globalThis
+    .fetch(FRONTEND_LOG_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    })
+    .catch(() => {});
+}
+
+export function logFrontendAction(event: string, payload?: Record<string, unknown>) {
+  sendFrontendLog("frontend-action", event, payload);
+}
+
+async function apiFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  context?: { timeoutMs?: number }
+) {
+  const url = String(input);
+  const method = init?.method ?? "GET";
+  const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+  if (!isLogEndpoint(url)) {
+    sendFrontendLog("frontend-api", "request.started", {
+      method,
+      url,
+      timeout_ms: context?.timeoutMs,
+    });
+  }
+  try {
+    const response = await fetch(input, init);
+    const durationMs =
+      (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+    if (!isLogEndpoint(url)) {
+      sendFrontendLog("frontend-api", "request.completed", {
+        method,
+        url,
+        status: response.status,
+        ok: response.ok,
+        duration_ms: Math.round(durationMs),
+      });
+    }
+    return response;
+  } catch (error) {
+    const durationMs =
+      (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+    if (!isLogEndpoint(url)) {
+      sendFrontendLog(
+        "frontend-api",
+        "request.failed",
+        {
+          method,
+          url,
+          duration_ms: Math.round(durationMs),
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "error"
+      );
+    }
+    throw error;
+  }
 }
 
 async function fetchWithTimeout(
@@ -12,7 +112,7 @@ async function fetchWithTimeout(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    return await apiFetch(input, { ...init, signal: controller.signal }, { timeoutMs });
   } finally {
     clearTimeout(timeoutId);
   }
@@ -27,7 +127,7 @@ export interface CompanyWorkspaceResponse {
 }
 
 export async function fetchAgentEvents(limit = 50) {
-  const res = await fetch(buildApiUrl(`/agent-events?limit=${limit}`));
+  const res = await apiFetch(buildApiUrl(`/agent-events?limit=${limit}`));
   if (!res.ok) throw new Error("Failed to fetch agent events");
   return res.json();
 }
@@ -39,7 +139,7 @@ export async function runAgents(payload: {
   resume_text?: string;
   resume_version_id?: string;
 }) {
-  const res = await fetch(`${API_URL}/agents/run`, {
+  const res = await apiFetch(`${API_URL}/agents/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -52,7 +152,7 @@ export async function executeAgent(
   agentName: string,
   payload: Record<string, unknown>
 ) {
-  const res = await fetch(`${API_URL}/agents/${agentName}/execute`, {
+  const res = await apiFetch(`${API_URL}/agents/${agentName}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -65,7 +165,7 @@ export async function fetchEmails(status?: string) {
   const url = status
     ? `${API_URL}/emails?status=${status}`
     : `${API_URL}/emails`;
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   if (!res.ok) throw new Error("Failed to fetch emails");
   return res.json();
 }
@@ -75,7 +175,7 @@ export async function generatePersonalization(payload: {
   company_id: string;
   job?: Record<string, unknown>;
 }) {
-  const res = await fetch(`${API_URL}/outreach/personalization`, {
+  const res = await apiFetch(`${API_URL}/outreach/personalization`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -96,7 +196,7 @@ export async function discoverOutreachContacts(payload: {
   company_id: string;
   job?: Record<string, unknown>;
 }) {
-  const res = await fetch(`${API_URL}/outreach/contacts/discover`, {
+  const res = await apiFetch(`${API_URL}/outreach/contacts/discover`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -171,13 +271,43 @@ export function streamEmailGeneration(
   });
   const url = `${API_URL}/outreach/drafts/generate/stream?${params}`;
   const es = new EventSource(url);
+  const startedAt = Date.now();
+  let lastEventAt = Date.now();
+
+  sendFrontendLog("frontend-api", "sse.opened", { url, ...payload });
+
+  const watchdog = setInterval(() => {
+    const now = Date.now();
+    if (now - lastEventAt > SSE_INACTIVITY_TIMEOUT_MS || now - startedAt > SSE_TOTAL_TIMEOUT_MS) {
+      clearInterval(watchdog);
+      es.close();
+      const timedOut = now - lastEventAt > SSE_INACTIVITY_TIMEOUT_MS;
+      sendFrontendLog(
+        "frontend-api",
+        "sse.closed_by_watchdog",
+        {
+          url,
+          inactivity_ms: now - lastEventAt,
+          total_ms: now - startedAt,
+          reason: timedOut ? "inactivity_timeout" : "total_timeout",
+        },
+        "error"
+      );
+      onEvent({ type: "error", message: "Draft generation took too long. Please try again." });
+      onDone();
+    }
+  }, 1000);
 
   es.onmessage = (e) => {
+    lastEventAt = Date.now();
     try {
       const data = JSON.parse(e.data) as EmailGenerationEvent;
+      sendFrontendLog("frontend-api", "sse.message", { url, event_type: data.type, event: data });
       onEvent(data);
       if (data.type === "done" || data.type === "error") {
+        clearInterval(watchdog);
         es.close();
+        sendFrontendLog("frontend-api", "sse.closed", { url, reason: data.type });
         onDone();
       }
     } catch {
@@ -186,12 +316,18 @@ export function streamEmailGeneration(
   };
 
   es.onerror = () => {
+    clearInterval(watchdog);
     es.close();
+    sendFrontendLog("frontend-api", "sse.error", { url }, "error");
     onEvent({ type: "error", message: "Connection to generation service lost. Please try again." });
     onDone();
   };
 
-  return () => es.close();
+  return () => {
+    clearInterval(watchdog);
+    es.close();
+    sendFrontendLog("frontend-api", "sse.closed", { url, reason: "cleanup" });
+  };
 }
 
 export async function fetchEmailDrafts(userId: string, status?: string) {
@@ -262,7 +398,7 @@ export async function requestInlineAIEdit(
 
 export async function restoreEmailVersion(draftId: string, versionId: string, userId: string) {
   const params = new URLSearchParams({ user_id: userId });
-  const res = await fetch(`${API_URL}/outreach/drafts/${draftId}/versions/${versionId}/restore?${params}`, {
+  const res = await apiFetch(`${API_URL}/outreach/drafts/${draftId}/versions/${versionId}/restore?${params}`, {
     method: "POST",
   });
   if (!res.ok) throw new Error("Failed to restore version");
@@ -278,7 +414,7 @@ export async function compareEmailVersions(
     left_version_id: leftVersionId,
     right_version_id: rightVersionId,
   });
-  const res = await fetch(`${API_URL}/outreach/drafts/${draftId}/versions/compare?${params}`);
+  const res = await apiFetch(`${API_URL}/outreach/drafts/${draftId}/versions/compare?${params}`);
   if (!res.ok) throw new Error("Failed to compare versions");
   return res.json() as Promise<{
     subject_changed: boolean;
@@ -289,7 +425,7 @@ export async function compareEmailVersions(
 }
 
 export async function approveEmail(emailId: string) {
-  const res = await fetch(`${API_URL}/emails/${emailId}/approve`, {
+  const res = await apiFetch(`${API_URL}/emails/${emailId}/approve`, {
     method: "POST",
   });
   if (!res.ok) throw new Error("Failed to approve email");
@@ -297,7 +433,7 @@ export async function approveEmail(emailId: string) {
 }
 
 export async function rejectEmail(emailId: string, reason?: string) {
-  const res = await fetch(`${API_URL}/emails/${emailId}/reject`, {
+  const res = await apiFetch(`${API_URL}/emails/${emailId}/reject`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ reason }),
@@ -307,7 +443,7 @@ export async function rejectEmail(emailId: string, reason?: string) {
 }
 
 export async function sendEmail(emailId: string) {
-  const res = await fetch(`${API_URL}/emails/${emailId}/send`, {
+  const res = await apiFetch(`${API_URL}/emails/${emailId}/send`, {
     method: "POST",
   });
   if (!res.ok) throw new Error("Failed to send email");
@@ -322,7 +458,7 @@ export async function editEmail(
     resume_version_id?: string;
   }
 ) {
-  const res = await fetch(`${API_URL}/emails/${emailId}`, {
+  const res = await apiFetch(`${API_URL}/emails/${emailId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(updates),
@@ -332,7 +468,7 @@ export async function editEmail(
 }
 
 export async function fetchPipeline() {
-  const res = await fetch(`${API_URL}/pipeline`);
+  const res = await apiFetch(`${API_URL}/pipeline`);
   if (!res.ok) throw new Error("Failed to fetch pipeline");
   return res.json();
 }
@@ -344,7 +480,7 @@ export function createEventSource(onMessage: (event: MessageEvent) => void) {
 }
 
 export async function uploadResume(formData: FormData) {
-  const res = await fetch(`${API_URL}/resumes/upload`, {
+  const res = await apiFetch(`${API_URL}/resumes/upload`, {
     method: "POST",
     body: formData,
   });
@@ -353,13 +489,13 @@ export async function uploadResume(formData: FormData) {
 }
 
 export async function fetchResumes(userId: string) {
-  const res = await fetch(`${API_URL}/resumes?user_id=${encodeURIComponent(userId)}`);
+  const res = await apiFetch(`${API_URL}/resumes?user_id=${encodeURIComponent(userId)}`);
   if (!res.ok) throw new Error("Failed to fetch resumes");
   return res.json();
 }
 
 export async function activateResume(resumeId: string, userId: string) {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_URL}/resumes/${resumeId}/activate?user_id=${encodeURIComponent(userId)}`,
     {
       method: "POST",
@@ -370,7 +506,7 @@ export async function activateResume(resumeId: string, userId: string) {
 }
 
 export async function deleteResume(resumeId: string, userId: string) {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_URL}/resumes/${resumeId}?user_id=${encodeURIComponent(userId)}`,
     {
       method: "DELETE",
@@ -389,7 +525,7 @@ export async function runCompanyFinder(payload: {
   count?: number;
   rediscover?: boolean;
 }) {
-  const res = await fetch(`${API_URL}/company-finder/run`, {
+  const res = await apiFetch(`${API_URL}/company-finder/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -403,7 +539,7 @@ export async function discoverCompanies(payload: {
   preferences?: Record<string, unknown>;
   count?: number;
 }) {
-  const res = await fetch(`${API_URL}/company-finder/discover`, {
+  const res = await apiFetch(`${API_URL}/company-finder/discover`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -432,13 +568,13 @@ export async function fetchDiscoveredCompanies(
   if (opts?.includeRemoved) params.set("include_removed", "true");
   if (opts?.stage) params.set("stage", opts.stage);
   if (opts?.source) params.set("source", opts.source);
-  const res = await fetch(`${API_URL}/company-finder/companies?${params}`);
+  const res = await apiFetch(`${API_URL}/company-finder/companies?${params}`);
   if (!res.ok) throw new Error("Failed to fetch companies");
   return res.json() as Promise<CompanyWorkspaceResponse>;
 }
 
 export async function repairCompanyWorkspace(userId: string) {
-  const res = await fetch(`${API_URL}/company-finder/companies/repair`, {
+  const res = await apiFetch(`${API_URL}/company-finder/companies/repair`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId }),
@@ -462,7 +598,7 @@ export async function updateWorkspaceCompany(
     outreach_sent?: boolean;
   }
 ) {
-  const res = await fetch(`${API_URL}/company-finder/companies/${companyId}`, {
+  const res = await apiFetch(`${API_URL}/company-finder/companies/${companyId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -479,7 +615,7 @@ export async function sendCompanyFeedback(
     feedback_reason?: string;
   }
 ) {
-  const res = await fetch(`${API_URL}/company-finder/companies/${companyId}/feedback`, {
+  const res = await apiFetch(`${API_URL}/company-finder/companies/${companyId}/feedback`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -493,7 +629,7 @@ export async function continueCompanyDiscovery(payload: {
   count?: number;
   source_mode?: string;
 }) {
-  const res = await fetch(`${API_URL}/company-finder/continue`, {
+  const res = await apiFetch(`${API_URL}/company-finder/continue`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -509,7 +645,7 @@ export async function fetchDiscoverySessions(
   const params = new URLSearchParams();
   if (opts?.limit) params.set("limit", String(opts.limit));
   if (opts?.offset != null) params.set("offset", String(opts.offset));
-  const res = await fetch(`${API_URL}/company-finder/discovery-sessions/${encodeURIComponent(userId)}?${params.toString()}`);
+  const res = await apiFetch(`${API_URL}/company-finder/discovery-sessions/${encodeURIComponent(userId)}?${params.toString()}`);
   if (!res.ok) throw new Error("Failed to fetch discovery sessions");
   return res.json() as Promise<{ sessions: import("./types").DiscoverySession[]; total: number }>;
 }
@@ -521,7 +657,7 @@ export async function fetchDiscoverySourceLogs(
   const params = new URLSearchParams();
   if (opts?.sessionId) params.set("session_id", opts.sessionId);
   if (opts?.limit) params.set("limit", String(opts.limit));
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_URL}/company-finder/source-logs/${encodeURIComponent(userId)}?${params.toString()}`
   );
   if (!res.ok) throw new Error("Failed to fetch source logs");
@@ -529,7 +665,7 @@ export async function fetchDiscoverySourceLogs(
 }
 
 export async function fetchOrchestrationState(userId: string) {
-  const res = await fetch(`${API_URL}/company-finder/orchestration/${encodeURIComponent(userId)}`);
+  const res = await apiFetch(`${API_URL}/company-finder/orchestration/${encodeURIComponent(userId)}`);
   if (!res.ok) throw new Error("Failed to fetch orchestration state");
   return res.json() as Promise<{ state: import("./types").OrchestrationState | null }>;
 }
@@ -544,7 +680,7 @@ export async function saveOrchestrationState(
     last_task_id?: string;
   }
 ) {
-  const res = await fetch(`${API_URL}/company-finder/orchestration/${encodeURIComponent(userId)}`, {
+  const res = await apiFetch(`${API_URL}/company-finder/orchestration/${encodeURIComponent(userId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -557,7 +693,7 @@ export async function fetchCompanyDetail(companyId: string, userId?: string) {
   const params = new URLSearchParams();
   if (userId) params.set("user_id", userId);
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  const res = await fetch(`${API_URL}/company-finder/companies/${companyId}${suffix}`);
+  const res = await apiFetch(`${API_URL}/company-finder/companies/${companyId}${suffix}`);
   if (!res.ok) throw new Error("Failed to fetch company detail");
   return res.json() as Promise<{ company: import("./types").Company }>;
 }
@@ -569,7 +705,7 @@ export async function addManualCompany(payload: {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 90_000); // 90 s — scraping 4 pages at 15s each
   try {
-    const res = await fetch(`${API_URL}/company-finder/companies/manual`, {
+    const res = await apiFetch(`${API_URL}/company-finder/companies/manual`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -620,7 +756,7 @@ export async function handoffToAgent(
 }
 
 export async function fetchParsedProfile(userId: string) {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_URL}/company-finder/profile/${encodeURIComponent(userId)}`
   );
   if (!res.ok) throw new Error("Failed to fetch profile");
@@ -628,7 +764,7 @@ export async function fetchParsedProfile(userId: string) {
 }
 
 export async function parseResumeProfile(userId: string, resumeVersionId?: string) {
-  const res = await fetch(`${API_URL}/company-finder/parse-resume`, {
+  const res = await apiFetch(`${API_URL}/company-finder/parse-resume`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, resume_version_id: resumeVersionId }),
@@ -638,7 +774,7 @@ export async function parseResumeProfile(userId: string, resumeVersionId?: strin
 }
 
 export async function fetchUserPreferences(userId: string) {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_URL}/company-finder/preferences/${encodeURIComponent(userId)}`
   );
   if (!res.ok) throw new Error("Failed to fetch preferences");
@@ -649,7 +785,7 @@ export async function saveUserPreferences(
   userId: string,
   preferences: Partial<import("./types").UserPreferences>
 ) {
-  const res = await fetch(`${API_URL}/company-finder/preferences`, {
+  const res = await apiFetch(`${API_URL}/company-finder/preferences`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, preferences }),
@@ -664,7 +800,7 @@ export async function chatPreferences(payload: {
   history: Array<{ role: string; content: string }>;
   current_prefs?: Record<string, unknown>;
 }) {
-  const res = await fetch(`${API_URL}/company-finder/preferences/chat`, {
+  const res = await apiFetch(`${API_URL}/company-finder/preferences/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -678,7 +814,7 @@ export async function chatPreferences(payload: {
 }
 
 export async function getPreferenceOpener(userId: string): Promise<string> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_URL}/company-finder/preferences/opener?user_id=${encodeURIComponent(userId)}`
   );
   if (!res.ok) return "What types of roles are you targeting?";
@@ -687,10 +823,9 @@ export async function getPreferenceOpener(userId: string): Promise<string> {
 }
 
 export async function fetchConversationHistory(userId: string) {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_URL}/company-finder/conversation/${encodeURIComponent(userId)}`
   );
   if (!res.ok) return { history: [] };
   return res.json() as Promise<{ history: import("./types").ConversationMessage[] }>;
 }
-

@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import uuid
+import time
 from copy import deepcopy
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -47,6 +48,51 @@ _user_companies_cache: dict[str, list] = {}
 _outreach_drafts_cache: dict[str, list[dict[str, Any]]] = {}
 _workspace_repairs_running: set[str] = set()
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
+OUTREACH_DRAFT_USE_AI = os.getenv("OUTREACH_DRAFT_USE_AI", "false").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = float(os.getenv("STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS", "18"))
+except ValueError:
+    STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = 18.0
+LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_preview(value: Any, max_chars: int = 1000) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        text = str(value)
+        return text if len(text) <= max_chars else text[:max_chars] + "...[truncated]"
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+        if len(text) <= max_chars:
+            return value
+        return text[:max_chars] + "...[truncated]"
+    except Exception:
+        text = str(value)
+        return text if len(text) <= max_chars else text[:max_chars] + "...[truncated]"
+
+
+def _write_log(file_name: str, payload: dict[str, Any]) -> None:
+    entry = {
+        "ts": datetime.utcnow().isoformat(),
+        **payload,
+    }
+    try:
+        with (LOGS_DIR / file_name).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _log_backend_action(action: str, **details: Any) -> None:
+    _write_log(
+        "backend-actions.jsonl",
+        {
+            "action": action,
+            "details": {k: _safe_preview(v, 4000) for k, v in details.items()},
+        },
+    )
 
 
 def _build_allowed_cors_origins() -> list[str]:
@@ -427,6 +473,69 @@ app.add_middleware(
     max_age=600,
 )
 
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    started = time.perf_counter()
+    request_id = str(uuid.uuid4())
+    request_payload: Any = None
+    request_body_size = 0
+    content_type = (request.headers.get("content-type") or "").lower()
+    try:
+        if content_type.startswith("multipart/") or "application/octet-stream" in content_type:
+            request_payload = f"[{content_type or 'binary'} body omitted]"
+        else:
+            body = await request.body()
+            request_body_size = len(body or b"")
+            if body and request_body_size <= 20000:
+                if "application/json" in content_type:
+                    try:
+                        request_payload = json.loads(body.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        request_payload = body.decode("utf-8", errors="ignore")
+                else:
+                    request_payload = f"[{content_type or 'raw'} body omitted]"
+    except Exception:
+        request_payload = "[failed to read request body]"
+
+    try:
+        response = await call_next(request)
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        _write_log(
+            "api-calls.jsonl",
+            {
+                "request_id": request_id,
+                "kind": "api_call",
+                "method": request.method,
+                "path": request.url.path,
+                "query": dict(request.query_params),
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+                "request_body_size": request_body_size,
+                "request_payload": _safe_preview(request_payload, 4000),
+                "client": request.client.host if request.client else None,
+                "user_agent": request.headers.get("user-agent"),
+            },
+        )
+        return response
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        _write_log(
+            "api-calls.jsonl",
+            {
+                "request_id": request_id,
+                "kind": "api_call_error",
+                "method": request.method,
+                "path": request.url.path,
+                "query": dict(request.query_params),
+                "duration_ms": duration_ms,
+                "request_body_size": request_body_size,
+                "request_payload": _safe_preview(request_payload, 4000),
+                "error": str(exc),
+            },
+        )
+        raise
+
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Models Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 class RunAgentsRequest(BaseModel):
@@ -499,6 +608,13 @@ class DiscoverContactsRequest(BaseModel):
     user_id: str
     company_id: str
     job: Optional[dict[str, Any]] = None
+
+
+class FrontendClientLogRequest(BaseModel):
+    source: str = "frontend-action"
+    event: str
+    level: str = "info"
+    payload: Optional[dict[str, Any]] = None
 
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Company Finder Models Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -900,7 +1016,21 @@ async def _generate_selected_company_email(request: GenerateEmailDraftRequest) -
     The critical path intentionally avoids live AI and contact discovery. Those are useful
     enrichments, but a user click on "Generate cold email" should always produce a draft.
     """
+    started = time.perf_counter()
+    _log_backend_action(
+        "generate_selected_company_email.started",
+        user_id=request.user_id,
+        company_id=request.company_id,
+        outreach_type=request.outreach_type or "cold_email",
+    )
     context = await _load_outreach_context_fast(request.user_id, request.company_id)
+    _log_backend_action(
+        "generate_selected_company_email.context_loaded",
+        user_id=request.user_id,
+        company_id=request.company_id,
+        company=context.get("company", {}).get("name"),
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
     personalization = await _get_personalization_profile_fast(request.user_id, request.company_id)
     if not personalization:
         personalization_model = await PersonalizationService().generate_profile(
@@ -913,6 +1043,18 @@ async def _generate_selected_company_email(request: GenerateEmailDraftRequest) -
             use_ai=False,
         )
         personalization = personalization_model.model_dump()
+        _log_backend_action(
+            "generate_selected_company_email.personalization_generated",
+            user_id=request.user_id,
+            company_id=request.company_id,
+        )
+    else:
+        _log_backend_action(
+            "generate_selected_company_email.personalization_loaded",
+            user_id=request.user_id,
+            company_id=request.company_id,
+            profile_id=personalization.get("id"),
+        )
 
     draft_model = await EmailWriterService().generate_email(
         user_id=request.user_id,
@@ -924,7 +1066,14 @@ async def _generate_selected_company_email(request: GenerateEmailDraftRequest) -
         job=request.job,
         recipient=request.recipient,
         outreach_type=request.outreach_type or "cold_email",
-        use_ai=True,
+        use_ai=OUTREACH_DRAFT_USE_AI,
+    )
+    _log_backend_action(
+        "generate_selected_company_email.draft_generated",
+        user_id=request.user_id,
+        company_id=request.company_id,
+        used_ai=OUTREACH_DRAFT_USE_AI,
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
     )
     draft_payload = {**draft_model.model_dump(), "version_number": 1}
     stored = await _persist_email_draft_fast(request.user_id, draft_payload)
@@ -935,6 +1084,13 @@ async def _generate_selected_company_email(request: GenerateEmailDraftRequest) -
             stored=stored,
             personalization=personalization,
         )
+    )
+    _log_backend_action(
+        "generate_selected_company_email.completed",
+        user_id=request.user_id,
+        company_id=request.company_id,
+        draft_id=stored.get("id"),
+        total_duration_ms=round((time.perf_counter() - started) * 1000, 2),
     )
     return {"draft": stored, "personalization": personalization}
 
@@ -1024,10 +1180,24 @@ async def stream_email_generation(
         def event(payload: dict) -> str:
             return f"data: {json.dumps(payload)}\n\n"
 
+        started = time.perf_counter()
         try:
+            _log_backend_action(
+                "stream_email_generation.started",
+                user_id=user_id,
+                company_id=company_id,
+                outreach_type=outreach_type,
+            )
             yield event({"type": "status", "step": "context", "message": "Loading your profile and company data..."})
             context = await _load_outreach_context_fast(user_id, company_id)
             company_name = (context.get("company") or {}).get("name") or "this company"
+            _log_backend_action(
+                "stream_email_generation.context_loaded",
+                user_id=user_id,
+                company_id=company_id,
+                company_name=company_name,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            )
 
             yield event({"type": "status", "step": "personalization", "message": f"Building personalization profile for {company_name}..."})
             personalization = await _get_personalization_profile_fast(user_id, company_id)
@@ -1041,22 +1211,41 @@ async def stream_email_generation(
                     use_ai=False,
                 )
                 personalization = personalization_model.model_dump()
+                _log_backend_action(
+                    "stream_email_generation.personalization_generated",
+                    user_id=user_id,
+                    company_id=company_id,
+                )
+            else:
+                _log_backend_action(
+                    "stream_email_generation.personalization_loaded",
+                    user_id=user_id,
+                    company_id=company_id,
+                    profile_id=personalization.get("id"),
+                )
 
             yield event({"type": "status", "step": "writing", "message": f"Writing your personalized cold email for {company_name}..."})
-            req = GenerateEmailDraftRequest(
+            draft_model = await asyncio.wait_for(
+                EmailWriterService().generate_email(
+                    user_id=user_id,
+                    company=context["company"],
+                    personalization=personalization,
+                    user_profile=context["profile"],
+                    preferences=context["preferences"],
+                    resume=context["resume"],
+                    outreach_type=outreach_type,
+                    use_ai=OUTREACH_DRAFT_USE_AI,
+                ),
+                # Keep backend timeout below frontend SSE watchdog thresholds
+                # (20s inactivity / 45s total) to avoid indefinite loading.
+                timeout=STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS,
+            )
+            _log_backend_action(
+                "stream_email_generation.draft_generated",
                 user_id=user_id,
                 company_id=company_id,
-                outreach_type=outreach_type,
-            )
-            draft_model = await EmailWriterService().generate_email(
-                user_id=user_id,
-                company=context["company"],
-                personalization=personalization,
-                user_profile=context["profile"],
-                preferences=context["preferences"],
-                resume=context["resume"],
-                outreach_type=outreach_type,
-                use_ai=True,
+                used_ai=OUTREACH_DRAFT_USE_AI,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
             )
             draft_payload = {**draft_model.model_dump(), "version_number": 1}
             stored = await _persist_email_draft_fast(user_id, draft_payload)
@@ -1070,9 +1259,36 @@ async def stream_email_generation(
             )
             yield event({"type": "draft", "draft": stored, "personalization": personalization})
             yield event({"type": "done"})
+            _log_backend_action(
+                "stream_email_generation.completed",
+                user_id=user_id,
+                company_id=company_id,
+                draft_id=stored.get("id"),
+                total_duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            )
+        except asyncio.TimeoutError:
+            _log_backend_action(
+                "stream_email_generation.timeout",
+                user_id=user_id,
+                company_id=company_id,
+                timeout_seconds=STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS,
+            )
+            yield event({"type": "error", "message": "Draft generation timed out. Please try again."})
         except HTTPException as exc:
+            _log_backend_action(
+                "stream_email_generation.http_error",
+                user_id=user_id,
+                company_id=company_id,
+                error=exc.detail,
+            )
             yield event({"type": "error", "message": exc.detail})
-        except Exception:
+        except Exception as exc:
+            _log_backend_action(
+                "stream_email_generation.error",
+                user_id=user_id,
+                company_id=company_id,
+                error=str(exc),
+            )
             # Do not expose internal exception details to the client
             yield event({"type": "error", "message": "Failed to generate email draft. Please try again."})
 
@@ -1090,6 +1306,21 @@ async def stream_email_generation(
             "Vary": "Origin",
         },
     )
+
+
+@app.post("/debug/logs/frontend")
+async def ingest_frontend_logs(request: FrontendClientLogRequest):
+    file_name = "frontend-api.jsonl" if request.source == "frontend-api" else "frontend-actions.jsonl"
+    _write_log(
+        file_name,
+        {
+            "kind": request.source,
+            "event": request.event,
+            "level": request.level,
+            "payload": _safe_preview(request.payload or {}, 8000),
+        },
+    )
+    return {"ok": True}
 
 
 @app.get("/outreach/drafts")
@@ -2552,4 +2783,3 @@ def _mock_emails(status: Optional[str] = None) -> list[dict]:
     if status:
         return [e for e in emails if e["status"] == status]
     return emails
-
