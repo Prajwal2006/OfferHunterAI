@@ -117,6 +117,9 @@ export default function ReviewPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [generatingFor, setGeneratingFor] = useState<string | null>(null);
+  const [generationStatus, setGenerationStatus] = useState<string | null>(null);
+  const [typedDraftId, setTypedDraftId] = useState<string | null>(null);
+  const [typedBody, setTypedBody] = useState("");
 
   // â”€â”€â”€ AI editing state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const [toolbar, setToolbar] = useState<ToolbarState | null>(null);
@@ -143,6 +146,7 @@ export default function ReviewPage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const toolbarRef = useRef<HTMLDivElement>(null);
   const saveDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoGenerateKeyRef = useRef<string | null>(null);
 
   // â”€â”€â”€ Effects â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
@@ -156,9 +160,38 @@ export default function ReviewPage() {
   }, [authLoading, userId]);
 
   useEffect(() => {
+    if (authLoading || !userId || typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const companyId = params.get("generate");
+    if (!companyId) return;
+    const outreachType = params.get("type") || "cold_email";
+    const key = `${userId}:${companyId}:${outreachType}`;
+    if (autoGenerateKeyRef.current === key) return;
+    autoGenerateKeyRef.current = key;
+    void generateForCompanyId(companyId, outreachType);
+  }, [authLoading, userId]);
+
+  useEffect(() => {
     if (!selectedId || !userId) return;
     void loadSelected(selectedId, userId);
   }, [selectedId, userId]);
+
+  useEffect(() => {
+    if (!typedDraftId || !selectedDraft || selectedDraft.id !== typedDraftId) return;
+    const fullBody = selectedDraft.body || "";
+    setTypedBody("");
+    let index = 0;
+    const timer = setInterval(() => {
+      index = Math.min(index + 10, fullBody.length);
+      setTypedBody(fullBody.slice(0, index));
+      if (index >= fullBody.length) {
+        clearInterval(timer);
+        setTypedDraftId(null);
+      }
+    }, 16);
+
+    return () => clearInterval(timer);
+  }, [selectedDraft, typedDraftId]);
 
   // Dismiss floating toolbar when clicking outside
   useEffect(() => {
@@ -261,6 +294,8 @@ export default function ReviewPage() {
 
   function handleBodyChange(value: string) {
     if (!selectedDraft) return;
+    setTypedDraftId(null);
+    setTypedBody("");
     setSelectedDraft({ ...selectedDraft, body: value });
     debouncedSave({ body: value });
   }
@@ -336,22 +371,43 @@ export default function ReviewPage() {
   }
 
   // â”€â”€â”€ Generate draft for company â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  async function generateForCompany(company: Company, outreachType = "cold_email") {
+  async function generateForCompanyId(companyId: string, outreachType = "cold_email") {
     if (!userId) return;
-    setGeneratingFor(company.id);
+    setGeneratingFor(companyId);
+    setGenerationStatus("Collecting your resume, preferences, and company context...");
+    setLoadError(null);
     try {
-      const res = await generateEmailDraft({ user_id: userId, company_id: company.id, outreach_type: outreachType });
+      setGenerationStatus("Writing a polished first-person cold email...");
+      const res = await generateEmailDraft({ user_id: userId, company_id: companyId, outreach_type: outreachType });
       const newDraft = res.draft;
       setDrafts((prev) => {
-        const exists = prev.find((d) => d.company_id === company.id);
-        return exists ? prev.map((d) => (d.company_id === company.id ? newDraft : d)) : [newDraft, ...prev];
+        const exists = prev.find((d) => d.company_id === companyId);
+        return exists ? prev.map((d) => (d.company_id === companyId ? newDraft : d)) : [newDraft, ...prev];
       });
+      setSelectedDraft(newDraft);
       setSelectedId(newDraft.id);
+      setPersonalization(res.personalization);
+      setTypedDraftId(newDraft.id);
+      setTypedBody("");
+      setGenerationStatus("Draft ready. Typing it into the editor...");
+      if (typeof window !== "undefined") {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("generate");
+        url.searchParams.delete("type");
+        url.searchParams.set("draft", newDraft.id);
+        window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+      }
     } catch (err) {
       console.error("Failed to generate draft", err);
+      setLoadError(err instanceof Error ? err.message : "Failed to generate draft.");
     } finally {
       setGeneratingFor(null);
+      setTimeout(() => setGenerationStatus(null), 1200);
     }
+  }
+
+  async function generateForCompany(company: Company, outreachType = "cold_email") {
+    await generateForCompanyId(company.id, outreachType);
   }
 
   // â”€â”€â”€ Refresh contacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -427,6 +483,15 @@ export default function ReviewPage() {
             </div>
           </div>
         </header>
+
+        {generationStatus && (
+          <div className="border-b border-primary/20 bg-primary/8">
+            <div className="mx-auto flex max-w-400 items-center gap-2 px-4 py-2 text-sm text-primary sm:px-6">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span>{generationStatus}</span>
+            </div>
+          </div>
+        )}
 
         {/* Three-panel grid */}
         <div className="flex-1 overflow-hidden lg:grid lg:grid-cols-[260px_minmax(0,1fr)_320px]">
@@ -619,7 +684,7 @@ export default function ReviewPage() {
                 <div className="relative">
                   <textarea
                     ref={textareaRef}
-                    value={selectedDraft.body}
+                    value={typedDraftId === selectedDraft.id ? typedBody : selectedDraft.body}
                     onChange={(e) => handleBodyChange(e.target.value)}
                     onMouseUp={onTextareaMouseUp}
                     rows={22}

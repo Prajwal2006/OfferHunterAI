@@ -119,11 +119,19 @@ export async function generateEmailDraft(payload: {
   recipient?: Record<string, unknown>;
   outreach_type?: string;
 }) {
-  const res = await fetchWithTimeout(`${API_URL}/outreach/drafts/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  }, 20_000);
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(`${API_URL}/outreach/drafts/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }, 90_000);
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("Draft generation timed out. Please try again.");
+    }
+    throw err;
+  }
   if (!res.ok) {
     let detail = "Failed to generate draft";
     try {

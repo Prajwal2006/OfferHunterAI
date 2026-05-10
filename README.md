@@ -133,7 +133,6 @@ supabase/migrations/001_initial_schema.sql
 
 ```bash
 # Terminal 1 — Backend
-cd backend
 uvicorn main:app --reload --port 8000
 
 # Terminal 2 — Frontend

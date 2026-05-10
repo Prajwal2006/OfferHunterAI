@@ -30,7 +30,6 @@ import {
   fetchDiscoverySourceLogs,
   buildApiUrl,
   fetchEmailDrafts,
-  generateEmailDraft,
 } from "@/lib/api";
 import {
   Company,
@@ -871,77 +870,47 @@ function CompanyFinderContent() {
       agent: "email-writer" | "resume-tailor"
     ) => {
       const company = companies.find((item) => item.id === companyId) || selectedCompany;
+      if (agent === "email-writer") {
+        const params = new URLSearchParams({
+          generate: companyId,
+          type: "cold_email",
+        });
+        const reviewUrl = `/review?${params.toString()}`;
+        const opened = window.open(reviewUrl, "_blank", "noopener,noreferrer");
+        if (!opened) {
+          router.push(reviewUrl);
+        }
+        setSelectedCompany(null);
+        setCompanies((prev) =>
+          prev.map((company) =>
+            company.id === companyId
+              ? {
+                  ...company,
+                  workspace: {
+                    ...(company.workspace || {}),
+                    orchestration_stage: "Review",
+                    outreach_started: true,
+                  },
+                }
+              : company
+          )
+        );
+        return;
+      }
       setHandoffLoading(agent);
       setHandoffCompany(company || null);
       setHandoffTaskId(null);
       setHandoffEvents([
         {
           task_id: "",
-          agent_name: agent === "email-writer" ? "PersonalizationAgent" : "ResumeTailorAgent",
+          agent_name: "ResumeTailorAgent",
           status: "started",
-          message:
-            agent === "email-writer"
-              ? "Preparing your cold email workflow..."
-              : "Preparing resume tailoring workflow...",
+          message: "Preparing resume tailoring workflow...",
         },
       ]);
       setHandoffDraft(null);
       setTypedDraftBody("");
       try {
-        if (agent === "email-writer") {
-          setHandoffEvents([
-            {
-              task_id: "",
-              agent_name: "EmailWriterAgent",
-              status: "started",
-              message: "Writing your cold email draft...",
-            },
-          ]);
-          const result = await generateEmailDraft({
-            user_id: userId,
-            company_id: companyId,
-            outreach_type: "cold_email",
-          });
-          setHandoffDraft(result.draft);
-          setAgentMessage("Cold email draft is ready for review.");
-          setHandoffEvents([
-            {
-              task_id: "",
-              agent_name: "EmailWriterAgent",
-              status: "started",
-              message: "Writing your cold email draft...",
-            },
-            {
-              task_id: "",
-              agent_name: "EmailWriterAgent",
-              status: "completed",
-              message: `Cold email draft ready for ${result.draft.company_name || company?.name || "this company"}`,
-            },
-            {
-              task_id: "",
-              agent_name: "HumanReviewAgent",
-              status: "started",
-              message: "Draft is ready for human review",
-            },
-          ]);
-          setCompanies((prev) =>
-            prev.map((company) =>
-              company.id === companyId
-                ? {
-                    ...company,
-                    workspace: {
-                      ...(company.workspace || {}),
-                      orchestration_stage: "Review",
-                      personalization_completed: true,
-                      outreach_started: true,
-                    },
-                  }
-                : company
-            )
-          );
-          return;
-        }
-
         const result = await handoffToAgent(companyId, agent, userId);
         setHandoffTaskId(result.task_id);
         setAgentMessage("Starting Resume Tailor agent...");
@@ -966,7 +935,7 @@ function CompanyFinderContent() {
           ...prev,
           {
             task_id: "",
-            agent_name: agent === "email-writer" ? "EmailWriterAgent" : "ResumeTailorAgent",
+            agent_name: "ResumeTailorAgent",
             status: "failed",
             message: err instanceof Error ? err.message : "Failed to start company action",
           },
@@ -975,7 +944,7 @@ function CompanyFinderContent() {
         setHandoffLoading(null);
       }
     },
-    [companies, selectedCompany, userId]
+    [companies, router, selectedCompany, userId]
   );
 
   const onAddManualCompany = useCallback(async () => {

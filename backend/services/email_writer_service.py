@@ -76,11 +76,15 @@ class EmailWriterService:
                 "Use I, me, my, and mine. Never say the user, the candidate, the applicant, or this profile.",
                 "Do not write phrases like 'the user is qualified in'; write 'I have experience in' instead.",
                 "Open directly with the candidate's interest or with a sharp hook, depending on the variant.",
+                "Sound like a strong, thoughtful student/operator writing one personal note, not a cover letter.",
+                "Make the first two sentences specific to the company and the candidate's fit.",
                 "Mention internship availability and whether the candidate is open to full-time or part-time work when preferences include it.",
                 "Include the strongest relevant links from portfolio, GitHub, LinkedIn, or other profile links.",
                 "Use Markdown-style bold sparingly for 1-3 skimmable labels or value points in the body, such as **Availability** or **Portfolio**.",
                 "Do not sound AI-generated.",
                 "Avoid generic template phrases.",
+                "Avoid 'I hope you are doing well' unless no better opener is available.",
+                "Avoid overexplaining. Prefer precise, confident sentences.",
                 "Do not overload with more than three proof points.",
                 "No fabricated metrics.",
                 "Keep short under 150 words, medium under 260 words, bold under 220 words.",
@@ -90,15 +94,17 @@ class EmailWriterService:
             "You are OfferHunterAI's Email Writer Agent. Return only valid JSON. "
             "Write human, concise, deeply personalized career outreach. "
             "Every draft must sound like the candidate wrote it personally in first person. "
-            "Use natural plain text with light Markdown emphasis where useful."
+            "Use natural plain text with light Markdown emphasis where useful. "
+            "Optimize for a reply from a busy founder, recruiter, or hiring manager."
         )
         user = (
             "Generate JSON with keys: selected_variant, subject, body, variants, subjects, generation_metadata. "
             "variants must include short, medium, bold_founder. subjects must include professional, startup_style, "
             "curiosity_based, role_focused objects with label and subject. Select medium by default. "
-            "The medium variant should be a polished direct internship/outreach email. "
-            "The short variant should start quickly and stay concise. "
-            "The bold_founder variant should begin with a hook line that makes the reader want to keep reading. "
+            "The medium variant should be polished, warm, direct, and easy to skim. "
+            "The short variant should start quickly and feel like a human note, not a template. "
+            "The bold_founder variant should begin with a hook line that makes the reader want to keep reading, while staying credible. "
+            "When the recipient is unknown, use a clean greeting such as 'Hi [Company] team,' instead of a formal 'Dear'. "
             f"Context:\n{compact_json(context)}"
         )
         try:
@@ -141,7 +147,7 @@ class EmailWriterService:
         skills = personalization.get("relevant_skills") or user_profile.get("skills") or []
         projects = personalization.get("relevant_projects") or user_profile.get("projects") or []
         links = self._collect_links(user_profile, preferences, personalization)
-        greeting = f"Dear {company_name} Team,"
+        greeting = f"Hi {company_name} team,"
         skill_line = ", ".join(skills[:3]) if skills else "shipping practical software"
         education_line = self._education_line(user_profile, resume_text)
         availability_line = self._availability_line(preferences)
@@ -158,11 +164,10 @@ class EmailWriterService:
 
         medium = (
             f"{greeting}\n\n"
-            "I hope you are doing well.\n\n"
-            f"My name is {full_name}, and {education_line} I am reaching out to express my strong interest in a 3-month summer internship opportunity with {company_name}.\n\n"
-            f"{availability_line} I would bring full commitment, energy, and ownership from day one. I am not looking to contribute only in a narrow technical capacity; I can help across engineering, product, research, and operations where useful.\n\n"
-            f"{highlight_line} My strongest technical overlap is **{skill_line}**.{project_line}\n\n"
-            f"What excites me most about {company_name} is {company_interest} I would love the chance to support your team this summer in any way that creates value.\n\n"
+            f"I came across {company_name} and was drawn to {company_interest} {education_line}\n\n"
+            f"I am looking for a 3-month summer internship where I can contribute quickly. {availability_line} "
+            f"My strongest technical overlap is **{skill_line}**.{project_line}\n\n"
+            f"{highlight_line} I would bring energy, ownership, and range across engineering, product, research, or operations wherever the team needs leverage.\n\n"
             f"{link_line}"
             f"{cta}\n\n"
             f"Best,\n{full_name}"

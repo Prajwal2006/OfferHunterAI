@@ -924,7 +924,7 @@ async def _generate_selected_company_email(request: GenerateEmailDraftRequest) -
         job=request.job,
         recipient=request.recipient,
         outreach_type=request.outreach_type or "cold_email",
-        use_ai=False,
+        use_ai=True,
     )
     draft_payload = {**draft_model.model_dump(), "version_number": 1}
     stored = await _persist_email_draft_fast(request.user_id, draft_payload)
