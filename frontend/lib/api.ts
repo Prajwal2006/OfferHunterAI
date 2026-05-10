@@ -1,5 +1,7 @@
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/+$/, "");
 const FRONTEND_LOG_ENDPOINT = `${API_URL}/debug/logs/frontend`;
+const SSE_INACTIVITY_TIMEOUT_MS = 20_000;
+const SSE_TOTAL_TIMEOUT_MS = 45_000;
 
 export function buildApiUrl(path: string): string {
   return `${API_URL}/${path.replace(/^\/+/, "")}`;
@@ -271,17 +273,15 @@ export function streamEmailGeneration(
   const es = new EventSource(url);
   const startedAt = Date.now();
   let lastEventAt = Date.now();
-  const maxInactivityMs = 20_000;
-  const maxTotalMs = 45_000;
 
   sendFrontendLog("frontend-api", "sse.opened", { url, ...payload });
 
   const watchdog = setInterval(() => {
     const now = Date.now();
-    if (now - lastEventAt > maxInactivityMs || now - startedAt > maxTotalMs) {
+    if (now - lastEventAt > SSE_INACTIVITY_TIMEOUT_MS || now - startedAt > SSE_TOTAL_TIMEOUT_MS) {
       clearInterval(watchdog);
       es.close();
-      const timedOut = now - lastEventAt > maxInactivityMs;
+      const timedOut = now - lastEventAt > SSE_INACTIVITY_TIMEOUT_MS;
       sendFrontendLog(
         "frontend-api",
         "sse.closed_by_watchdog",

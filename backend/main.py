@@ -49,6 +49,10 @@ _outreach_drafts_cache: dict[str, list[dict[str, Any]]] = {}
 _workspace_repairs_running: set[str] = set()
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
 OUTREACH_DRAFT_USE_AI = os.getenv("OUTREACH_DRAFT_USE_AI", "false").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = float(os.getenv("STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS", "18"))
+except ValueError:
+    STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = 18.0
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1232,7 +1236,9 @@ async def stream_email_generation(
                     outreach_type=outreach_type,
                     use_ai=OUTREACH_DRAFT_USE_AI,
                 ),
-                timeout=float(os.getenv("STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS", "20")),
+                # Keep backend timeout below frontend SSE watchdog thresholds
+                # (20s inactivity / 45s total) to avoid indefinite loading.
+                timeout=STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS,
             )
             _log_backend_action(
                 "stream_email_generation.draft_generated",
@@ -1265,7 +1271,7 @@ async def stream_email_generation(
                 "stream_email_generation.timeout",
                 user_id=user_id,
                 company_id=company_id,
-                timeout_seconds=os.getenv("STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS", "20"),
+                timeout_seconds=STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS,
             )
             yield event({"type": "error", "message": "Draft generation timed out. Please try again."})
         except HTTPException as exc:
