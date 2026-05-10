@@ -34,6 +34,7 @@ import {
   fetchEmailDrafts,
   fetchOutreachContacts,
   fetchPersonalization,
+  logFrontendAction,
   streamEmailGeneration,
   requestInlineAIEdit,
   restoreEmailVersion,
@@ -215,6 +216,7 @@ export default function ReviewPage() {
 
   // â”€â”€â”€ Data loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   async function loadAll(uid: string) {
+    logFrontendAction("review.load_all.started", { user_id: uid });
     setLoading(true);
     setLoadError(null);
     try {
@@ -229,6 +231,11 @@ export default function ReviewPage() {
           : [];
       setDrafts(loadedDrafts);
       setCompanies(loadedCompanies);
+      logFrontendAction("review.load_all.completed", {
+        user_id: uid,
+        drafts: loadedDrafts.length,
+        companies: loadedCompanies.length,
+      });
       if (loadedDrafts.length > 0) {
         setSelectedId((cur) => {
           if (cur && loadedDrafts.some((d) => d.id === cur)) return cur;
@@ -236,6 +243,10 @@ export default function ReviewPage() {
         });
       }
     } catch (err) {
+      logFrontendAction("review.load_all.failed", {
+        user_id: uid,
+        error: err instanceof Error ? err.message : "unknown",
+      });
       setLoadError(err instanceof Error ? err.message : "Failed to load.");
     } finally {
       setLoading(false);
@@ -243,6 +254,7 @@ export default function ReviewPage() {
   }
 
   async function loadSelected(draftId: string, uid: string) {
+    logFrontendAction("review.load_selected.started", { user_id: uid, draft_id: draftId });
     try {
       const result = await fetchEmailDraft(draftId);
       setSelectedDraft(result.draft);
@@ -258,7 +270,18 @@ export default function ReviewPage() {
       ]);
       setPersonalization(profileRes.status === "fulfilled" ? profileRes.value.profile : null);
       setContacts(contactsRes.status === "fulfilled" ? contactsRes.value.contacts : []);
+      logFrontendAction("review.load_selected.completed", {
+        user_id: uid,
+        draft_id: draftId,
+        company_id: result.draft.company_id,
+        contacts: contactsRes.status === "fulfilled" ? contactsRes.value.contacts.length : 0,
+      });
     } catch (err) {
+      logFrontendAction("review.load_selected.failed", {
+        user_id: uid,
+        draft_id: draftId,
+        error: err instanceof Error ? err.message : "unknown",
+      });
       setLoadError(err instanceof Error ? err.message : "Failed to load draft.");
     }
   }
@@ -377,6 +400,11 @@ export default function ReviewPage() {
   // â”€â”€â”€ Generate draft for company â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   function generateForCompanyId(companyId: string, outreachType = "cold_email") {
     if (!userId) return;
+    logFrontendAction("review.generate_draft.started", {
+      user_id: userId,
+      company_id: companyId,
+      outreach_type: outreachType,
+    });
     setGeneratingFor(companyId);
     setGenerationStatus("Loading your profile and company data...");
     setLoadError(null);
@@ -384,6 +412,11 @@ export default function ReviewPage() {
     const cleanup = streamEmailGeneration(
       { user_id: userId, company_id: companyId, outreach_type: outreachType },
       (ev: EmailGenerationEvent) => {
+        logFrontendAction("review.generate_draft.event", {
+          user_id: userId,
+          company_id: companyId,
+          event_type: ev.type,
+        });
         if (ev.type === "status") {
           setGenerationStatus(ev.message);
         } else if (ev.type === "draft") {
@@ -406,6 +439,11 @@ export default function ReviewPage() {
             window.history.replaceState(null, "", `${url.pathname}${url.search}`);
           }
         } else if (ev.type === "error") {
+          logFrontendAction("review.generate_draft.failed", {
+            user_id: userId,
+            company_id: companyId,
+            error: ev.message || "unknown",
+          });
           setLoadError(ev.message || "Failed to generate draft.");
           setGeneratingFor(null);
           setTimeout(() => setGenerationStatus(null), 1200);
@@ -413,6 +451,11 @@ export default function ReviewPage() {
       },
       () => {
         // onDone
+        logFrontendAction("review.generate_draft.completed", {
+          user_id: userId,
+          company_id: companyId,
+          outreach_type: outreachType,
+        });
         setGeneratingFor(null);
         setTimeout(() => setGenerationStatus(null), 1200);
       },
@@ -1339,4 +1382,3 @@ function ContactTypeBadge({ type }: { type: OutreachContact["contact_type"] }) {
   const { label, cls } = labels[type] ?? labels.other;
   return <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}>{label}</span>;
 }
-
