@@ -1072,8 +1072,9 @@ async def stream_email_generation(
             yield event({"type": "done"})
         except HTTPException as exc:
             yield event({"type": "error", "message": exc.detail})
-        except Exception as exc:
-            yield event({"type": "error", "message": str(exc) or "Failed to generate email draft"})
+        except Exception:
+            # Do not expose internal exception details to the client
+            yield event({"type": "error", "message": "Failed to generate email draft. Please try again."})
 
     request_origin = (request.headers.get("origin") or "").rstrip("/")
     allow_origin = request_origin if request_origin in ALLOWED_CORS_ORIGINS else ALLOWED_CORS_ORIGINS[0]

@@ -203,14 +203,16 @@ export default function AgentsPage() {
     async function loadHistory() {
       try {
         const result = await fetchAgentEvents(100);
+        const str = (v: unknown, fallback = ""): string =>
+          typeof v === "string" ? v : fallback;
         const historical: AgentEvent[] = (result.events ?? []).map((ev: Record<string, unknown>) => ({
-          id: (ev.id as string) ?? `hist-${Date.now()}-${Math.random()}`,
-          agent_name: (ev.agent_name as string) ?? "Unknown",
-          task_id: (ev.task_id as string) ?? "",
-          status: (ev.status as string) ?? "running",
-          message: (ev.message as string) ?? "",
+          id: str(ev.id) || `hist-${Date.now()}-${Math.random()}`,
+          agent_name: str(ev.agent_name, "Unknown"),
+          task_id: str(ev.task_id),
+          status: str(ev.status, "running"),
+          message: str(ev.message),
           metadata: (ev.metadata as Record<string, unknown>) ?? {},
-          created_at: (ev.created_at as string) ?? new Date().toISOString(),
+          created_at: str(ev.created_at) || new Date().toISOString(),
         }));
         historical.forEach(applyEvent);
       } catch {
