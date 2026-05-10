@@ -1009,6 +1009,88 @@ async def generate_email_draft(request: GenerateEmailDraftRequest):
     return await _generate_selected_company_email(request)
 
 
+@app.get("/outreach/drafts/generate/stream")
+async def stream_email_generation(
+    request: Request,
+    user_id: str = Query(...),
+    company_id: str = Query(...),
+    outreach_type: str = Query("cold_email"),
+):
+    """
+    SSE endpoint that streams email generation progress in real time.
+    Emits status events for each step, then the full draft when ready.
+    """
+    async def generate_and_stream() -> AsyncGenerator[str, None]:
+        def event(payload: dict) -> str:
+            return f"data: {json.dumps(payload)}\n\n"
+
+        try:
+            yield event({"type": "status", "step": "context", "message": "Loading your profile and company data..."})
+            context = await _load_outreach_context_fast(user_id, company_id)
+            company_name = (context.get("company") or {}).get("name") or "this company"
+
+            yield event({"type": "status", "step": "personalization", "message": f"Building personalization profile for {company_name}..."})
+            personalization = await _get_personalization_profile_fast(user_id, company_id)
+            if not personalization:
+                personalization_model = await PersonalizationService().generate_profile(
+                    user_id=user_id,
+                    company=context["company"],
+                    user_profile=context["profile"],
+                    preferences=context["preferences"],
+                    resume=context["resume"],
+                    use_ai=False,
+                )
+                personalization = personalization_model.model_dump()
+
+            yield event({"type": "status", "step": "writing", "message": f"Writing your personalized cold email for {company_name}..."})
+            req = GenerateEmailDraftRequest(
+                user_id=user_id,
+                company_id=company_id,
+                outreach_type=outreach_type,
+            )
+            draft_model = await EmailWriterService().generate_email(
+                user_id=user_id,
+                company=context["company"],
+                personalization=personalization,
+                user_profile=context["profile"],
+                preferences=context["preferences"],
+                resume=context["resume"],
+                outreach_type=outreach_type,
+                use_ai=True,
+            )
+            draft_payload = {**draft_model.model_dump(), "version_number": 1}
+            stored = await _persist_email_draft_fast(user_id, draft_payload)
+            asyncio.create_task(
+                _finalize_email_draft_storage(
+                    user_id=user_id,
+                    company_id=company_id,
+                    stored=stored,
+                    personalization=personalization,
+                )
+            )
+            yield event({"type": "draft", "draft": stored, "personalization": personalization})
+            yield event({"type": "done"})
+        except HTTPException as exc:
+            yield event({"type": "error", "message": exc.detail})
+        except Exception as exc:
+            yield event({"type": "error", "message": str(exc) or "Failed to generate email draft"})
+
+    request_origin = (request.headers.get("origin") or "").rstrip("/")
+    allow_origin = request_origin if request_origin in ALLOWED_CORS_ORIGINS else ALLOWED_CORS_ORIGINS[0]
+
+    return StreamingResponse(
+        generate_and_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Access-Control-Allow-Origin": allow_origin,
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Vary": "Origin",
+        },
+    )
+
+
 @app.get("/outreach/drafts")
 async def get_email_drafts(user_id: str = Query(...), status: Optional[str] = None):
     cached = _outreach_drafts_cache.get(user_id, [])

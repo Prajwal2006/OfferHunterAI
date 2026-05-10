@@ -569,14 +569,20 @@ function CompanyFinderContent() {
         ).catch(() => null);
         if (cancelled) return;
 
-        // 3. Check for preferences
-        const prefsRes = await fetchWithTimeout(
-          buildApiUrl(`/company-finder/preferences/${encodeURIComponent(userId)}`)
-        );
-        if (cancelled) return;
-        if (!prefsRes.ok) throw new Error("Failed to fetch preferences");
-        const prefsData = await prefsRes.json();
-        if (cancelled) return;
+        // 3. Check for preferences (non-fatal: show results even if prefs API is down)
+        let prefsData: { preferences: UserPreferences | null } = { preferences: null };
+        try {
+          const prefsRes = await fetchWithTimeout(
+            buildApiUrl(`/company-finder/preferences/${encodeURIComponent(userId)}`)
+          );
+          if (cancelled) return;
+          if (prefsRes.ok) {
+            prefsData = await prefsRes.json();
+            if (cancelled) return;
+          }
+        } catch {
+          // preferences are optional - continue without them
+        }
         setPreferences(prefsData.preferences);
 
         const [orchestration, sessions, logs] = await Promise.all([
@@ -735,9 +741,17 @@ function CompanyFinderContent() {
           } else if (data.status === "failed") {
             isContinuingRef.current = false;
             setIsContinuing(false);
-            setError(data.message || "Agent failed");
             activeTaskIdRef.current = null;
-            setStep("error");
+            const failMsg = data.message || "Agent failed";
+            // If we already have companies, don't replace the page — just show an inline error
+            if (companies.length > 0) {
+              setError(failMsg);
+              setAgentMessage("");
+              setStep("results");
+            } else {
+              setError(failMsg);
+              setStep("error");
+            }
           }
         }
       } catch {
@@ -773,7 +787,7 @@ function CompanyFinderContent() {
       clearTimeout(fallbackTimer);
       clearInterval(stagePulseTimer);
     };
-  }, [step, userId]);
+  }, [step, userId, companies.length]);
 
   useEffect(() => {
     if (!handoffTaskId || !userId) {
@@ -1235,6 +1249,24 @@ function CompanyFinderContent() {
             setStep("results");
           }}
         />
+      )}
+
+      {/* Inline error banner — shown when agent fails but we still have companies */}
+      {step === "results" && error && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex items-center gap-3 px-4 py-3 bg-destructive/10 border border-destructive/25 rounded-xl text-sm"
+        >
+          <AlertTriangle className="w-4 h-4 text-destructive shrink-0" />
+          <span className="flex-1 text-foreground">{error}</span>
+          <button
+            onClick={() => setError(null)}
+            className="text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </motion.div>
       )}
 
       {handoffCompany && handoffEvents.length > 0 && (
