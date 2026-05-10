@@ -9,7 +9,7 @@ import EventStream from "@/components/EventStream";
 import OrchestrationFlow from "@/components/OrchestrationFlow";
 import TaskTimeline from "@/components/TaskTimeline";
 import { RequireAuth } from "@/components/RequireAuth";
-import { createEventSource, fetchOrchestrationState, fetchDiscoveredCompanies } from "@/lib/api";
+import { createEventSource, fetchOrchestrationState, fetchDiscoveredCompanies, fetchAgentEvents } from "@/lib/api";
 import { useAuth } from "@/components/AuthProvider";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -198,6 +198,30 @@ export default function AgentsPage() {
   }, [events]);
 
   // â”€â”€ Connect to real SSE stream â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Load historical events on mount so the agents tab shows past activity
+  useEffect(() => {
+    async function loadHistory() {
+      try {
+        const result = await fetchAgentEvents(100);
+        const str = (v: unknown, fallback = ""): string =>
+          typeof v === "string" ? v : fallback;
+        const historical: AgentEvent[] = (result.events ?? []).map((ev: Record<string, unknown>) => ({
+          id: str(ev.id) || `hist-${Date.now()}-${Math.random()}`,
+          agent_name: str(ev.agent_name, "Unknown"),
+          task_id: str(ev.task_id),
+          status: str(ev.status, "running"),
+          message: str(ev.message),
+          metadata: (ev.metadata as Record<string, unknown>) ?? {},
+          created_at: str(ev.created_at) || new Date().toISOString(),
+        }));
+        historical.forEach(applyEvent);
+      } catch {
+        // best-effort: silently skip if DB is not configured
+      }
+    }
+    void loadHistory();
+  }, [applyEvent]);
+
   useEffect(() => {
     esRef.current?.close();
 

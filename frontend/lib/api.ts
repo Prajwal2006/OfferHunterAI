@@ -148,6 +148,52 @@ export async function generateEmailDraft(payload: {
   }>;
 }
 
+export type EmailGenerationEvent =
+  | { type: "status"; step: string; message: string }
+  | { type: "draft"; draft: import("./types").EmailDraft; personalization: import("./types").PersonalizationProfile }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+/**
+ * Stream email generation events via SSE.
+ * Calls onEvent for each progress/draft/error event.
+ * Returns a cleanup function (closes the connection).
+ */
+export function streamEmailGeneration(
+  payload: { user_id: string; company_id: string; outreach_type?: string },
+  onEvent: (event: EmailGenerationEvent) => void,
+  onDone: () => void,
+): () => void {
+  const params = new URLSearchParams({
+    user_id: payload.user_id,
+    company_id: payload.company_id,
+    outreach_type: payload.outreach_type ?? "cold_email",
+  });
+  const url = `${API_URL}/outreach/drafts/generate/stream?${params}`;
+  const es = new EventSource(url);
+
+  es.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data) as EmailGenerationEvent;
+      onEvent(data);
+      if (data.type === "done" || data.type === "error") {
+        es.close();
+        onDone();
+      }
+    } catch {
+      // ignore malformed
+    }
+  };
+
+  es.onerror = () => {
+    es.close();
+    onEvent({ type: "error", message: "Connection to generation service lost. Please try again." });
+    onDone();
+  };
+
+  return () => es.close();
+}
+
 export async function fetchEmailDrafts(userId: string, status?: string) {
   const params = new URLSearchParams({ user_id: userId });
   if (status) params.set("status", status);

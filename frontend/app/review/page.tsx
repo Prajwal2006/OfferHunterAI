@@ -34,11 +34,12 @@ import {
   fetchEmailDrafts,
   fetchOutreachContacts,
   fetchPersonalization,
-  generateEmailDraft,
+  streamEmailGeneration,
   requestInlineAIEdit,
   restoreEmailVersion,
   updateEmailDraft,
 } from "@/lib/api";
+import type { EmailGenerationEvent } from "@/lib/api";
 import type {
   Company,
   EmailDraft,
@@ -168,7 +169,9 @@ export default function ReviewPage() {
     const key = `${userId}:${companyId}:${outreachType}`;
     if (autoGenerateKeyRef.current === key) return;
     autoGenerateKeyRef.current = key;
-    void generateForCompanyId(companyId, outreachType);
+    const cleanup = generateForCompanyId(companyId, outreachType);
+    return () => { if (cleanup) cleanup(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authLoading, userId]);
 
   useEffect(() => {
@@ -181,8 +184,9 @@ export default function ReviewPage() {
     const fullBody = selectedDraft.body || "";
     setTypedBody("");
     let index = 0;
+    // Type at ~4 chars per frame @ 16ms = ~250 chars/sec — feels natural like ChatGPT
     const timer = setInterval(() => {
-      index = Math.min(index + 10, fullBody.length);
+      index = Math.min(index + 4, fullBody.length);
       setTypedBody(fullBody.slice(0, index));
       if (index >= fullBody.length) {
         clearInterval(timer);
@@ -371,43 +375,56 @@ export default function ReviewPage() {
   }
 
   // â”€â”€â”€ Generate draft for company â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  async function generateForCompanyId(companyId: string, outreachType = "cold_email") {
+  function generateForCompanyId(companyId: string, outreachType = "cold_email") {
     if (!userId) return;
     setGeneratingFor(companyId);
-    setGenerationStatus("Collecting your resume, preferences, and company context...");
+    setGenerationStatus("Loading your profile and company data...");
     setLoadError(null);
-    try {
-      setGenerationStatus("Writing a polished first-person cold email...");
-      const res = await generateEmailDraft({ user_id: userId, company_id: companyId, outreach_type: outreachType });
-      const newDraft = res.draft;
-      setDrafts((prev) => {
-        const exists = prev.find((d) => d.company_id === companyId);
-        return exists ? prev.map((d) => (d.company_id === companyId ? newDraft : d)) : [newDraft, ...prev];
-      });
-      setSelectedDraft(newDraft);
-      setSelectedId(newDraft.id);
-      setPersonalization(res.personalization);
-      setTypedDraftId(newDraft.id);
-      setTypedBody("");
-      setGenerationStatus("Draft ready. Typing it into the editor...");
-      if (typeof window !== "undefined") {
-        const url = new URL(window.location.href);
-        url.searchParams.delete("generate");
-        url.searchParams.delete("type");
-        url.searchParams.set("draft", newDraft.id);
-        window.history.replaceState(null, "", `${url.pathname}${url.search}`);
-      }
-    } catch (err) {
-      console.error("Failed to generate draft", err);
-      setLoadError(err instanceof Error ? err.message : "Failed to generate draft.");
-    } finally {
-      setGeneratingFor(null);
-      setTimeout(() => setGenerationStatus(null), 1200);
-    }
+
+    const cleanup = streamEmailGeneration(
+      { user_id: userId, company_id: companyId, outreach_type: outreachType },
+      (ev: EmailGenerationEvent) => {
+        if (ev.type === "status") {
+          setGenerationStatus(ev.message);
+        } else if (ev.type === "draft") {
+          const newDraft = ev.draft;
+          setDrafts((prev) => {
+            const exists = prev.find((d) => d.company_id === companyId);
+            return exists ? prev.map((d) => (d.company_id === companyId ? newDraft : d)) : [newDraft, ...prev];
+          });
+          setSelectedDraft(newDraft);
+          setSelectedId(newDraft.id);
+          if (ev.personalization) setPersonalization(ev.personalization);
+          setTypedDraftId(newDraft.id);
+          setTypedBody("");
+          setGenerationStatus("Typing your email...");
+          if (typeof window !== "undefined") {
+            const url = new URL(window.location.href);
+            url.searchParams.delete("generate");
+            url.searchParams.delete("type");
+            url.searchParams.set("draft", newDraft.id);
+            window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+          }
+        } else if (ev.type === "error") {
+          setLoadError(ev.message || "Failed to generate draft.");
+          setGeneratingFor(null);
+          setTimeout(() => setGenerationStatus(null), 1200);
+        }
+      },
+      () => {
+        // onDone
+        setGeneratingFor(null);
+        setTimeout(() => setGenerationStatus(null), 1200);
+      },
+    );
+
+    // Store cleanup so we can cancel if component unmounts
+    // (cleanup is a no-op if SSE already closed)
+    return cleanup;
   }
 
-  async function generateForCompany(company: Company, outreachType = "cold_email") {
-    await generateForCompanyId(company.id, outreachType);
+  function generateForCompany(company: Company, outreachType = "cold_email") {
+    generateForCompanyId(company.id, outreachType);
   }
 
   // â”€â”€â”€ Refresh contacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -545,7 +562,7 @@ export default function ReviewPage() {
                       >
                         <span className="truncate text-sm text-muted-foreground">{company.name}</span>
                         <button
-                          onClick={() => void generateForCompany(company)}
+                          onClick={() => generateForCompany(company)}
                           disabled={generatingFor === company.id}
                           className="ml-2 flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:border-primary/40 hover:text-primary disabled:opacity-40"
                         >
