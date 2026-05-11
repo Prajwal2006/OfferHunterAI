@@ -8,6 +8,7 @@ import re
 import sys
 import uuid
 import time
+from threading import Lock
 from copy import deepcopy
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -48,6 +49,8 @@ from models.work_mode import normalize_company_work_mode
 _user_companies_cache: dict[str, list] = {}
 _outreach_drafts_cache: dict[str, list[dict[str, Any]]] = {}
 _workspace_repairs_running: set[str] = set()
+_workspace_repair_status: dict[str, dict[str, Any]] = {}
+_workspace_repair_lock = Lock()
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
 OUTREACH_DRAFT_USE_AI = os.getenv("OUTREACH_DRAFT_USE_AI", "false").strip().lower() in {"1", "true", "yes", "on"}
 try:
@@ -114,6 +117,113 @@ def _log_backend_action(action: str, **details: Any) -> None:
             "details": {k: _safe_preview(v, 4000) for k, v in details.items()},
         },
     )
+
+
+def _utc_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _repair_status_for(user_id: str) -> dict[str, Any]:
+    with _workspace_repair_lock:
+        status = dict(_workspace_repair_status.get(user_id) or {})
+        return {
+            "status": status.get("status", "idle"),
+            "job_id": status.get("job_id"),
+            "user_id": user_id,
+            "recovered_count": status.get("recovered_count", 0),
+            "error": status.get("error"),
+            "steps": status.get("steps", []),
+            "last_started_at": status.get("last_started_at"),
+            "last_finished_at": status.get("last_finished_at"),
+        }
+
+
+def _set_repair_status(user_id: str, **updates: Any) -> dict[str, Any]:
+    with _workspace_repair_lock:
+        current = dict(_workspace_repair_status.get(user_id) or {})
+        current.update(updates)
+        current["user_id"] = user_id
+        _workspace_repair_status[user_id] = current
+        return dict(current)
+
+
+async def _persist_workspace_repair_status(user_id: str, status: dict[str, Any]) -> None:
+    """Best-effort repair status persistence; never block user-facing reads."""
+    try:
+        existing = await _db_call(
+            "repair.status.orchestration_state",
+            lambda: supabase_client.get_orchestration_state(user_id),
+            timeout=2.0,
+            fallback=None,
+        )
+        progress = dict((existing or {}).get("progress") or {})
+        progress["workspace_repair"] = {
+            "status": status.get("status"),
+            "job_id": status.get("job_id"),
+            "recovered_count": status.get("recovered_count", 0),
+            "error": status.get("error"),
+            "last_started_at": status.get("last_started_at"),
+            "last_finished_at": status.get("last_finished_at"),
+            "steps": status.get("steps", []),
+        }
+        await _db_call(
+            "repair.status.persist",
+            lambda: supabase_client.upsert_orchestration_state(
+                {
+                    "user_id": user_id,
+                    "progress": progress,
+                }
+            ),
+            timeout=2.0,
+            fallback={},
+        )
+    except Exception:
+        pass
+
+
+async def _db_call(
+    label: str,
+    coro_factory,
+    *,
+    timeout: float = 3.0,
+    fallback: Any = None,
+) -> Any:
+    """
+    Run a Supabase wrapper off the FastAPI event loop.
+
+    Most methods in db.supabase are declared async but use the synchronous
+    supabase-py client internally, so awaiting them directly can stall every
+    request until network I/O returns.
+    """
+    started = time.perf_counter()
+
+    def run() -> Any:
+        return asyncio.run(coro_factory())
+
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(run), timeout=timeout)
+        _log_backend_action(
+            "db_call.completed",
+            label=label,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+        return result
+    except asyncio.TimeoutError:
+        _log_backend_action(
+            "db_call.timeout",
+            label=label,
+            timeout_seconds=timeout,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+        return fallback
+    except Exception as exc:
+        _log_backend_action(
+            "db_call.failed",
+            label=label,
+            error=str(exc),
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+        return fallback
 
 
 def _build_allowed_cors_origins() -> list[str]:
@@ -806,8 +916,13 @@ async def get_agent_events(
 ):
     """Poll for recent agent events."""
     try:
-        result = await supabase_client.get_agent_events(
-            limit=limit, agent_name=agent_name, status=status
+        result = await _db_call(
+            "agent_events.list",
+            lambda: supabase_client.get_agent_events(
+                limit=limit, agent_name=agent_name, status=status
+            ),
+            timeout=3.0,
+            fallback=[],
         )
         return {"events": result, "total": len(result)}
     except Exception:
@@ -2049,7 +2164,7 @@ async def _persist_recovered_workspace_companies(
     return recovered
 
 
-async def _recover_workspace_from_agent_events(user_id: str) -> list[dict[str, Any]]:
+async def _recover_workspace_from_agent_events(user_id: str, sweep_limit: int = 50) -> list[dict[str, Any]]:
     """
     Repair old runs that emitted completed companies but failed before
     user_companies was durable.
@@ -2091,7 +2206,7 @@ async def _recover_workspace_from_agent_events(user_id: str) -> list[dict[str, A
         # orchestration_state.last_task_id is overwritten by newer runs. Sweep
         # completed CompanyFinder artifacts too. Newer events include user_id;
         # legacy events do not, so they are treated as repair candidates.
-        events = await supabase_client.get_completed_company_finder_events(limit=200)
+        events = await supabase_client.get_completed_company_finder_events(limit=sweep_limit)
         for event in events:
             metadata = event.get("metadata") or {}
             if metadata.get("user_id") and metadata.get("user_id") != user_id:
@@ -2156,33 +2271,83 @@ async def _repair_workspace_memory(user_id: str) -> dict[str, Any]:
     This is intentionally not called from the normal read path. It performs
     write-heavy recovery and can touch many rows, so it runs in the background.
     """
-    if user_id in _workspace_repairs_running:
-        return {"status": "already_running", "recovered_count": 0}
-
-    _workspace_repairs_running.add(user_id)
     recovered_by_key: dict[str, dict[str, Any]] = {}
-    try:
-        ranking_rows = await supabase_client.backfill_user_companies_from_rankings(user_id)
-        legacy_companies = await _recover_workspace_from_legacy_companies(user_id)
-        event_companies = await _recover_workspace_from_agent_events(user_id)
 
-        for row in ranking_rows:
-            company = _workspace_row_to_company(row) if row.get("companies") else row
-            key = _company_memory_key(company)
-            if key:
-                recovered_by_key[key] = company
-        for company in legacy_companies + event_companies:
-            key = _company_memory_key(company)
-            if key:
-                recovered_by_key[key] = company
+    async def run_step(step: str, coro_factory, timeout: float) -> Any:
+        started = time.perf_counter()
+        current = _repair_status_for(user_id)
+        steps = list(current.get("steps") or [])
+        steps.append({"step": step, "status": "running", "started_at": _utc_iso()})
+        _set_repair_status(user_id, steps=steps)
+        _log_backend_action("workspace_repair.step_started", user_id=user_id, step=step)
 
-        recovered = list(recovered_by_key.values())
-        if recovered:
-            _merge_user_company_cache(user_id, recovered)
+        result = await _db_call(
+            f"workspace_repair.{step}",
+            coro_factory,
+            timeout=timeout,
+            fallback=[],
+        )
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        result_count = len(result) if isinstance(result, list) else 0
+        current = _repair_status_for(user_id)
+        steps = list(current.get("steps") or [])
+        for item in reversed(steps):
+            if item.get("step") == step and item.get("status") == "running":
+                item.update(
+                    {
+                        "status": "completed",
+                        "duration_ms": duration_ms,
+                        "result_count": result_count,
+                        "finished_at": _utc_iso(),
+                    }
+                )
+                break
+        _set_repair_status(user_id, steps=steps)
+        _log_backend_action(
+            "workspace_repair.step_completed",
+            user_id=user_id,
+            step=step,
+            duration_ms=duration_ms,
+            result_count=result_count,
+        )
+        return result
 
-        return {"status": "completed", "recovered_count": len(recovered)}
-    finally:
-        _workspace_repairs_running.discard(user_id)
+    ranking_rows = await run_step(
+        "ranking_backfill",
+        lambda: supabase_client.backfill_user_companies_from_rankings(user_id),
+        timeout=20.0,
+    )
+    legacy_companies = await run_step(
+        "legacy_companies",
+        lambda: _recover_workspace_from_legacy_companies(user_id),
+        timeout=20.0,
+    )
+
+    # Agent-event sweeps are expensive and only needed when lighter repair
+    # sources did not recover anything useful.
+    event_companies: list[dict[str, Any]] = []
+    if not ranking_rows and not legacy_companies:
+        event_companies = await run_step(
+            "agent_event_sweep",
+            lambda: _recover_workspace_from_agent_events(user_id, sweep_limit=50),
+            timeout=45.0,
+        )
+
+    for row in ranking_rows:
+        company = _workspace_row_to_company(row) if row.get("companies") else row
+        key = _company_memory_key(company)
+        if key:
+            recovered_by_key[key] = company
+    for company in legacy_companies + event_companies:
+        key = _company_memory_key(company)
+        if key:
+            recovered_by_key[key] = company
+
+    recovered = list(recovered_by_key.values())
+    if recovered:
+        _merge_user_company_cache(user_id, recovered)
+
+    return {"status": "completed", "recovered_count": len(recovered)}
 
 
 @app.get("/company-finder/companies")
@@ -2202,15 +2367,28 @@ async def get_discovered_companies(
     """
     preferences: dict[str, Any] = {}
     try:
-        preferences = normalize_preference_payload(await supabase_client.get_user_preferences(user_id) or {})
-        rows = await supabase_client.get_user_companies(
-            user_id=user_id,
-            limit=limit,
-            offset=offset,
-            include_archived=include_archived,
-            include_removed=include_removed,
-            stage=stage,
-            source=source,
+        preferences = normalize_preference_payload(
+            await _db_call(
+                "companies.preferences",
+                lambda: supabase_client.get_user_preferences(user_id),
+                timeout=1.5,
+                fallback={},
+            )
+            or {}
+        )
+        rows = await _db_call(
+            "companies.user_companies",
+            lambda: supabase_client.get_user_companies(
+                user_id=user_id,
+                limit=limit,
+                offset=offset,
+                include_archived=include_archived,
+                include_removed=include_removed,
+                stage=stage,
+                source=source,
+            ),
+            timeout=4.0,
+            fallback=[],
         )
 
         companies = []
@@ -2241,7 +2419,12 @@ async def get_discovered_companies(
         # ── Fallback 1: legacy company_rankings table ──────────────────────────
         # user_companies might be empty if migration 005 hasn't been run or
         # companies were stored before the new persistence layer was added.
-        ranking_rows = await supabase_client.get_company_rankings(user_id, limit=limit)
+        ranking_rows = await _db_call(
+            "companies.legacy_rankings",
+            lambda: supabase_client.get_company_rankings(user_id, limit=limit),
+            timeout=3.0,
+            fallback=[],
+        )
         if ranking_rows:
             legacy = []
             for row in ranking_rows:
@@ -2302,7 +2485,12 @@ async def get_discovered_companies(
         return {"companies": [], "total": 0, "error": str(e)}
 
 
-@app.post("/company-finder/companies/repair")
+@app.get("/company-finder/companies/repair/status")
+async def get_company_workspace_repair_status(user_id: str = Query(...)):
+    return _repair_status_for(user_id)
+
+
+@app.post("/company-finder/companies/repair", status_code=202)
 async def repair_company_workspace(request: WorkspaceRepairRequest):
     """
     Start non-blocking repair of historical discovery artifacts.
@@ -2310,18 +2498,70 @@ async def repair_company_workspace(request: WorkspaceRepairRequest):
     Normal company reads must stay fast. This endpoint reconciles legacy rows
     and old agent-event company payloads into user_companies in the background.
     """
-    async def run_repair():
-        try:
-            await _repair_workspace_memory(request.user_id)
-        except Exception:
-            pass
+    user_id = request.user_id
 
-    if request.user_id not in _workspace_repairs_running:
-        asyncio.create_task(run_repair())
+    if user_id in _workspace_repairs_running:
+        current = _repair_status_for(user_id)
+        return {
+            "status": current.get("status") or "running",
+            "job_id": current.get("job_id"),
+            "user_id": user_id,
+        }
+
+    job_id = str(uuid.uuid4())
+    _workspace_repairs_running.add(user_id)
+    queued = _set_repair_status(
+        user_id,
+        status="queued",
+        job_id=job_id,
+        recovered_count=0,
+        error=None,
+        steps=[],
+        last_started_at=None,
+        last_finished_at=None,
+    )
+
+    async def run_repair():
+        status_payload = _set_repair_status(
+            user_id,
+            status="running",
+            job_id=job_id,
+            last_started_at=_utc_iso(),
+            last_finished_at=None,
+            error=None,
+        )
+        await _persist_workspace_repair_status(user_id, status_payload)
+        try:
+            result = await _repair_workspace_memory(user_id)
+            status_payload = _set_repair_status(
+                user_id,
+                status="completed",
+                job_id=job_id,
+                recovered_count=result.get("recovered_count", 0),
+                last_finished_at=_utc_iso(),
+                error=None,
+            )
+            await _persist_workspace_repair_status(user_id, status_payload)
+        except Exception as exc:
+            status_payload = _set_repair_status(
+                user_id,
+                status="failed",
+                job_id=job_id,
+                error=str(exc),
+                last_finished_at=_utc_iso(),
+            )
+            await _persist_workspace_repair_status(user_id, status_payload)
+            _log_backend_action("workspace_repair.failed", user_id=user_id, job_id=job_id, error=str(exc))
+        finally:
+            _workspace_repairs_running.discard(user_id)
+
+    asyncio.create_task(run_repair())
+    _log_backend_action("workspace_repair.queued", user_id=user_id, job_id=job_id)
 
     return {
-        "status": "started" if request.user_id not in _workspace_repairs_running else "already_running",
-        "user_id": request.user_id,
+        "status": queued.get("status", "queued"),
+        "job_id": job_id,
+        "user_id": user_id,
     }
 
 
@@ -2548,7 +2788,12 @@ async def get_discovery_source_logs(
 @app.get("/company-finder/orchestration/{user_id}")
 async def get_orchestration_state(user_id: str):
     try:
-        state = await supabase_client.get_orchestration_state(user_id)
+        state = await _db_call(
+            "orchestration_state.get",
+            lambda: supabase_client.get_orchestration_state(user_id),
+            timeout=2.5,
+            fallback=None,
+        )
         return {"state": state}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -25,15 +25,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    supabase.auth.getSession().then(({ data }) => {
-      if (!mounted) return;
-      setSession(data.session ?? null);
-      setLoading(false);
-    });
-
+    // onAuthStateChange fires INITIAL_SESSION synchronously on mount, so we
+    // don't also call getSession() — that would cause two state updates and
+    // re-trigger any effects depending on authLoading/userId twice.
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!mounted) return;
       setSession(nextSession ?? null);
       setLoading(false);
     });

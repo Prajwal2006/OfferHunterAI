@@ -149,6 +149,7 @@ export default function ReviewPage() {
   const toolbarRef = useRef<HTMLDivElement>(null);
   const saveDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoGenerateKeyRef = useRef<string | null>(null);
+  const loadAllRunning = useRef(false);
 
   // â”€â”€â”€ Effects â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
@@ -216,6 +217,8 @@ export default function ReviewPage() {
 
   // â”€â”€â”€ Data loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   async function loadAll(uid: string) {
+    if (loadAllRunning.current) return;
+    loadAllRunning.current = true;
     logFrontendAction("review.load_all.started", { user_id: uid });
     setLoading(true);
     setLoadError(null);
@@ -249,6 +252,7 @@ export default function ReviewPage() {
       });
       setLoadError(err instanceof Error ? err.message : "Failed to load.");
     } finally {
+      loadAllRunning.current = false;
       setLoading(false);
     }
   }

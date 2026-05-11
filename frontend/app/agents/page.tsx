@@ -179,8 +179,10 @@ export default function AgentsPage() {
   const [filterAgent, setFilterAgent] = useState<string>("all");
   const [persistedStage, setPersistedStage] = useState<string | undefined>(undefined);
   const [timelineItems, setTimelineItems] = useState<PipelineItem[]>([]);
+  const [timelineRefreshKey, setTimelineRefreshKey] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
   const esRef = useRef<EventSource | null>(null);
+  const timelineRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Derive active step from agent states
   const runningAgent = agents.find((a) => a.status === "running");
@@ -319,7 +321,23 @@ export default function AgentsPage() {
     }
 
     void loadTimeline();
-  }, [session?.user?.id, events.length]);
+  }, [session?.user?.id, timelineRefreshKey]);
+
+  useEffect(() => {
+    const latest = events[0];
+    if (!latest || !["completed", "failed", "error"].includes(latest.status)) return;
+    if (!["CompanyFinderAgent", "EmailWriterAgent", "HumanReviewAgent"].includes(latest.agent_name)) return;
+    if (timelineRefreshTimerRef.current) clearTimeout(timelineRefreshTimerRef.current);
+    timelineRefreshTimerRef.current = setTimeout(() => {
+      setTimelineRefreshKey((value) => value + 1);
+    }, 1500);
+  }, [events]);
+
+  useEffect(() => {
+    return () => {
+      if (timelineRefreshTimerRef.current) clearTimeout(timelineRefreshTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     async function loadOrchestrationState() {
@@ -408,7 +426,7 @@ export default function AgentsPage() {
           <motion.button
             whileHover={{ scale: 1.05 }}
             whileTap={{ scale: 0.95 }}
-            onClick={() => window.location.reload()}
+            onClick={() => setTimelineRefreshKey((value) => value + 1)}
             className="p-2.5 rounded-xl glass border border-border text-muted-foreground hover:text-foreground hover:border-primary/30 transition-all"
             title="Refresh"
           >

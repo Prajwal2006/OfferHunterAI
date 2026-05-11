@@ -608,19 +608,42 @@ export async function fetchDiscoveredCompanies(
   if (opts?.includeRemoved) params.set("include_removed", "true");
   if (opts?.stage) params.set("stage", opts.stage);
   if (opts?.source) params.set("source", opts.source);
-  const res = await apiFetch(`${API_URL}/company-finder/companies?${params}`);
+  const res = await fetchWithTimeout(`${API_URL}/company-finder/companies?${params}`, undefined, 10_000);
   if (!res.ok) throw new Error("Failed to fetch companies");
   return res.json() as Promise<CompanyWorkspaceResponse>;
 }
 
 export async function repairCompanyWorkspace(userId: string) {
-  const res = await apiFetch(`${API_URL}/company-finder/companies/repair`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId }),
-  });
+  const res = await fetchWithTimeout(
+    `${API_URL}/company-finder/companies/repair`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    },
+    2_000
+  );
   if (!res.ok) throw new Error("Failed to start workspace repair");
-  return res.json() as Promise<{ status: string; user_id: string }>;
+  return res.json() as Promise<{ status: string; job_id?: string; user_id: string }>;
+}
+
+export async function fetchCompanyWorkspaceRepairStatus(userId: string) {
+  const params = new URLSearchParams({ user_id: userId });
+  const res = await fetchWithTimeout(
+    `${API_URL}/company-finder/companies/repair/status?${params}`,
+    undefined,
+    2_000
+  );
+  if (!res.ok) throw new Error("Failed to fetch workspace repair status");
+  return res.json() as Promise<{
+    status: "idle" | "queued" | "running" | "completed" | "failed";
+    job_id?: string | null;
+    user_id: string;
+    recovered_count?: number;
+    last_started_at?: string | null;
+    last_finished_at?: string | null;
+    error?: string | null;
+  }>;
 }
 
 export async function updateWorkspaceCompany(

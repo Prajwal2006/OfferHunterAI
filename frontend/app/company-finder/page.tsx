@@ -30,6 +30,8 @@ import {
   fetchDiscoverySourceLogs,
   buildApiUrl,
   fetchEmailDrafts,
+  repairCompanyWorkspace,
+  fetchCompanyWorkspaceRepairStatus,
 } from "@/lib/api";
 import {
   Company,
@@ -629,36 +631,35 @@ function CompanyFinderContent() {
         }
 
         // 4. Check for existing companies — show them without auto-running discovery
-        const companyData = await fetchJsonWithTimeout<{ companies: Company[] }>(
-          buildApiUrl(`/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=1000`),
+        const companyData = await fetchJsonWithTimeout<{
+          companies: Company[];
+          hidden_by_preferences?: Company[];
+          archived_companies?: Company[];
+        }>(
+          buildApiUrl(`/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=100`),
           undefined,
           { companies: [] }
         );
         if (cancelled) return;
         setCompanies((prev) => mergeCompanies(prev, companyData.companies));
         setStep("results");
-        if (repairRequestedForUserRef.current !== userId) {
+        const workspaceCount =
+          (companyData.companies ?? []).length +
+          (companyData.hidden_by_preferences ?? []).length +
+          (companyData.archived_companies ?? []).length;
+        if (workspaceCount === 0 && repairRequestedForUserRef.current !== userId) {
           repairRequestedForUserRef.current = userId;
-          void fetchJsonWithTimeout<{ status: string; user_id: string }>(
-            buildApiUrl("/company-finder/companies/repair"),
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ user_id: userId }),
-            },
-            { status: "skipped", user_id: userId }
-          )
-            .then(() => new Promise((resolve) => setTimeout(resolve, 2500)))
-            .then(() =>
-              fetchJsonWithTimeout<{ companies: Company[] }>(
-                buildApiUrl(`/company-finder/companies?user_id=${encodeURIComponent(userId)}&limit=1000`),
-                undefined,
-                { companies: [] }
-              )
-            )
-            .then((data) => {
-              if (!cancelled) {
-                setCompanies((prev) => mergeCompanies(prev, data.companies));
+          void repairCompanyWorkspace(userId)
+            .then(async () => {
+              for (let attempt = 0; attempt < 6 && !cancelled; attempt += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 2500));
+                const status = await fetchCompanyWorkspaceRepairStatus(userId);
+                if (status.status !== "completed") continue;
+                const data = await fetchDiscoveredCompanies(userId, { limit: 100 });
+                if (!cancelled) {
+                  setCompanies((prev) => mergeCompanies(prev, data.companies));
+                }
+                break;
               }
             })
             .catch(() => {
@@ -705,7 +706,7 @@ function CompanyFinderContent() {
 
           const shouldRefreshCompanies = Boolean((data.metadata || {}).refresh_companies);
           if (shouldRefreshCompanies) {
-            fetchDiscoveredCompanies(userId, { limit: 1000 })
+            fetchDiscoveredCompanies(userId, { limit: 100 })
               .then((res) => {
                 setCompanies((prev) => mergeCompanies(prev, res.companies));
                 void fetchDiscoverySourceLogs(userId, { limit: 24 }).then((logs) =>
@@ -721,7 +722,7 @@ function CompanyFinderContent() {
             isContinuingRef.current = false;
             setIsContinuing(false);
             // Always reload from DB so persisted state is the source of truth
-            fetchDiscoveredCompanies(userId, { limit: 1000 })
+            fetchDiscoveredCompanies(userId, { limit: 100 })
               .then((res) => {
                 setCompanies((prev) =>
                   res.companies.length > 0 || prev.length === 0
@@ -765,7 +766,7 @@ function CompanyFinderContent() {
     const fallbackTimer = setTimeout(() => {
       isContinuingRef.current = false;
       setIsContinuing(false);
-      fetchDiscoveredCompanies(userId, { limit: 1000 })
+      fetchDiscoveredCompanies(userId, { limit: 100 })
         .then((res) => {
           setCompanies((prev) => mergeCompanies(prev, res.companies));
           activeTaskIdRef.current = null;
@@ -1021,7 +1022,7 @@ function CompanyFinderContent() {
           feedback_type: feedback,
         });
       } catch {
-        await fetchDiscoveredCompanies(userId, { limit: 1000 }).then((data) =>
+        await fetchDiscoveredCompanies(userId, { limit: 100 }).then((data) =>
           setCompanies((prev) => mergeCompanies(prev, data.companies))
         );
       }
@@ -1036,7 +1037,7 @@ function CompanyFinderContent() {
       try {
         await updateWorkspaceCompany(company.id, { user_id: userId, archived: true });
       } catch {
-        await fetchDiscoveredCompanies(userId, { limit: 1000 }).then((data) =>
+        await fetchDiscoveredCompanies(userId, { limit: 100 }).then((data) =>
           setCompanies((prev) => mergeCompanies(prev, data.companies))
         );
       }
@@ -1051,7 +1052,7 @@ function CompanyFinderContent() {
       try {
         await updateWorkspaceCompany(company.id, { user_id: userId, removed: true });
       } catch {
-        await fetchDiscoveredCompanies(userId, { limit: 1000 }).then((data) =>
+        await fetchDiscoveredCompanies(userId, { limit: 100 }).then((data) =>
           setCompanies((prev) => mergeCompanies(prev, data.companies))
         );
       }
