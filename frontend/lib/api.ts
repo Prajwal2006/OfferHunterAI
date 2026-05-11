@@ -1,3 +1,5 @@
+import clientLogger, { fetchWithLogging } from "./client-logger";
+
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/+$/, "");
 const FRONTEND_LOG_ENDPOINT = `${API_URL}/debug/logs/frontend`;
 const SSE_INACTIVITY_TIMEOUT_MS = 20_000;
@@ -19,6 +21,13 @@ function safeLogPayload(payload: unknown): unknown {
 
 function isLogEndpoint(url: string): boolean {
   return url.includes("/debug/logs/frontend");
+}
+
+function isAbortLikeError(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  if (error instanceof DOMException && error.name === "AbortError") return true;
+  if (error instanceof Error && /abort|aborted|timeout/i.test(error.message)) return true;
+  return false;
 }
 
 function sendFrontendLog(
@@ -53,6 +62,7 @@ function sendFrontendLog(
 
 export function logFrontendAction(event: string, payload?: Record<string, unknown>) {
   sendFrontendLog("frontend-action", event, payload);
+  clientLogger.logUserAction(event, "manual-action", payload);
 }
 
 async function apiFetch(
@@ -69,6 +79,7 @@ async function apiFetch(
       url,
       timeout_ms: context?.timeoutMs,
     });
+    clientLogger.logApiCall(url, method, { timeout_ms: context?.timeoutMs });
   }
   try {
     const response = await fetch(input, init);
@@ -82,12 +93,34 @@ async function apiFetch(
         ok: response.ok,
         duration_ms: Math.round(durationMs),
       });
+      clientLogger.logApiResponse(url, method, response.status, Math.round(durationMs));
     }
     return response;
   } catch (error) {
     const durationMs =
       (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
     if (!isLogEndpoint(url)) {
+      if (isAbortLikeError(error, init?.signal)) {
+        sendFrontendLog(
+          "frontend-api",
+          "request.aborted",
+          {
+            method,
+            url,
+            duration_ms: Math.round(durationMs),
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "info"
+        );
+        clientLogger.logUserAction("api_request_aborted", "api-client", {
+          method,
+          url,
+          duration_ms: Math.round(durationMs),
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+
       sendFrontendLog(
         "frontend-api",
         "request.failed",
@@ -98,6 +131,12 @@ async function apiFetch(
           error: error instanceof Error ? error.message : String(error),
         },
         "error"
+      );
+      clientLogger.logError(
+        "api_request_failed",
+        error instanceof Error ? error.message : String(error),
+        { method, url, duration_ms: Math.round(durationMs) },
+        error instanceof Error ? error.stack : undefined
       );
     }
     throw error;
@@ -139,6 +178,7 @@ export async function runAgents(payload: {
   resume_text?: string;
   resume_version_id?: string;
 }) {
+  clientLogger.logButtonClick("agents", "run_agents", payload);
   const res = await apiFetch(`${API_URL}/agents/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

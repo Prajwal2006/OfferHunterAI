@@ -40,6 +40,7 @@ from services.email_editor_service import EmailEditorService
 from services.email_writer_service import EmailWriterService
 from services.personalization_service import PersonalizationService
 from services.versioning_service import VersioningService
+from services.logger_service import get_logger
 from models.work_mode import normalize_company_work_mode
 
 # In-memory company results cache (user_id -> companies list)
@@ -55,6 +56,8 @@ except ValueError:
     STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = 18.0
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+UNIFIED_LOG_FILE = LOGS_DIR / "app.log"
+UNIFIED_LOG_FILE.touch(exist_ok=True)
 
 
 def _safe_preview(value: Any, max_chars: int = 1000) -> Any:
@@ -76,11 +79,29 @@ def _safe_preview(value: Any, max_chars: int = 1000) -> Any:
 def _write_log(file_name: str, payload: dict[str, Any]) -> None:
     entry = {
         "ts": datetime.utcnow().isoformat(),
+        "log_channel": file_name,
         **payload,
     }
+
+    def format_value(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        else:
+            text = str(value)
+        return text if len(text) <= 4000 else text[:4000] + "...[truncated]"
+
+    parts = [
+        str(entry.get("ts") or datetime.utcnow().isoformat()),
+        f"channel={entry.get('log_channel', 'legacy')}",
+    ]
+    for key, value in entry.items():
+        if key in {"ts", "log_channel"} or value is None:
+            continue
+        parts.append(f"{key}={format_value(value)}")
+
     try:
-        with (LOGS_DIR / file_name).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        with UNIFIED_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(" | ".join(parts) + "\n")
     except Exception:
         pass
 
@@ -476,11 +497,14 @@ app.add_middleware(
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
+    logger = get_logger()
     started = time.perf_counter()
     request_id = str(uuid.uuid4())
     request_payload: Any = None
     request_body_size = 0
     content_type = (request.headers.get("content-type") or "").lower()
+    user_id = request.headers.get("x-user-id") or request.headers.get("user-id")
+    
     try:
         if content_type.startswith("multipart/") or "application/octet-stream" in content_type:
             request_payload = f"[{content_type or 'binary'} body omitted]"
@@ -497,10 +521,33 @@ async def request_logging_middleware(request: Request, call_next):
                     request_payload = f"[{content_type or 'raw'} body omitted]"
     except Exception:
         request_payload = "[failed to read request body]"
+    
+    # Log API request using the new logger service
+    logger.log_api_request(
+        endpoint=request.url.path,
+        method=request.method,
+        user_id=user_id,
+        body=request_payload,
+        status="received",
+        request_id=request_id,
+        client_host=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
 
     try:
         response = await call_next(request)
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        
+        # Log API response using the new logger service
+        logger.log_api_response(
+            request_id=request_id,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+            endpoint=request.url.path,
+            method=request.method,
+        )
+        
+        # Also write to legacy format for backward compatibility
         _write_log(
             "api-calls.jsonl",
             {
@@ -520,6 +567,22 @@ async def request_logging_middleware(request: Request, call_next):
         return response
     except Exception as exc:
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        
+        # Log error using the new logger service
+        logger.log_error(
+            error_type="api_request_failed",
+            message=str(exc),
+            user_id=user_id,
+            context={
+                "request_id": request_id,
+                "endpoint": request.url.path,
+                "method": request.method,
+                "duration_ms": duration_ms,
+            },
+            severity="error",
+        )
+        
+        # Also write to legacy format
         _write_log(
             "api-calls.jsonl",
             {
@@ -1309,17 +1372,87 @@ async def stream_email_generation(
 
 
 @app.post("/debug/logs/frontend")
-async def ingest_frontend_logs(request: FrontendClientLogRequest):
-    file_name = "frontend-api.jsonl" if request.source == "frontend-api" else "frontend-actions.jsonl"
-    _write_log(
-        file_name,
-        {
-            "kind": request.source,
-            "event": request.event,
-            "level": request.level,
-            "payload": _safe_preview(request.payload or {}, 8000),
-        },
-    )
+async def ingest_frontend_logs(request: Request):
+    """
+    Receive and persist comprehensive frontend logs.
+    Supports both legacy format and new structured format.
+    """
+    logger = get_logger()
+    
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "Invalid JSON"}
+    
+    # Handle new structured format from client-logger
+    if "logs" in body:
+        logs = body.get("logs", [])
+        user_id = body.get("user_id")
+        session_id = body.get("session_id")
+        
+        for log_entry in logs:
+            event_type = log_entry.get("event_type", "unknown")
+            component = log_entry.get("component", "unknown")
+            
+            if event_type == "button_click":
+                logger.log_business_logic(
+                    action=log_entry.get("action", "unknown_click"),
+                    user_id=user_id,
+                    details={
+                        "component": component,
+                        "session_id": session_id,
+                        **log_entry.get("details", {}),
+                    },
+                )
+            elif event_type == "api_call":
+                logger.log_api_request(
+                    endpoint=log_entry.get("endpoint", "unknown"),
+                    method=log_entry.get("method", "GET"),
+                    user_id=user_id,
+                    body=log_entry.get("details"),
+                )
+            elif event_type == "api_response":
+                logger.log_api_response(
+                    request_id=log_entry.get("endpoint", "unknown"),
+                    status_code=log_entry.get("status_code", 0),
+                    duration_ms=log_entry.get("duration_ms"),
+                )
+            elif event_type == "error":
+                logger.log_error(
+                    error_type=log_entry.get("error_type", "unknown"),
+                    message=log_entry.get("error_message", "Unknown error"),
+                    user_id=user_id,
+                    context=log_entry.get("details"),
+                    severity="error",
+                )
+            elif event_type == "performance":
+                logger.log_performance(
+                    operation=log_entry.get("action", "unknown"),
+                    duration_ms=log_entry.get("duration_ms", 0),
+                    user_id=user_id,
+                    metadata=log_entry.get("details"),
+                )
+            else:
+                logger.log_frontend_event(
+                    event_type=event_type,
+                    component=component,
+                    user_id=user_id,
+                    details=log_entry.get("details"),
+                    level=log_entry.get("level", "info"),
+                )
+    else:
+        # Handle legacy format
+        file_name = "frontend-api.jsonl" if body.get("source") == "frontend-api" else "frontend-actions.jsonl"
+        _write_log(
+            file_name,
+            {
+                "kind": body.get("source", "unknown"),
+                "event": body.get("event", "unknown"),
+                "level": body.get("level", "info"),
+                "payload": _safe_preview(body.get("payload", {}), 8000),
+            },
+        )
+    
     return {"ok": True}
 
 
@@ -1558,6 +1691,8 @@ async def health_check():
         "service": "OfferHunter AI API",
         "version": "1.0.0",
         "timestamp": datetime.utcnow().isoformat(),
+        "source_file": str(Path(__file__).resolve()),
+        "has_debug_logs_route": any(getattr(route, "path", "") == "/debug/logs/frontend" for route in app.routes),
     }
 
 

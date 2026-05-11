@@ -5,6 +5,7 @@ node_modules/
 .venv/
 venv/
 
+
 # Next.js
 frontend/.next/
 frontend/out/
@@ -52,6 +53,7 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+logs/
 
 # Testing
 coverage/

@@ -5,6 +5,7 @@ import { ThemeProvider } from "@/components/ThemeProvider";
 import { AnimatedBackground } from "@/components/AnimatedBackground";
 import { Footer } from "@/components/Footer";
 import { AuthProvider } from "@/components/AuthProvider";
+import { GlobalInteractionLogger } from "@/components/GlobalInteractionLogger";
 
 export const metadata: Metadata = {
   title: "OfferHunter AI | AI-Powered Job Discovery & Outreach",
@@ -42,6 +43,7 @@ export default function RootLayout({
           disableTransitionOnChange={false}
         >
           <AuthProvider>
+            <GlobalInteractionLogger />
             <AnimatedBackground />
             <div className="relative z-10 flex flex-col min-h-screen">
               <Navigation />
