@@ -30,6 +30,7 @@ export interface LogEvent {
   duration_ms?: number;
   error_message?: string;
   error_type?: string;
+  user_id?: string;
   details?: Record<string, unknown>;
   level: "info" | "warning" | "error" | "debug";
 }
@@ -62,23 +63,25 @@ class ClientLogger {
   private setupAutoFlush() {
     // Flush when buffer reaches limit
     const originalPush = this.logBuffer.push.bind(this.logBuffer);
-    const self = this;
-    this.logBuffer.push = function (...items: LogEvent[]) {
+    this.logBuffer.push = (...items: LogEvent[]) => {
       const result = originalPush(...items);
-      if (self.logBuffer.length >= self.bufferSize) {
-        self.flush();
+      if (this.logBuffer.length >= this.bufferSize) {
+        void this.flush();
       }
       return result;
     };
   }
 
-  private safeSerialize(value: unknown): unknown {
+  private safeSerialize(value: unknown): Record<string, unknown> {
     try {
-      const serialized = JSON.stringify(value ?? {});
-      if (serialized.length <= 3000) return value;
-      return `${serialized.slice(0, 3000)}...[truncated]`;
+      if (!value || typeof value !== "object") {
+        return value === undefined ? {} : { value };
+      }
+      const serialized = JSON.stringify(value);
+      if (serialized.length <= 3000) return value as Record<string, unknown>;
+      return { value: `${serialized.slice(0, 3000)}...[truncated]` };
     } catch {
-      return String(value);
+      return { value: String(value) };
     }
   }
 
@@ -128,6 +131,7 @@ class ClientLogger {
       event_type: "button_click",
       component,
       action,
+      user_id: userId,
       details: this.safeSerialize(details),
       level: "info",
     });
@@ -146,6 +150,7 @@ class ClientLogger {
       component: "api-client",
       endpoint,
       method,
+      user_id: userId,
       details: this.safeSerialize(details),
       level: "info",
     });
@@ -168,6 +173,7 @@ class ClientLogger {
       method,
       status_code: statusCode,
       duration_ms: durationMs,
+      user_id: userId,
       details: this.safeSerialize(details),
       level: statusCode >= 400 ? "warning" : "info",
     });
@@ -187,6 +193,7 @@ class ClientLogger {
       component: "client",
       error_type: errorType,
       error_message: message,
+      user_id: userId,
       details: {
         context: this.safeSerialize(context),
         stack: errorStack?.substring(0, 1000),
@@ -210,6 +217,7 @@ class ClientLogger {
       component: "performance",
       action: operation,
       duration_ms: durationMs,
+      user_id: userId,
       details: {
         ...this.safeSerialize(details),
         is_slow: isSlow,
@@ -233,6 +241,7 @@ class ClientLogger {
       event_type: "user_action",
       component,
       action,
+      user_id: userId,
       details: this.safeSerialize(details),
       level: "info",
     });

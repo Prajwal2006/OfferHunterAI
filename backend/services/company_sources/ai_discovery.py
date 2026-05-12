@@ -16,6 +16,7 @@ import httpx
 
 from .base import CompanySource, ProgressCallback
 from .utils import normalize_company
+from services.logger_service import get_logger
 
 
 class AIDiscoverySource(CompanySource):
@@ -26,6 +27,7 @@ class AIDiscoverySource(CompanySource):
     def __init__(self, api_key: str = "", model: str = "") -> None:
         self._api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self._model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self._logger = get_logger()
 
     async def search(
         self,
@@ -117,6 +119,36 @@ Return ONLY a JSON object with a "companies" array. Each company object must hav
 Only include real companies. Prioritize companies with strong engineering cultures and active hiring."""
 
         try:
+            payload = {
+                "model": self._model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a job market expert. Return only valid JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": 4096,
+                "response_format": {"type": "json_object"},
+            }
+            call_id = self._logger.log_llm_call(
+                provider="openai",
+                model=self._model,
+                system_prompt=payload["messages"][0]["content"],
+                user_prompt=prompt,
+                temperature=temperature,
+                max_tokens=payload["max_tokens"],
+                context={
+                    "operation": "ai_company_source_discovery",
+                    "profile": profile,
+                    "preferences": preferences,
+                    "queries": queries,
+                    "excluded_domains": sorted(excluded_domains),
+                    "excluded_names": sorted(excluded_names),
+                },
+                raw_payload=payload,
+            )
             async with httpx.AsyncClient(timeout=45.0) as client:
                 response = await client.post(
                     "https://api.openai.com/v1/chat/completions",
@@ -124,22 +156,11 @@ Only include real companies. Prioritize companies with strong engineering cultur
                         "Authorization": f"Bearer {self._api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": self._model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are a job market expert. Return only valid JSON.",
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": temperature,
-                        "max_tokens": 4096,
-                        "response_format": {"type": "json_object"},
-                    },
+                    json=payload,
                 )
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
+                raw_response = response.json()
+                content = raw_response["choices"][0]["message"]["content"]
                 data = json.loads(content)
 
                 if isinstance(data, list):
@@ -159,6 +180,16 @@ Only include real companies. Prioritize companies with strong engineering cultur
                     # Client-side safety net: skip any GPT hallucinates that match excluded domains
                     and (c.get("domain") or "").lower() not in excluded_domains
                 ]
+                usage = raw_response.get("usage") or {}
+                self._logger.log_llm_response(
+                    call_id=call_id,
+                    response=content,
+                    response_json={"raw_companies": raw_companies, "normalized_results": results},
+                    tokens_used=usage.get("total_tokens"),
+                    tokens_prompt=usage.get("prompt_tokens"),
+                    tokens_completion=usage.get("completion_tokens"),
+                    raw_response=raw_response,
+                )
                 await self._notify(
                     progress_callback, f"AI discovery found {len(results)} companies"
                 )

@@ -59,6 +59,14 @@ type FlowStep =
 
 // ─── Loading Skeleton ─────────────────────────────────────────────────────────
 
+function getDefaultTemplateReason(draft: EmailDraft | null): string | null {
+  if (!draft?.generation_metadata?.used_default_template) return null;
+  const reason = draft.generation_metadata.default_template_reason;
+  return typeof reason === "string" && reason.trim()
+    ? reason
+    : "AI email generation was unavailable, so this draft was created from the default template.";
+}
+
 function CompanyCardSkeleton({ i }: { i: number }) {
   return (
     <motion.div
@@ -134,7 +142,7 @@ function ColdEmailProgressPanel({
   const steps = [
     { agent: "PersonalizationAgent", label: "Personalization", description: "Matching your resume, profile, links, and company context" },
     { agent: "ContactDiscoveryAgent", label: "Contact discovery", description: "Finding and ranking the best people to email" },
-    { agent: "EmailWriterAgent", label: "Cold email draft", description: "Generating subject lines and short, medium, and founder-style variants" },
+    { agent: "EmailWriterAgent", label: "Cold email draft", description: "Generating one personalized cold email" },
     { agent: "HumanReviewAgent", label: "Human review", description: "Saving the draft with version history for review" },
   ];
 
@@ -147,6 +155,7 @@ function ColdEmailProgressPanel({
   }
 
   const latest = events[events.length - 1];
+  const defaultTemplateReason = getDefaultTemplateReason(draft);
 
   return (
     <motion.div
@@ -203,6 +212,17 @@ function ColdEmailProgressPanel({
 
       {draft && (
         <div className="mt-4 rounded-xl border border-border bg-background p-4">
+          {defaultTemplateReason && (
+            <div className="mb-3 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-sm text-amber-700">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <div>
+                  <p className="font-semibold">Using default template</p>
+                  <p className="mt-0.5 text-xs leading-5">{defaultTemplateReason}</p>
+                </div>
+              </div>
+            </div>
+          )}
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <div>
               <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -1279,7 +1299,10 @@ function CompanyFinderContent() {
           onOpenAgents={() =>
             router.push(handoffTaskId ? `/agents?task_id=${encodeURIComponent(handoffTaskId)}` : "/agents")
           }
-          onOpenReview={() => router.push("/review")}
+          onOpenReview={() => {
+            const opened = window.open("/review", "_blank", "noopener,noreferrer");
+            if (!opened) router.push("/review");
+          }}
           onDismiss={() => {
             handoffEsRef.current?.close();
             setHandoffTaskId(null);

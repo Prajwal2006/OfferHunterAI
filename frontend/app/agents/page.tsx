@@ -51,7 +51,7 @@ const AGENTS: AgentInfo[] = [
   {
     name: "EmailWriterAgent",
     displayName: "Email Writer",
-    description: "Generates cold email variants, subjects, and saved drafts",
+    description: "Generates one personalized cold email draft",
     status: "idle",
     icon: "edit",
   },
@@ -78,6 +78,12 @@ const AGENTS: AgentInfo[] = [
   },
 ];
 
+function isStaleRunningEvent(ev: AgentEvent): boolean {
+  if (ev.status !== "started" && ev.status !== "running") return false;
+  const expiresAt = ev.expires_at ? new Date(ev.expires_at).getTime() : new Date(ev.created_at).getTime() + 120_000;
+  return Number.isFinite(expiresAt) && expiresAt < Date.now();
+}
+
 function useAgentState() {
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>(AGENTS);
@@ -87,23 +93,24 @@ function useAgentState() {
 
   // â”€â”€ Apply a real SSE event to agent state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const applyEvent = useCallback((ev: AgentEvent) => {
+    const effectiveStatus = isStaleRunningEvent(ev) ? "completed" : ev.status;
     setEvents((prev) => {
       // deduplicate by id
       if (prev.some((e) => e.id === ev.id)) return prev;
-      return [ev, ...prev];
+      return [{ ...ev, status: effectiveStatus }, ...prev];
     });
 
     setAgents((prev) =>
       prev.map((a) => {
         if (a.name !== ev.agent_name) return a;
         const next = { ...a };
-        if (ev.status === "running" || ev.status === "started") {
+        if (effectiveStatus === "running" || effectiveStatus === "started") {
           next.status = "running";
           next.currentTask = ev.message;
-        } else if (ev.status === "completed") {
+        } else if (effectiveStatus === "completed") {
           next.status = "completed";
           next.currentTask = ev.message;
-        } else if (ev.status === "failed" || ev.status === "error") {
+        } else if (effectiveStatus === "failed") {
           next.status = "error";
           next.currentTask = ev.message;
         }
@@ -124,7 +131,7 @@ function useAgentState() {
     { agent: "PersonalizationAgent", msg: "Built personalization profile: fit score 92, 3 hooks, 2 relevant projects", status: "completed" as const },
     { agent: "ContactDiscoveryAgent", msg: "Ranking founders, CTOs, recruiters, and careers contacts...", status: "running" as const },
     { agent: "ContactDiscoveryAgent", msg: "Ranked 7 contacts. Best recipient: engineering recruiting.", status: "completed" as const },
-    { agent: "EmailWriterAgent", msg: "Generating cold email variants and subject lines for Anthropic...", status: "running" as const },
+    { agent: "EmailWriterAgent", msg: "Generating one personalized cold email for Anthropic...", status: "running" as const },
     { agent: "EmailWriterAgent", msg: "Email drafted for Anthropic. Awaiting your approval in Review.", status: "completed" as const },
     { agent: "HumanReviewAgent", msg: "Draft is available in the review editor with version history.", status: "running" as const },
     { agent: "ResumeTailorAgent", msg: "Tailoring resume bullets for Anthropic job descriptions...", status: "running" as const },
@@ -183,6 +190,15 @@ export default function AgentsPage() {
   const logRef = useRef<HTMLDivElement>(null);
   const esRef = useRef<EventSource | null>(null);
   const timelineRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const openNewTab = useCallback(
+    (href: string) => {
+      const opened = window.open(href, "_blank", "noopener,noreferrer");
+      if (!opened) {
+        router.push(href);
+      }
+    },
+    [router]
+  );
 
   // Derive active step from agent states
   const runningAgent = agents.find((a) => a.status === "running");
@@ -203,17 +219,21 @@ export default function AgentsPage() {
     // Load historical events on mount so the agents tab shows past activity
   useEffect(() => {
     async function loadHistory() {
+      const userId = session?.user?.id;
+      if (!userId) return;
       try {
-        const result = await fetchAgentEvents(100);
+        const result = await fetchAgentEvents(100, userId);
         const str = (v: unknown, fallback = ""): string =>
           typeof v === "string" ? v : fallback;
         const historical: AgentEvent[] = (result.events ?? []).map((ev: Record<string, unknown>) => ({
           id: str(ev.id) || `hist-${Date.now()}-${Math.random()}`,
+          user_id: str(ev.user_id),
           agent_name: str(ev.agent_name, "Unknown"),
           task_id: str(ev.task_id),
           status: str(ev.status, "running"),
           message: str(ev.message),
           metadata: (ev.metadata as Record<string, unknown>) ?? {},
+          expires_at: str(ev.expires_at) || null,
           created_at: str(ev.created_at) || new Date().toISOString(),
         }));
         historical.forEach(applyEvent);
@@ -222,7 +242,7 @@ export default function AgentsPage() {
       }
     }
     void loadHistory();
-  }, [applyEvent]);
+  }, [applyEvent, session?.user?.id]);
 
   useEffect(() => {
     esRef.current?.close();
@@ -233,13 +253,16 @@ export default function AgentsPage() {
         if (data.type === "connected") return;
         const event: AgentEvent = {
           id: data.id ?? `sse-${Date.now()}`,
+          user_id: data.user_id,
           agent_name: data.agent_name ?? "Unknown",
           task_id: data.task_id ?? "",
           status: data.status ?? "running",
           message: data.message ?? "",
           metadata: data.metadata ?? {},
+          expires_at: data.expires_at ?? null,
           created_at: data.created_at ?? new Date().toISOString(),
         };
+        if (session?.user?.id && event.user_id && event.user_id !== session.user.id) return;
         applyEvent(event);
       } catch {
         // ignore malformed
@@ -248,7 +271,7 @@ export default function AgentsPage() {
     esRef.current = es;
 
     return () => es.close();
-  }, [applyEvent]);
+  }, [applyEvent, session?.user?.id]);
 
   useEffect(() => {
     async function loadTimeline() {
@@ -367,18 +390,18 @@ export default function AgentsPage() {
         return;
       }
       if (stepId === "EmailWriter") {
-        router.push("/review");
+        openNewTab("/review");
         return;
       }
       if (stepId === "Review") {
-        router.push("/review");
+        openNewTab("/review");
         return;
       }
       if (stepId === "Sender") {
         router.push("/analytics");
       }
     },
-    [router]
+    [openNewTab, router]
   );
 
   const handleAgentCardClick = useCallback(

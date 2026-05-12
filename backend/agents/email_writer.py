@@ -41,7 +41,7 @@ class EmailWriterAgent:
             task_id=task_id,
             status="started",
             message=f"Starting email generation for {company_name}",
-            metadata={"company": company_name},
+            metadata={"company": company_name, "user_id": user_id},
         )
 
         if not job and job_title:
@@ -65,14 +65,37 @@ class EmailWriterAgent:
             recipient=recipient,
             outreach_type=kwargs.get("outreach_type"),
         )
-        result = draft.model_dump()
+        result = draft.model_dump(exclude={"generation_attempt"})
         result["resume_version_id"] = resume_version_id or (resume or {}).get("id")
         result["resume_skills"] = resume_skills or skills or []
+        generation_metadata = result.get("generation_metadata") or {}
+        if generation_metadata.get("used_default_template") is True:
+            await self.logger.emit(
+                agent_name=self.AGENT_NAME,
+                task_id=task_id,
+                status="running",
+                message="Using default template because AI email generation was unavailable.",
+                metadata={
+                    "company": company_name,
+                    "draft_id": result.get("id"),
+                    "user_id": user_id,
+                    "used_default_template": True,
+                    "reason": generation_metadata.get("default_template_reason"),
+                },
+            )
 
         try:
             from db.supabase import supabase_client
 
             stored = await supabase_client.upsert_email_draft({**result, "version_number": 1})
+            generation_attempt = draft.generation_attempt
+            if generation_attempt:
+                await supabase_client.insert_email_generation_attempt(
+                    {
+                        **generation_attempt,
+                        "draft_id": stored.get("id") or generation_attempt.get("draft_id"),
+                    }
+                )
             version = self.versioning.create_version(
                 draft={**stored, "version_number": 0},
                 event_type="generated",
@@ -80,7 +103,6 @@ class EmailWriterAgent:
                 changes={"task_id": task_id},
             )
             await supabase_client.insert_email_version(version)
-            await supabase_client.insert_generated_subjects(stored.get("id") or result["id"], result.get("subjects") or [])
 
             # Legacy table compatibility for existing review/pipeline screens.
             await supabase_client.insert_email(
@@ -105,6 +127,12 @@ class EmailWriterAgent:
             task_id=task_id,
             status="completed",
             message=f"Email draft created for {company_name} and queued for human review",
-            metadata={"company": company_name, "draft_id": result.get("id")},
+            metadata={
+                "company": company_name,
+                "draft_id": result.get("id"),
+                "user_id": user_id,
+                "used_default_template": generation_metadata.get("used_default_template") is True,
+                "default_template_reason": generation_metadata.get("default_template_reason"),
+            },
         )
         return result

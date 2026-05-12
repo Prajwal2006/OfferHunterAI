@@ -3,7 +3,8 @@
  * Automatically logs all tracked actions with context.
  */
 
-import { useCallback, useRef, useEffect } from "react";
+import { createElement, useCallback, useRef, useEffect } from "react";
+import type { ComponentType, FC } from "react";
 import clientLogger from "./client-logger";
 
 export interface UseTrackingOptions {
@@ -89,10 +90,10 @@ export function useTracking(options: UseTrackingOptions): TrackingCallbacks {
  * Higher-order component to automatically track click events on elements
  */
 export function withClickTracking<P extends { [key: string]: unknown }>(
-  WrappedComponent: React.ComponentType<P>,
+  WrappedComponent: ComponentType<P>,
   component: string
-): React.FC<P> {
-  return (props: P) => {
+): FC<P> {
+  const TrackedComponent: FC<P> = (props: P) => {
     const tracking = useTracking({ component });
 
     // Create a modified version of props that intercepts onClick handlers
@@ -103,12 +104,13 @@ export function withClickTracking<P extends { [key: string]: unknown }>(
       for (const key in props) {
         if (key.startsWith("on") && typeof props[key] === "function") {
           // Wrap event handlers to track clicks
-          const originalHandler = props[key] as Function;
-          (modifiedProps as any)[key] = function (event: any) {
+          const originalHandler = props[key] as (event: Event) => unknown;
+          (modifiedProps as Record<string, unknown>)[key] = function (event: Event) {
+            const target = event.target instanceof HTMLElement ? event.target : null;
             const actionName = key.replace(/^on/, "").toLowerCase();
             tracking.trackClick(actionName, {
-              element: event.target?.className,
-              text: event.target?.textContent?.substring(0, 100),
+              element: target?.className,
+              text: target?.textContent?.substring(0, 100),
             });
             return originalHandler(event);
           };
@@ -116,8 +118,10 @@ export function withClickTracking<P extends { [key: string]: unknown }>(
       }
     }
 
-    return <WrappedComponent {...(modifiedProps as P)} />;
+    return createElement(WrappedComponent, modifiedProps as P);
   };
+  TrackedComponent.displayName = `withClickTracking(${WrappedComponent.displayName ?? WrappedComponent.name ?? "Component"})`;
+  return TrackedComponent;
 }
 
 export default useTracking;

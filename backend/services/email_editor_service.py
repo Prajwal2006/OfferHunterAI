@@ -39,7 +39,21 @@ class EmailEditorService:
                 f"Full email context:\n{full_body}\n\nAdditional context:\n{compact_json(context or {}, 6000)}"
             )
             try:
-                data = await self.ai.create_json(system=system, user=user, temperature=0.35, max_tokens=1200)
+                data = await self.ai.create_json(
+                    system=system,
+                    user=user,
+                    temperature=0.35,
+                    max_tokens=1200,
+                    user_id=str((context or {}).get("user_id") or "") or None,
+                    context_metadata={
+                        "operation": "inline_email_edit",
+                        "instruction": instruction,
+                        "subject": subject,
+                        "selected_text": selected_text,
+                        "full_body": full_body,
+                        "context": context or {},
+                    },
+                )
                 replacement = str(data.get("replacement_text") or replacement).strip()
                 rationale = str(data.get("rationale") or "AI rewrite based on the instruction.")
             except (AIServiceError, ValueError, TypeError):

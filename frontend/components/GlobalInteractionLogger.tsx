@@ -75,6 +75,10 @@ function isAbortLikeError(error: unknown, signal?: AbortSignal): boolean {
   return false;
 }
 
+function isOptionalReviewFetch(url: string): boolean {
+  return url.includes("/outreach/contacts/") || url.includes("/outreach/personalization/");
+}
+
 export function GlobalInteractionLogger() {
   const { session } = useAuth();
 
@@ -149,7 +153,7 @@ export function GlobalInteractionLogger() {
         const parsed = parseUnknownError(error);
 
         // Timeouts/aborts are expected in some flows; log them as user action instead of hard error.
-        if (isAbortLikeError(error, init?.signal)) {
+        if (isAbortLikeError(error, init?.signal ?? undefined)) {
           clientLogger.logUserAction("global_fetch_aborted", "global-fetch", {
             url,
             method,
@@ -161,19 +165,30 @@ export function GlobalInteractionLogger() {
           throw error;
         }
 
-        clientLogger.logError(
-          "global_fetch_failed",
-          parsed.message,
-          {
+        if (isOptionalReviewFetch(url)) {
+          clientLogger.logUserAction("global_optional_fetch_failed", "global-fetch", {
             url,
             method,
             duration_ms: durationMs,
             path: window.location.pathname,
             error_name: parsed.name,
-            raw_error: parsed.raw,
-          },
-          parsed.stack
-        );
+            error_message: parsed.message,
+          });
+        } else {
+          clientLogger.logError(
+            "global_fetch_failed",
+            parsed.message,
+            {
+              url,
+              method,
+              duration_ms: durationMs,
+              path: window.location.pathname,
+              error_name: parsed.name,
+              raw_error: parsed.raw,
+            },
+            parsed.stack
+          );
+        }
         throw error;
       }
     };

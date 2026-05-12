@@ -26,13 +26,14 @@ class ResumeTailorAgent:
         **kwargs: Any,
     ) -> dict:
         company_name = (company or {}).get("name", "Unknown")
+        user_id = str(kwargs.get("user_id") or "anonymous")
 
         await self.logger.emit(
             agent_name=self.AGENT_NAME,
             task_id=task_id,
             status="started",
             message=f"Tailoring resume for {company_name}",
-            metadata={"company": company_name},
+            metadata={"company": company_name, "user_id": user_id},
         )
 
         steps = [
@@ -48,7 +49,7 @@ class ResumeTailorAgent:
                 task_id=task_id,
                 status="running",
                 message=step,
-                metadata={"company": company_name},
+                metadata={"company": company_name, "user_id": user_id},
             )
             await asyncio.sleep(0.4)
 
@@ -67,7 +68,7 @@ class ResumeTailorAgent:
             task_id=task_id,
             status="completed",
             message=f"Resume tailored for {company_name} — 3 bullets optimized",
-            metadata=tailored,
+            metadata={**tailored, "user_id": user_id},
         )
 
         return tailored

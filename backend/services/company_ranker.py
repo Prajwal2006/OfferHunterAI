@@ -24,6 +24,8 @@ if _backend_root not in sys.path:
 
 import httpx
 
+from services.logger_service import get_logger
+
 # Lazy import of EmbeddingService to avoid circular imports
 _embedding_service_instance = None
 
@@ -163,6 +165,7 @@ class CompanyRankerService:
     def __init__(self) -> None:
         self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self._logger = get_logger()
 
     async def rank(
         self,
@@ -492,6 +495,28 @@ Companies:
 
 Return a JSON object where keys are company names and values are explanation strings."""
 
+        payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.5,
+            "max_tokens": 2048,
+            "response_format": {"type": "json_object"},
+        }
+        call_id = self._logger.log_llm_call(
+            provider="openai",
+            model=self._model,
+            user_prompt=prompt,
+            temperature=payload["temperature"],
+            max_tokens=payload["max_tokens"],
+            context={
+                "operation": "company_ranking_explanations",
+                "profile_summary": profile_summary,
+                "companies": companies,
+            },
+            raw_payload=payload,
+        )
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -499,19 +524,22 @@ Return a JSON object where keys are company names and values are explanation str
                     "Authorization": f"Bearer {self._api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": self._model,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.5,
-                    "max_tokens": 2048,
-                    "response_format": {"type": "json_object"},
-                },
+                json=payload,
             )
             response.raise_for_status()
             data = response.json()
-            explanations: dict[str, str] = json.loads(data["choices"][0]["message"]["content"])
+            content = data["choices"][0]["message"]["content"]
+            explanations: dict[str, str] = json.loads(content)
+            usage = data.get("usage") or {}
+            self._logger.log_llm_response(
+                call_id=call_id,
+                response=content,
+                response_json=explanations,
+                tokens_used=usage.get("total_tokens"),
+                tokens_prompt=usage.get("prompt_tokens"),
+                tokens_completion=usage.get("completion_tokens"),
+                raw_response=data,
+            )
 
         for company in companies:
             name = company.get("name", "")

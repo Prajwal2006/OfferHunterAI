@@ -41,6 +41,7 @@ class SupabaseClient:
     async def get_agent_events(
         self,
         limit: int = 50,
+        user_id: Optional[str] = None,
         agent_name: Optional[str] = None,
         status: Optional[str] = None,
     ) -> list[dict]:
@@ -54,6 +55,8 @@ class SupabaseClient:
             .order("created_at", desc=True)
             .limit(limit)
         )
+        if user_id:
+            query = query.eq("user_id", user_id)
         if agent_name:
             query = query.eq("agent_name", agent_name)
         if status:
@@ -237,26 +240,12 @@ class SupabaseClient:
         rows = result.data or []
         return rows[0] if rows else None
 
-    async def insert_generated_subjects(self, draft_id: str, subjects: list[dict[str, Any]]) -> list[dict]:
-        rows = [{"draft_id": draft_id, **subject} for subject in subjects]
+    async def insert_email_generation_attempt(self, attempt: dict[str, Any]) -> dict:
         client = self._get_client()
         if not client:
-            return rows
-        result = client.table("generated_subjects").insert(rows).execute()
-        return result.data or rows
-
-    async def get_generated_subjects(self, draft_id: str) -> list[dict]:
-        client = self._get_client()
-        if not client:
-            return []
-        result = (
-            client.table("generated_subjects")
-            .select("*")
-            .eq("draft_id", draft_id)
-            .order("created_at")
-            .execute()
-        )
-        return result.data or []
+            return attempt
+        result = client.table("email_generation_attempts").insert(attempt).execute()
+        return result.data[0] if result.data else attempt
 
     async def insert_ai_edit_request(self, request: dict[str, Any]) -> dict:
         client = self._get_client()
@@ -278,11 +267,7 @@ class SupabaseClient:
         return result.data[0] if result.data else {"id": request_id, **updates}
 
     async def insert_edit_history(self, row: dict[str, Any]) -> dict:
-        client = self._get_client()
-        if not client:
-            return row
-        result = client.table("edit_history").insert(row).execute()
-        return result.data[0] if result.data else row
+        return row
 
     async def upsert_outreach_contacts(self, contacts: list[dict[str, Any]]) -> list[dict]:
         client = self._get_client()

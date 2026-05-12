@@ -1,14 +1,11 @@
 ﻿"use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
 import {
   AlertCircle,
   Bot,
   Check,
   ChevronRight,
-  Clock,
-  Copy,
   GitCompare,
   History,
   Loader2,
@@ -18,7 +15,6 @@ import {
   RotateCcw,
   Send,
   Sparkles,
-  Star,
   UserRound,
   Wand2,
   X,
@@ -76,11 +72,6 @@ interface DiffLine {
   text: string;
 }
 
-interface GenerateState {
-  companyId: string;
-  outreachType: string;
-}
-
 // â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function parseDiff(diff: string): DiffLine[] {
@@ -91,6 +82,14 @@ function parseDiff(diff: string): DiffLine[] {
       type: (l.startsWith("+") ? "added" : l.startsWith("-") ? "removed" : "unchanged") as DiffLine["type"],
       text: l.startsWith("+") || l.startsWith("-") ? l.slice(1) : l,
     }));
+}
+
+function getDefaultTemplateReason(draft: EmailDraft | null): string | null {
+  if (!draft?.generation_metadata?.used_default_template) return null;
+  const reason = draft.generation_metadata.default_template_reason;
+  return typeof reason === "string" && reason.trim()
+    ? reason
+    : "AI email generation was unavailable, so this draft was created from the default template.";
 }
 
 function formatDate(iso?: string): string {
@@ -155,9 +154,11 @@ export default function ReviewPage() {
   useEffect(() => {
     if (authLoading) return;
     if (!userId) {
-      setLoading(false);
-      setLoadError("Sign in to review your drafts.");
-      return;
+      const timer = window.setTimeout(() => {
+        setLoading(false);
+        setLoadError("Sign in to review your drafts.");
+      }, 0);
+      return () => window.clearTimeout(timer);
     }
     void loadAll(userId);
   }, [authLoading, userId]);
@@ -184,7 +185,6 @@ export default function ReviewPage() {
   useEffect(() => {
     if (!typedDraftId || !selectedDraft || selectedDraft.id !== typedDraftId) return;
     const fullBody = selectedDraft.body || "";
-    setTypedBody("");
     let index = 0;
     // Type at ~4 chars per frame @ 16ms = ~250 chars/sec — feels natural like ChatGPT
     const timer = setInterval(() => {
@@ -423,8 +423,20 @@ export default function ReviewPage() {
         });
         if (ev.type === "status") {
           setGenerationStatus(ev.message);
+        } else if (ev.type === "fallback_template") {
+          logFrontendAction("USING_DEFAULT_TEMPLATE_EMAIL", {
+            user_id: userId,
+            company_id: companyId,
+            reason: ev.reason,
+            message: ev.message,
+          });
+          setGenerationStatus("Using default template because AI email generation was unavailable.");
         } else if (ev.type === "draft") {
           const newDraft = ev.draft;
+          const defaultTemplateReason = getDefaultTemplateReason(newDraft);
+          if (defaultTemplateReason) {
+            setGenerationStatus("Using default template because AI email generation was unavailable.");
+          }
           setDrafts((prev) => {
             const exists = prev.find((d) => d.company_id === companyId);
             return exists ? prev.map((d) => (d.company_id === companyId ? newDraft : d)) : [newDraft, ...prev];
@@ -434,7 +446,7 @@ export default function ReviewPage() {
           if (ev.personalization) setPersonalization(ev.personalization);
           setTypedDraftId(newDraft.id);
           setTypedBody("");
-          setGenerationStatus("Typing your email...");
+          if (!defaultTemplateReason) setGenerationStatus("Typing your email...");
           if (typeof window !== "undefined") {
             const url = new URL(window.location.href);
             url.searchParams.delete("generate");
@@ -487,19 +499,8 @@ export default function ReviewPage() {
     () => companies.filter((c) => !draftedCompanyIds.has(c.id)).slice(0, 30),
     [companies, draftedCompanyIds]
   );
-  const selectedSubjects = useMemo(
-    () =>
-      selectedDraft?.subjects?.length
-        ? selectedDraft.subjects
-        : selectedDraft
-        ? [{ label: "Current", subject: selectedDraft.subject }]
-        : [],
-    [selectedDraft]
-  );
-  const selectedVariants = useMemo(
-    () => (selectedDraft?.variants ? Object.keys(selectedDraft.variants) : []),
-    [selectedDraft]
-  );
+
+  const defaultTemplateReason = getDefaultTemplateReason(selectedDraft);
 
   // â”€â”€â”€ Render â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   return (
@@ -648,6 +649,17 @@ export default function ReviewPage() {
               <EmptyEditor loading={loading} error={loadError} onRetry={() => userId && void loadAll(userId)} />
             ) : (
               <div className="mx-auto max-w-3xl space-y-5 px-4 py-6 sm:px-6">
+                {defaultTemplateReason && (
+                  <div className="rounded-md border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                      <div>
+                        <p className="font-semibold">Using default template</p>
+                        <p className="mt-0.5 text-xs leading-5">{defaultTemplateReason}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* Actions bar */}
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -696,45 +708,10 @@ export default function ReviewPage() {
                   </div>
                 </div>
 
-                {/* Variant tabs */}
-                {selectedVariants.length > 0 && (
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-xs text-muted-foreground">Variant:</span>
-                    {selectedVariants.map((key) => (
-                      <button
-                        key={key}
-                        onClick={() =>
-                          void persistSave({ selected_variant: key, body: selectedDraft.variants[key] ?? "" })
-                        }
-                        className={`rounded-md border px-3 py-1 text-xs font-medium transition ${
-                          selectedDraft.selected_variant === key
-                            ? "border-primary bg-primary/10 text-primary"
-                            : "border-border text-muted-foreground hover:border-primary/30 hover:text-foreground"
-                        }`}
-                      >
-                        {key.replace(/_/g, " ")}
-                      </button>
-                    ))}
-                  </div>
-                )}
-
                 {/* Subject */}
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
                     <span className="w-14 shrink-0 text-xs text-muted-foreground">Subject</span>
-                    {selectedSubjects.length > 1 && (
-                      <select
-                        value={selectedDraft.subject}
-                        onChange={(e) => void persistSave({ subject: e.target.value })}
-                        className="max-w-52 rounded border border-border bg-background px-2 py-1 text-xs text-muted-foreground"
-                      >
-                        {selectedSubjects.map((s) => (
-                          <option key={`${s.label}|${s.subject}`} value={s.subject}>
-                            {s.label}
-                          </option>
-                        ))}
-                      </select>
-                    )}
                   </div>
                   <input
                     value={selectedDraft.subject}

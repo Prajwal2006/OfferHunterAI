@@ -1,9 +1,11 @@
-import clientLogger, { fetchWithLogging } from "./client-logger";
+import clientLogger from "./client-logger";
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/+$/, "");
 const FRONTEND_LOG_ENDPOINT = `${API_URL}/debug/logs/frontend`;
-const SSE_INACTIVITY_TIMEOUT_MS = 20_000;
-const SSE_TOTAL_TIMEOUT_MS = 45_000;
+const SSE_INACTIVITY_TIMEOUT_MS = 90_000;
+const SSE_TOTAL_TIMEOUT_MS = 150_000;
+const DEFAULT_TEMPLATE_FALLBACK_NOTICE =
+  "USING DEFAULT TEMPLATE EMAIL BECAUSE OPENAI EMAIL GENERATION FAILED OR WAS DISABLED";
 
 export function buildApiUrl(path: string): string {
   return `${API_URL}/${path.replace(/^\/+/, "")}`;
@@ -21,6 +23,10 @@ function safeLogPayload(payload: unknown): unknown {
 
 function isLogEndpoint(url: string): boolean {
   return url.includes("/debug/logs/frontend");
+}
+
+function isOptionalReviewFetch(url: string): boolean {
+  return url.includes("/outreach/contacts/") || url.includes("/outreach/personalization/");
 }
 
 function isAbortLikeError(error: unknown, signal?: AbortSignal): boolean {
@@ -100,7 +106,7 @@ async function apiFetch(
     const durationMs =
       (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
     if (!isLogEndpoint(url)) {
-      if (isAbortLikeError(error, init?.signal)) {
+      if (isAbortLikeError(error, init?.signal ?? undefined)) {
         sendFrontendLog(
           "frontend-api",
           "request.aborted",
@@ -121,6 +127,7 @@ async function apiFetch(
         throw error;
       }
 
+      const optionalReviewFetch = isOptionalReviewFetch(url);
       sendFrontendLog(
         "frontend-api",
         "request.failed",
@@ -130,14 +137,23 @@ async function apiFetch(
           duration_ms: Math.round(durationMs),
           error: error instanceof Error ? error.message : String(error),
         },
-        "error"
+        optionalReviewFetch ? "info" : "error"
       );
-      clientLogger.logError(
-        "api_request_failed",
-        error instanceof Error ? error.message : String(error),
-        { method, url, duration_ms: Math.round(durationMs) },
-        error instanceof Error ? error.stack : undefined
-      );
+      if (optionalReviewFetch) {
+        clientLogger.logUserAction("api_optional_request_failed", "api-client", {
+          method,
+          url,
+          duration_ms: Math.round(durationMs),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } else {
+        clientLogger.logError(
+          "api_request_failed",
+          error instanceof Error ? error.message : String(error),
+          { method, url, duration_ms: Math.round(durationMs) },
+          error instanceof Error ? error.stack : undefined
+        );
+      }
     }
     throw error;
   }
@@ -165,8 +181,10 @@ export interface CompanyWorkspaceResponse {
   total: number;
 }
 
-export async function fetchAgentEvents(limit = 50) {
-  const res = await apiFetch(buildApiUrl(`/agent-events?limit=${limit}`));
+export async function fetchAgentEvents(limit = 50, userId?: string) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (userId) params.set("user_id", userId);
+  const res = await apiFetch(buildApiUrl(`/agent-events?${params.toString()}`));
   if (!res.ok) throw new Error("Failed to fetch agent events");
   return res.json();
 }
@@ -282,14 +300,30 @@ export async function generateEmailDraft(payload: {
     }
     throw new Error(detail);
   }
-  return res.json() as Promise<{
+  const data = (await res.json()) as {
     draft: import("./types").EmailDraft;
     personalization: import("./types").PersonalizationProfile;
-  }>;
+  };
+  if (data.draft?.generation_metadata?.used_default_template) {
+    console.warn(`\n${DEFAULT_TEMPLATE_FALLBACK_NOTICE}\n`, {
+      user_id: payload.user_id,
+      company_id: payload.company_id,
+      draft_id: data.draft.id,
+      reason: data.draft.generation_metadata.default_template_reason,
+    });
+    logFrontendAction("USING_DEFAULT_TEMPLATE_EMAIL", {
+      user_id: payload.user_id,
+      company_id: payload.company_id,
+      draft_id: data.draft.id,
+      reason: data.draft.generation_metadata.default_template_reason,
+    });
+  }
+  return data;
 }
 
 export type EmailGenerationEvent =
   | { type: "status"; step: string; message: string }
+  | { type: "fallback_template"; message: string; reason?: string }
   | { type: "draft"; draft: import("./types").EmailDraft; personalization: import("./types").PersonalizationProfile }
   | { type: "done" }
   | { type: "error"; message: string };
@@ -343,6 +377,20 @@ export function streamEmailGeneration(
     try {
       const data = JSON.parse(e.data) as EmailGenerationEvent;
       sendFrontendLog("frontend-api", "sse.message", { url, event_type: data.type, event: data });
+      if (data.type === "fallback_template") {
+        console.warn(`\n${DEFAULT_TEMPLATE_FALLBACK_NOTICE}\n`, {
+          user_id: payload.user_id,
+          company_id: payload.company_id,
+          reason: data.reason,
+        });
+      } else if (data.type === "draft" && data.draft?.generation_metadata?.used_default_template) {
+        console.warn(`\n${DEFAULT_TEMPLATE_FALLBACK_NOTICE}\n`, {
+          user_id: payload.user_id,
+          company_id: payload.company_id,
+          draft_id: data.draft.id,
+          reason: data.draft.generation_metadata.default_template_reason,
+        });
+      }
       onEvent(data);
       if (data.type === "done" || data.type === "error") {
         clearInterval(watchdog);
@@ -384,7 +432,6 @@ export async function fetchEmailDraft(draftId: string) {
   return res.json() as Promise<{
     draft: import("./types").EmailDraft;
     versions: import("./types").EmailVersion[];
-    subjects: Array<{ label: string; subject: string }>;
   }>;
 }
 
@@ -394,7 +441,6 @@ export async function updateEmailDraft(
     user_id?: string;
     subject?: string;
     body?: string;
-    selected_variant?: string;
     recipient_email?: string;
     status?: string;
   }

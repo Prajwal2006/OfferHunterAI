@@ -45,7 +45,9 @@ class LoggerService:
         self.logs_dir = Path(__file__).resolve().parent.parent.parent / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.unified_log_file = self.logs_dir / "app.log"
+        self.llm_debug_file = self.logs_dir / "llm.txt"
         self.unified_log_file.touch(exist_ok=True)
+        self.llm_debug_file.touch(exist_ok=True)
         self._session_id = str(uuid.uuid4())
         self._request_counter = 0
 
@@ -121,6 +123,71 @@ class LoggerService:
                 f.write(self._format_log_line(entry) + "\n")
         except Exception as e:
             print(f"Failed to write log: {e}", file=sys.stderr)
+
+    def _pretty(self, value: Any) -> str:
+        """Pretty-print values for human-readable LLM debugging."""
+        if value is None:
+            return "None"
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            return str(value)
+
+    def _append_llm_debug(self, title: str, sections: dict[str, Any]) -> None:
+        """Append a readable LLM debug section without changing app.log behavior."""
+        timestamp = datetime.utcnow().isoformat()
+        lines = [
+            "\n" + "=" * 120,
+            f"{title} | {timestamp} UTC | session={self._session_id}",
+            "=" * 120,
+        ]
+        for heading, value in sections.items():
+            lines.extend(
+                [
+                    "",
+                    f"--- {heading} ---",
+                    self._pretty(value),
+                ]
+            )
+        lines.append("")
+        try:
+            with self.llm_debug_file.open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception as e:
+            print(f"Failed to write LLM debug log: {e}", file=sys.stderr)
+
+    def log_loud_marker(
+        self,
+        message: str,
+        details: Optional[dict[str, Any]] = None,
+        *,
+        include_llm_debug: bool = False,
+    ) -> None:
+        """Write a visually obvious marker to the console and log files."""
+        marker = message.upper()
+        detail_text = self._pretty(details or {})
+        text = f"\n{marker}\n{detail_text}\n"
+        print(text)
+        self._write_log(
+            "loud-marker",
+            {
+                "message": marker,
+                "details": self._safe_serialize(details, 4000),
+            },
+        )
+        try:
+            with self.unified_log_file.open("a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception as e:
+            print(f"Failed to write loud marker log: {e}", file=sys.stderr)
+        if include_llm_debug:
+            try:
+                with self.llm_debug_file.open("a", encoding="utf-8") as f:
+                    f.write(text + "\n")
+            except Exception as e:
+                print(f"Failed to write loud marker LLM debug log: {e}", file=sys.stderr)
     
     def log_api_request(
         self,
@@ -201,6 +268,39 @@ class LoggerService:
                 **{k: self._safe_serialize(v, 2000) for k, v in kwargs.items()},
             },
         )
+        self._append_llm_debug(
+            "LLM REQUEST",
+            {
+                "Call Metadata": {
+                    "call_id": call_id,
+                    "provider": provider,
+                    "model": model,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "user_id": user_id,
+                    **kwargs,
+                },
+                "Clean Context / Relevant App Data": context or {},
+                "System Prompt": system_prompt,
+                "User Prompt": user_prompt,
+                "Raw Request Data Sent To LLM": {
+                    "provider": provider,
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "context": context or {},
+                    **kwargs,
+                },
+                "Debug Notes": [
+                    "Authorization headers and API keys are intentionally excluded.",
+                    "If this request returns invalid JSON, compare the raw response section with the parsed clean response section using the same call_id.",
+                ],
+            },
+        )
         return call_id
     
     def log_llm_response(
@@ -228,6 +328,26 @@ class LoggerService:
                 "duration_ms": duration_ms,
                 "error": error,
                 **{k: self._safe_serialize(v, 2000) for k, v in kwargs.items()},
+            },
+        )
+        self._append_llm_debug(
+            "LLM RESPONSE",
+            {
+                "Call Metadata": {
+                    "call_id": call_id,
+                    "duration_ms": duration_ms,
+                    "tokens_used": tokens_used,
+                    "tokens_prompt": tokens_prompt,
+                    "tokens_completion": tokens_completion,
+                    "error": error,
+                    **kwargs,
+                },
+                "Raw Data Received From LLM": response,
+                "Parsed Clean Data From LLM": response_json,
+                "Debug Notes": [
+                    "Raw data is the exact message content received from the provider when available.",
+                    "Parsed clean data is the JSON/object form the app attempted to use downstream.",
+                ],
             },
         )
     

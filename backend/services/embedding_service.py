@@ -18,6 +18,8 @@ from typing import Any
 
 import httpx
 
+from .logger_service import get_logger
+
 # ─── Module-level embedding cache ─────────────────────────────────────────────
 # Shared across all service instances within one process lifetime.
 _embedding_cache: dict[str, list[float]] = {}
@@ -38,6 +40,7 @@ class EmbeddingService:
 
     def __init__(self) -> None:
         self._api_key = os.getenv("OPENAI_API_KEY", "")
+        self._logger = get_logger()
 
     # ─── Core Embedding Methods ───────────────────────────────────────────────
 
@@ -57,6 +60,22 @@ class EmbeddingService:
             return _embedding_cache[cache_key]
 
         try:
+            payload = {
+                "model": self.MODEL,
+                "input": text[:8000],
+                "encoding_format": "float",
+            }
+            call_id = self._logger.log_llm_call(
+                provider="openai",
+                model=self.MODEL,
+                user_prompt=text[:8000],
+                context={
+                    "operation": "embedding_generation",
+                    "input_length": len(text),
+                    "cache_key": cache_key,
+                },
+                raw_payload=payload,
+            )
             async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.post(
                     "https://api.openai.com/v1/embeddings",
@@ -64,15 +83,35 @@ class EmbeddingService:
                         "Authorization": f"Bearer {self._api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": self.MODEL,
-                        "input": text[:8000],
-                        "encoding_format": "float",
-                    },
+                    json=payload,
                 )
                 response.raise_for_status()
-                embedding: list[float] = response.json()["data"][0]["embedding"]
+                raw_response = response.json()
+                embedding: list[float] = raw_response["data"][0]["embedding"]
+                usage = raw_response.get("usage") or {}
+                self._logger.log_llm_response(
+                    call_id=call_id,
+                    response=f"[embedding vector length={len(embedding)}]",
+                    response_json={
+                        "embedding_preview": embedding[:12],
+                        "embedding_length": len(embedding),
+                        "model": self.MODEL,
+                    },
+                    tokens_used=usage.get("total_tokens"),
+                    tokens_prompt=usage.get("prompt_tokens"),
+                    raw_response={
+                        **raw_response,
+                        "data": [
+                            {
+                                **(raw_response.get("data") or [{}])[0],
+                                "embedding": f"[{len(embedding)} floats omitted from compact preview; first 12 shown in parsed data]",
+                            }
+                        ],
+                    },
+                )
         except Exception:
+            if "call_id" in locals():
+                self._logger.log_llm_response(call_id=call_id, error="Embedding request failed")
             return [0.0] * self.DIMENSIONS
 
         # Store in cache with simple eviction

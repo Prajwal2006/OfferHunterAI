@@ -2,6 +2,7 @@
 OfferHunter AI Ã¢â‚¬â€ FastAPI Backend
 """
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -10,11 +11,12 @@ import uuid
 import time
 from threading import Lock
 from copy import deepcopy
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -24,6 +26,8 @@ from pydantic import BaseModel
 _backend_root = str(Path(__file__).resolve().parent)
 if _backend_root not in sys.path:
     sys.path.insert(0, _backend_root)
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from db.supabase import supabase_client
 from agents.event_logger import AgentEventLogger
@@ -38,7 +42,7 @@ from services.resume_parser import ResumeParserService
 from services.filters import apply_hard_constraints, normalize_preference_payload, partition_workspace_companies
 from services.contact_discovery_service import ContactDiscoveryService
 from services.email_editor_service import EmailEditorService
-from services.email_writer_service import EmailWriterService
+from services.email_writer_service import DEFAULT_TEMPLATE_FALLBACK_NOTICE, EmailWriterService
 from services.personalization_service import PersonalizationService
 from services.versioning_service import VersioningService
 from services.logger_service import get_logger
@@ -52,11 +56,15 @@ _workspace_repairs_running: set[str] = set()
 _workspace_repair_status: dict[str, dict[str, Any]] = {}
 _workspace_repair_lock = Lock()
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
-OUTREACH_DRAFT_USE_AI = os.getenv("OUTREACH_DRAFT_USE_AI", "false").strip().lower() in {"1", "true", "yes", "on"}
+_OUTREACH_DRAFT_USE_AI_RAW = os.getenv("OUTREACH_DRAFT_USE_AI")
+if _OUTREACH_DRAFT_USE_AI_RAW is None:
+    OUTREACH_DRAFT_USE_AI = bool(os.getenv("OPENAI_API_KEY", "").strip())
+else:
+    OUTREACH_DRAFT_USE_AI = _OUTREACH_DRAFT_USE_AI_RAW.strip().lower() in {"1", "true", "yes", "on"}
 try:
-    STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = float(os.getenv("STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS", "18"))
+    STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = float(os.getenv("STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS", "75"))
 except ValueError:
-    STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = 18.0
+    STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS = 75.0
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 UNIFIED_LOG_FILE = LOGS_DIR / "app.log"
@@ -77,6 +85,26 @@ def _safe_preview(value: Any, max_chars: int = 1000) -> Any:
     except Exception:
         text = str(value)
         return text if len(text) <= max_chars else text[:max_chars] + "...[truncated]"
+
+
+def _masked_secret(value: str) -> str:
+    if not value:
+        return "missing"
+    return f"{value[:7]}...{value[-4:]}" if len(value) > 14 else f"{value[:4]}...{value[-2:]}"
+
+
+def _openai_runtime_config() -> dict[str, Any]:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    return {
+        "openai_api_key_present": bool(key),
+        "openai_api_key_masked": _masked_secret(key),
+        "openai_api_key_length": len(key),
+        "openai_api_key_sha256_12": hashlib.sha256(key.encode("utf-8")).hexdigest()[:12] if key else None,
+        "openai_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "openai_timeout_seconds": os.getenv("OPENAI_TIMEOUT_SECONDS", "45"),
+        "stream_email_generation_timeout_seconds": STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS,
+        "outreach_draft_use_ai": OUTREACH_DRAFT_USE_AI,
+    }
 
 
 def _write_log(file_name: str, payload: dict[str, Any]) -> None:
@@ -433,6 +461,28 @@ async def _get_personalization_profile_fast(user_id: str, company_id: str, timeo
         return None
 
 
+def _email_draft_payload(draft_model: Any) -> dict[str, Any]:
+    """Return only columns that exist on the reset email_drafts table."""
+    payload = draft_model.model_dump(exclude={"generation_attempt"})
+    payload.pop("selected_variant", None)
+    payload.pop("variants", None)
+    payload.pop("subjects", None)
+    return payload
+
+
+def _generation_attempt_payload(draft_model: Any, stored: dict[str, Any]) -> Optional[dict[str, Any]]:
+    attempt = getattr(draft_model, "generation_attempt", None)
+    if not isinstance(attempt, dict):
+        return None
+    payload = dict(attempt)
+    payload["draft_id"] = stored.get("id") or payload.get("draft_id")
+    payload["user_id"] = stored.get("user_id") or payload.get("user_id")
+    payload["company_id"] = stored.get("company_id") or payload.get("company_id")
+    payload.setdefault("status", stored.get("generation_status") or "completed")
+    payload.setdefault("prompt_version", stored.get("prompt_version") or "email_single_v1")
+    return payload
+
+
 async def _persist_email_draft_fast(user_id: str, draft_payload: dict[str, Any], timeout: float = 2.5) -> dict[str, Any]:
     """Persist the draft when Supabase is responsive, but always return the cached draft."""
     _merge_outreach_draft_cache(user_id, draft_payload)
@@ -462,6 +512,7 @@ async def _finalize_email_draft_storage(
     company_id: str,
     stored: dict[str, Any],
     personalization: dict[str, Any],
+    generation_attempt: Optional[dict[str, Any]] = None,
 ) -> None:
     """Best-effort noncritical storage. Failure here must not break draft generation."""
     def write_db() -> None:
@@ -487,10 +538,8 @@ async def _finalize_email_draft_storage(
         except Exception:
             pass
         try:
-            subjects = stored.get("subjects") or []
-            if stored.get("id") and subjects:
-                rows = [{"draft_id": stored.get("id"), **subject} for subject in subjects]
-                client.table("generated_subjects").insert(rows).execute()
+            if generation_attempt:
+                client.table("email_generation_attempts").insert(generation_attempt).execute()
         except Exception:
             pass
         try:
@@ -504,26 +553,6 @@ async def _finalize_email_draft_storage(
         await asyncio.wait_for(asyncio.to_thread(write_db), timeout=4.0)
     except Exception:
         pass
-
-
-async def _get_generated_subjects_fast(draft_id: str, timeout: float = 2.0) -> list[dict[str, Any]]:
-    def fetch_db() -> list[dict[str, Any]]:
-        client = supabase_client._get_client()  # type: ignore[attr-defined]
-        if not client:
-            return []
-        result = (
-            client.table("generated_subjects")
-            .select("*")
-            .eq("draft_id", draft_id)
-            .order("created_at")
-            .execute()
-        )
-        return result.data or []
-
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(fetch_db), timeout=timeout)
-    except Exception:
-        return []
 
 
 def _hydrate_company_work_mode(company: dict[str, Any]) -> dict[str, Any]:
@@ -568,6 +597,9 @@ _broadcast_queue = _BroadcastQueue()
 async def lifespan(app: FastAPI):
     # Startup
     print("OfferHunter AI backend starting up...")
+    config = _openai_runtime_config()
+    print(f"OpenAI runtime config: {json.dumps(config, default=str)}")
+    _log_backend_action("openai.runtime_config.loaded", **config)
     yield
     # Shutdown
     print("OfferHunter AI backend shutting down...")
@@ -755,7 +787,6 @@ class GenerateEmailDraftRequest(BaseModel):
 class DraftUpdateRequest(BaseModel):
     subject: Optional[str] = None
     body: Optional[str] = None
-    selected_variant: Optional[str] = None
     recipient_email: Optional[str] = None
     status: Optional[str] = None
     user_id: Optional[str] = None
@@ -911,6 +942,7 @@ class OrchestrationStateUpdateRequest(BaseModel):
 @app.get("/agent-events")
 async def get_agent_events(
     limit: int = Query(50, ge=1, le=200),
+    user_id: Optional[str] = None,
     agent_name: Optional[str] = None,
     status: Optional[str] = None,
 ):
@@ -919,7 +951,7 @@ async def get_agent_events(
         result = await _db_call(
             "agent_events.list",
             lambda: supabase_client.get_agent_events(
-                limit=limit, agent_name=agent_name, status=status
+                limit=limit, user_id=user_id, agent_name=agent_name, status=status
             ),
             timeout=3.0,
             fallback=[],
@@ -1141,7 +1173,7 @@ async def approve_email(email_id: str):
             task_id=email_id,
             status="started",
             message=f"Email {email_id} approved by user Ã¢â‚¬â€ ready to send",
-            metadata={"email_id": email_id},
+            metadata={"email_id": email_id, "user_id": "anonymous"},
         )
         return {"email_id": email_id, "status": "approved"}
     except Exception as e:
@@ -1218,7 +1250,7 @@ async def _generate_selected_company_email(request: GenerateEmailDraftRequest) -
             preferences=context["preferences"],
             resume=context["resume"],
             job=request.job,
-            use_ai=False,
+            use_ai=OUTREACH_DRAFT_USE_AI,
         )
         personalization = personalization_model.model_dump()
         _log_backend_action(
@@ -1251,16 +1283,19 @@ async def _generate_selected_company_email(request: GenerateEmailDraftRequest) -
         user_id=request.user_id,
         company_id=request.company_id,
         used_ai=OUTREACH_DRAFT_USE_AI,
+        used_default_template=(draft_model.generation_metadata or {}).get("used_default_template") is True,
         duration_ms=round((time.perf_counter() - started) * 1000, 2),
     )
-    draft_payload = {**draft_model.model_dump(), "version_number": 1}
+    draft_payload = {**_email_draft_payload(draft_model), "version_number": 1}
     stored = await _persist_email_draft_fast(request.user_id, draft_payload)
+    generation_attempt = _generation_attempt_payload(draft_model, stored)
     asyncio.create_task(
         _finalize_email_draft_storage(
             user_id=request.user_id,
             company_id=request.company_id,
             stored=stored,
             personalization=personalization,
+            generation_attempt=generation_attempt,
         )
     )
     _log_backend_action(
@@ -1386,7 +1421,7 @@ async def stream_email_generation(
                     user_profile=context["profile"],
                     preferences=context["preferences"],
                     resume=context["resume"],
-                    use_ai=False,
+                    use_ai=OUTREACH_DRAFT_USE_AI,
                 )
                 personalization = personalization_model.model_dump()
                 _log_backend_action(
@@ -1403,7 +1438,7 @@ async def stream_email_generation(
                 )
 
             yield event({"type": "status", "step": "writing", "message": f"Writing your personalized cold email for {company_name}..."})
-            draft_model = await asyncio.wait_for(
+            email_task = asyncio.create_task(
                 EmailWriterService().generate_email(
                     user_id=user_id,
                     company=context["company"],
@@ -1413,26 +1448,68 @@ async def stream_email_generation(
                     resume=context["resume"],
                     outreach_type=outreach_type,
                     use_ai=OUTREACH_DRAFT_USE_AI,
-                ),
-                # Keep backend timeout below frontend SSE watchdog thresholds
-                # (20s inactivity / 45s total) to avoid indefinite loading.
-                timeout=STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS,
+                )
             )
+            write_started = time.perf_counter()
+            heartbeat_count = 0
+            while True:
+                remaining = STREAM_EMAIL_GENERATION_TIMEOUT_SECONDS - (time.perf_counter() - write_started)
+                if remaining <= 0:
+                    email_task.cancel()
+                    with suppress(BaseException):
+                        await email_task
+                    raise asyncio.TimeoutError()
+                try:
+                    draft_model = await asyncio.wait_for(asyncio.shield(email_task), timeout=min(5.0, remaining))
+                    break
+                except asyncio.TimeoutError:
+                    heartbeat_count += 1
+                    yield event(
+                        {
+                            "type": "status",
+                            "step": "writing",
+                            "message": (
+                                f"Still writing the personalized email for {company_name}..."
+                                if heartbeat_count == 1
+                                else f"Still waiting on OpenAI for {company_name}..."
+                            ),
+                        }
+                    )
+            draft_metadata = draft_model.generation_metadata or {}
+            if draft_metadata.get("used_default_template") is True:
+                reason = str(draft_metadata.get("default_template_reason") or "AI email generation was unavailable")
+                _log_backend_action(
+                    "stream_email_generation.default_template_fallback",
+                    user_id=user_id,
+                    company_id=company_id,
+                    company_name=company_name,
+                    reason=reason,
+                )
+                yield event(
+                    {
+                        "type": "fallback_template",
+                        "message": DEFAULT_TEMPLATE_FALLBACK_NOTICE,
+                        "reason": reason,
+                    }
+                )
             _log_backend_action(
                 "stream_email_generation.draft_generated",
                 user_id=user_id,
                 company_id=company_id,
                 used_ai=OUTREACH_DRAFT_USE_AI,
+                used_default_template=draft_metadata.get("used_default_template") is True,
                 duration_ms=round((time.perf_counter() - started) * 1000, 2),
             )
-            draft_payload = {**draft_model.model_dump(), "version_number": 1}
+            draft_payload = {**_email_draft_payload(draft_model), "version_number": 1}
             stored = await _persist_email_draft_fast(user_id, draft_payload)
+            generation_attempt = _generation_attempt_payload(draft_model, stored)
             asyncio.create_task(
                 _finalize_email_draft_storage(
                     user_id=user_id,
                     company_id=company_id,
                     stored=stored,
                     personalization=personalization,
+                    generation_attempt=generation_attempt,
                 )
             )
             yield event({"type": "draft", "draft": stored, "personalization": personalization})
@@ -1595,8 +1672,7 @@ async def get_email_draft(draft_id: str):
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
     versions = await _get_email_versions_fast(draft_id)
-    subjects = await _get_generated_subjects_fast(draft_id)
-    return {"draft": draft, "versions": versions, "subjects": subjects}
+    return {"draft": draft, "versions": versions, "subjects": []}
 
 
 @app.patch("/outreach/drafts/{draft_id}")
@@ -1708,7 +1784,6 @@ async def restore_email_version(draft_id: str, version_id: str, user_id: str = Q
             user_id=user_id,
             subject=version.get("subject"),
             body=version.get("body"),
-            selected_variant=version.get("selected_variant"),
             recipient_email=version.get("recipient_email"),
         ),
     )
@@ -1809,6 +1884,14 @@ async def health_check():
         "source_file": str(Path(__file__).resolve()),
         "has_debug_logs_route": any(getattr(route, "path", "") == "/debug/logs/frontend" for route in app.routes),
     }
+
+
+@app.get("/debug/openai-config")
+async def get_openai_config():
+    """Return safe OpenAI runtime diagnostics without exposing the raw API key."""
+    config = _openai_runtime_config()
+    _log_backend_action("openai.runtime_config.requested", **config)
+    return config
 
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Company Finder Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -2863,7 +2946,7 @@ async def handoff_to_agent(
                 task_id=task_id,
                 status="started",
                 message="Generating selected-company cold email draft",
-                metadata={"company_id": company_id},
+                metadata={"company_id": company_id, "user_id": user_id},
             )
             result = await _generate_selected_company_email(
                 GenerateEmailDraftRequest(
@@ -2878,14 +2961,14 @@ async def handoff_to_agent(
                 task_id=task_id,
                 status="completed",
                 message=f"Cold email draft ready for {draft.get('company_name', 'company')}",
-                metadata={"company_id": company_id, "draft_id": draft.get("id")},
+                metadata={"company_id": company_id, "draft_id": draft.get("id"), "user_id": user_id},
             )
             await logger.emit(
                 agent_name="HumanReviewAgent",
                 task_id=task_id,
                 status="started",
                 message=f"Draft for {draft.get('company_name', 'company')} is ready for human review",
-                metadata={"company_id": company_id, "draft_id": draft.get("id")},
+                metadata={"company_id": company_id, "draft_id": draft.get("id"), "user_id": user_id},
             )
             return
 
@@ -2914,7 +2997,7 @@ async def handoff_to_agent(
                 task_id=task_id,
                 status="started",
                 message=f"Finding best people to contact at {company.get('name', 'this company')}",
-                metadata={"company_id": company_id, "company": company.get("name")},
+                metadata={"company_id": company_id, "company": company.get("name"), "user_id": user_id},
             )
             contact_result = await ContactDiscoveryService().discover(company)
             contacts = [
@@ -2943,7 +3026,7 @@ async def handoff_to_agent(
                 task_id=task_id,
                 status="completed",
                 message=f"Ranked {len(stored_contacts)} outreach contacts for {company.get('name', 'company')}",
-                metadata={"company_id": company_id, "contacts": stored_contacts[:5]},
+                metadata={"company_id": company_id, "contacts": stored_contacts[:5], "user_id": user_id},
             )
 
             await supabase_client.upsert_orchestration_state({
@@ -2989,7 +3072,7 @@ async def handoff_to_agent(
                 task_id=task_id,
                 status="started",
                 message=f"Draft for {company.get('name', 'company')} is ready for human review",
-                metadata={"company_id": company_id, "draft_id": draft.get("id")},
+                metadata={"company_id": company_id, "draft_id": draft.get("id"), "user_id": user_id},
             )
         except Exception as exc:
             await logger.emit(
@@ -2997,7 +3080,7 @@ async def handoff_to_agent(
                 task_id=task_id,
                 status="failed",
                 message=f"Cold email pipeline failed: {str(exc)}",
-                metadata={"company_id": company_id},
+                metadata={"company_id": company_id, "user_id": user_id},
             )
 
     if target == "email-writer":
@@ -3026,7 +3109,7 @@ async def handoff_to_agent(
                     task_id=task_id,
                     status="started",
                     message=f"Tailored resume for {company.get('name', 'company')} is ready for review",
-                    metadata={"company_id": company_id},
+                    metadata={"company_id": company_id, "user_id": user_id},
                 )
             except Exception as exc:
                 await logger.emit(
@@ -3034,7 +3117,7 @@ async def handoff_to_agent(
                     task_id=task_id,
                     status="failed",
                     message=f"Resume tailoring failed: {str(exc)}",
-                    metadata={"company_id": company_id},
+                    metadata={"company_id": company_id, "user_id": user_id},
                 )
 
         asyncio.create_task(run_resume_tailor())

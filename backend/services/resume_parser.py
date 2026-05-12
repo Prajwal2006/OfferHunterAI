@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 
+from .logger_service import get_logger
+
 # ─── Prompt ───────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert resume parser. Extract ALL available information
@@ -91,6 +93,7 @@ class ResumeParserService:
         self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self._base_url = "https://api.openai.com/v1"
+        self._logger = get_logger()
 
     async def parse(self, resume_text: str) -> dict[str, Any]:
         """
@@ -123,6 +126,20 @@ class ResumeParserService:
             "max_tokens": 4096,
             "response_format": {"type": "json_object"},
         }
+        call_id = self._logger.log_llm_call(
+            provider="openai",
+            model=self._model,
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=payload["messages"][1]["content"],
+            temperature=payload["temperature"],
+            max_tokens=payload["max_tokens"],
+            context={
+                "operation": "resume_parse",
+                "raw_resume_text": resume_text,
+                "truncated_resume_text_sent": truncated,
+            },
+            raw_payload=payload,
+        )
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self._base_url}/chat/completions",
@@ -134,7 +151,18 @@ class ResumeParserService:
             content = data["choices"][0]["message"]["content"]
             parsed = json.loads(content)
             parsed["raw_text"] = resume_text
-            return self._normalize(parsed)
+            normalized = self._normalize(parsed)
+            usage = data.get("usage") or {}
+            self._logger.log_llm_response(
+                call_id=call_id,
+                response=content,
+                response_json=normalized,
+                tokens_used=usage.get("total_tokens"),
+                tokens_prompt=usage.get("prompt_tokens"),
+                tokens_completion=usage.get("completion_tokens"),
+                raw_response=data,
+            )
+            return normalized
 
     def _parse_with_heuristics(self, text: str) -> dict[str, Any]:
         """Best-effort extraction using regex patterns."""

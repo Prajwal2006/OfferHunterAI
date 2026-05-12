@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from .logger_service import get_logger
+
 
 class QueryExpansionService:
     """
@@ -28,6 +30,7 @@ class QueryExpansionService:
     def __init__(self) -> None:
         self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self._logger = get_logger()
 
     async def expand_queries(
         self,
@@ -176,6 +179,29 @@ Generate queries that span:
 Each query should be 1-5 words. Useful for searching job boards, public ATS APIs, OSS organizations, funding databases, and company directories.
 Return a JSON object: {{"queries": ["query1", "query2", ...]}}"""
 
+        payload = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": 512,
+            "response_format": {"type": "json_object"},
+        }
+        call_id = self._logger.log_llm_call(
+            provider="openai",
+            model=self._model,
+            user_prompt=prompt,
+            temperature=temperature,
+            max_tokens=512,
+            context={
+                "operation": "query_expansion",
+                "profile": profile,
+                "preferences": preferences,
+                "base_queries": base,
+                "discovery_round": discovery_round,
+                "excluded_names": excluded_names,
+            },
+            raw_payload=payload,
+        )
         async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -183,14 +209,21 @@ Return a JSON object: {{"queries": ["query1", "query2", ...]}}"""
                     "Authorization": f"Bearer {self._api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": self._model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": temperature,
-                    "max_tokens": 512,
-                    "response_format": {"type": "json_object"},
-                },
+                json=payload,
             )
             response.raise_for_status()
-            data = json.loads(response.json()["choices"][0]["message"]["content"])
-            return [str(q) for q in data.get("queries", []) if q]
+            raw_response = response.json()
+            content = raw_response["choices"][0]["message"]["content"]
+            data = json.loads(content)
+            parsed = [str(q) for q in data.get("queries", []) if q]
+            usage = raw_response.get("usage") or {}
+            self._logger.log_llm_response(
+                call_id=call_id,
+                response=content,
+                response_json={"queries": parsed},
+                tokens_used=usage.get("total_tokens"),
+                tokens_prompt=usage.get("prompt_tokens"),
+                tokens_completion=usage.get("completion_tokens"),
+                raw_response=raw_response,
+            )
+            return parsed

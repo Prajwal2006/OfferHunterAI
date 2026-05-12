@@ -68,6 +68,7 @@ class CompanyFinderAgent:
         self._enricher = CompanyEnrichmentService()
         self._scorer = CompanyScoringService()
         self._contact_finder = ContactFinderService()
+        self._current_user_id = "anonymous"
 
     # ─── Public Entry Points ──────────────────────────────────────────────────
 
@@ -115,6 +116,7 @@ class CompanyFinderAgent:
         Returns { profile, preferences, companies, run_id }
         """
         run_id = str(uuid.uuid4())
+        self._current_user_id = user_id or "anonymous"
 
         await self._emit("started", task_id,
             f"Starting Company Finder Agent for user {user_id}",
@@ -268,6 +270,7 @@ class CompanyFinderAgent:
         Run discovery-first without the resume parse step.
         Used when a profile is already available.
         """
+        self._current_user_id = user_id or "anonymous"
         await self._emit("started", task_id,
             f"Starting company discovery — {len(profile.get('skills', []))} skills, "
             f"{len(preferences.get('preferred_roles', []))} target roles"
@@ -1007,12 +1010,14 @@ class CompanyFinderAgent:
         message: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        metadata = metadata or {}
+        metadata.setdefault("user_id", self._current_user_id)
         await self.logger.emit(
             agent_name=self.AGENT_NAME,
             task_id=task_id,
             status=status,
             message=message,
-            metadata=metadata or {},
+            metadata=metadata,
         )
 
     @staticmethod

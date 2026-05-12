@@ -27,6 +27,7 @@ class PersonalizationProfile(BaseModel):
     key_points_to_mention: list[str] = []
     personalization_summary: str
     evidence: dict[str, Any] = {}
+    generated_by: str = "openai"
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -57,6 +58,7 @@ class PersonalizationService:
             "links_analysis": links_analysis or self._analyze_links(user_profile or {}, preferences or {}),
         }
         fallback = self._deterministic_profile(user_id=user_id, context=context)
+        fallback.generated_by = "deterministic"
         if not use_ai or not self.ai.enabled:
             return fallback
 
@@ -75,12 +77,28 @@ class PersonalizationService:
             f"Context:\n{compact_json(context)}"
         )
         try:
-            data = await self.ai.create_json(system=system, user=user, temperature=0.25, max_tokens=2400)
+            data = await self.ai.create_json(
+                system=system,
+                user=user,
+                temperature=0.25,
+                max_tokens=2400,
+                user_id=user_id,
+                context_metadata={
+                    "operation": "personalization_profile",
+                    "company": company,
+                    "user_profile": user_profile or {},
+                    "preferences": preferences or {},
+                    "resume": self._resume_context(resume),
+                    "job": job or {},
+                    "links_analysis": context["links_analysis"],
+                },
+            )
             merged = {**fallback.model_dump(), **data}
             merged["id"] = fallback.id
             merged["user_id"] = user_id
             merged["company_id"] = str(company.get("id") or "")
             merged["fit_score"] = normalize_score(merged.get("fit_score"), fallback.fit_score)
+            merged["generated_by"] = "openai"
             return PersonalizationProfile.model_validate(merged)
         except (AIServiceError, ValueError, TypeError):
             return fallback

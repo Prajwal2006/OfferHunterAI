@@ -2,11 +2,13 @@ export type AgentStatus = "idle" | "running" | "completed" | "error";
 
 export interface AgentEvent {
   id: string;
+  user_id?: string;
   agent_name: string;
   task_id: string;
   status: "started" | "running" | "completed" | "failed";
   message: string;
   metadata: Record<string, unknown>;
+  expires_at?: string | null;
   created_at: string;
 }
 
@@ -336,16 +338,21 @@ export interface EmailDraft {
   company_name: string;
   outreach_type: string;
   tone: string;
-  selected_variant: string;
   subject: string;
   body: string;
-  variants: Record<string, string>;
-  subjects: Array<{ label: string; subject: string; selected?: boolean }>;
   recipient_email?: string;
   status: "draft" | "pending_approval" | "approved" | "rejected" | "scheduled" | "sent" | "failed";
   version_number: number;
   resume_version_id?: string | null;
   resume_skills?: string[];
+  generation_source?: "openai" | "default_template" | "manual";
+  generation_status?: "pending" | "running" | "completed" | "failed" | "fallback";
+  llm_provider?: string | null;
+  llm_model?: string | null;
+  llm_call_id?: string | null;
+  prompt_version?: string;
+  generation_error?: string | null;
+  generation_context_summary?: Record<string, unknown>;
   generation_metadata?: Record<string, unknown>;
   companies?: Partial<Company>;
   created_at?: string;
@@ -359,7 +366,6 @@ export interface EmailVersion {
   version_number: number;
   subject: string;
   body: string;
-  selected_variant: string;
   recipient_email?: string;
   event_type: string;
   editor: "user" | "ai" | "system";

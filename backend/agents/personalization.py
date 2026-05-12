@@ -34,14 +34,14 @@ class PersonalizationAgent:
             task_id=task_id,
             status="started",
             message=f"Starting personalization analysis for {company_name}",
-            metadata={"company": company_name, "domain": domain},
+            metadata={"company": company_name, "domain": domain, "user_id": user_id},
         )
         await self.logger.emit(
             agent_name=self.AGENT_NAME,
             task_id=task_id,
             status="running",
             message=f"Matching resume, preferences, links, company data, and role context for {company_name}",
-            metadata={"company": company_name},
+            metadata={"company": company_name, "user_id": user_id},
         )
 
         profile = await self.service.generate_profile(
@@ -67,6 +67,6 @@ class PersonalizationAgent:
             task_id=task_id,
             status="completed",
             message=f"Completed personalization for {company_name} with fit score {result.get('fit_score')}",
-            metadata={"company": company_name, "insights": result},
+            metadata={"company": company_name, "insights": result, "user_id": user_id},
         )
         return result

@@ -25,7 +25,6 @@ class VersioningService:
             "version_number": int(draft.get("version_number") or 0) + 1,
             "subject": draft.get("subject") or "",
             "body": draft.get("body") or "",
-            "selected_variant": draft.get("selected_variant") or "medium",
             "recipient_email": draft.get("recipient_email"),
             "snapshot": draft,
             "event_type": event_type,

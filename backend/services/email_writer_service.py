@@ -1,4 +1,4 @@
-"""AI email generation service with structured variants and subjects."""
+"""AI email generation service for one personalized cold email draft."""
 from __future__ import annotations
 
 import re
@@ -9,6 +9,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .ai_common import AIServiceError, OpenAIJsonClient, compact_json
+from .logger_service import get_logger
+
+
+DEFAULT_TEMPLATE_FALLBACK_NOTICE = "USING DEFAULT TEMPLATE EMAIL BECAUSE OPENAI EMAIL GENERATION FAILED OR WAS DISABLED"
 
 
 class GeneratedEmailDraft(BaseModel):
@@ -18,14 +22,20 @@ class GeneratedEmailDraft(BaseModel):
     company_name: str
     outreach_type: str
     tone: str
-    selected_variant: str = "medium"
     subject: str
     body: str
-    variants: dict[str, str]
-    subjects: list[dict[str, str]]
     recipient_email: str | None = None
     status: str = "pending_approval"
+    generation_source: str = "openai"
+    generation_status: str = "completed"
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    llm_call_id: str | None = None
+    prompt_version: str = "email_single_v1"
+    generation_error: str | None = None
+    generation_context_summary: dict[str, Any] = {}
     generation_metadata: dict[str, Any] = {}
+    generation_attempt: dict[str, Any] | None = None
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -34,6 +44,7 @@ class EmailWriterService:
 
     def __init__(self) -> None:
         self.ai = OpenAIJsonClient()
+        self.logger = get_logger()
 
     async def generate_email(
         self,
@@ -61,7 +72,15 @@ class EmailWriterService:
             outreach_type=outreach_type,
         )
         if not use_ai or not self.ai.enabled:
-            return fallback
+            reason = "OUTREACH_DRAFT_USE_AI is disabled" if not use_ai else "OpenAI client is not configured"
+            return self._use_default_template(
+                fallback,
+                reason=reason,
+                user_id=user_id,
+                company=company,
+                personalization=personalization,
+                use_ai=use_ai,
+            )
 
         context = {
             "company": company,
@@ -75,7 +94,7 @@ class EmailWriterService:
                 "Write every email body in FIRST PERSON from the candidate's perspective.",
                 "Use I, me, my, and mine. Never say the user, the candidate, the applicant, or this profile.",
                 "Do not write phrases like 'the user is qualified in'; write 'I have experience in' instead.",
-                "Open directly with the candidate's interest or with a sharp hook, depending on the variant.",
+                "Open directly with a specific candidate-company fit hook.",
                 "Sound like a strong, thoughtful student/operator writing one personal note, not a cover letter.",
                 "Make the first two sentences specific to the company and the candidate's fit.",
                 "Mention internship availability and whether the candidate is open to full-time or part-time work when preferences include it.",
@@ -87,7 +106,7 @@ class EmailWriterService:
                 "Avoid overexplaining. Prefer precise, confident sentences.",
                 "Do not overload with more than three proof points.",
                 "No fabricated metrics.",
-                "Keep short under 150 words, medium under 260 words, bold under 220 words.",
+                "Write exactly one email body under 240 words.",
             ],
         }
         system = (
@@ -98,17 +117,32 @@ class EmailWriterService:
             "Optimize for a reply from a busy founder, recruiter, or hiring manager."
         )
         user = (
-            "Generate JSON with keys: selected_variant, subject, body, variants, subjects, generation_metadata. "
-            "variants must include short, medium, bold_founder. subjects must include professional, startup_style, "
-            "curiosity_based, role_focused objects with label and subject. Select medium by default. "
-            "The medium variant should be polished, warm, direct, and easy to skim. "
-            "The short variant should start quickly and feel like a human note, not a template. "
-            "The bold_founder variant should begin with a hook line that makes the reader want to keep reading, while staying credible. "
+            "Generate JSON with exactly these keys: subject, body, generation_metadata. "
+            "Return one polished cold email only. Do not return variants or multiple subject options. "
+            "The email should be warm, direct, easy to skim, and specific to this company. "
             "When the recipient is unknown, use a clean greeting such as 'Hi [Company] team,' instead of a formal 'Dear'. "
             f"Context:\n{compact_json(context)}"
         )
         try:
-            data = await self.ai.create_json(system=system, user=user, temperature=0.55, max_tokens=2600)
+            result = await self.ai.create_json_detailed(
+                system=system,
+                user=user,
+                temperature=0.55,
+                max_tokens=1400,
+                user_id=user_id,
+                context_metadata={
+                    "operation": "email_writer",
+                    "company": company,
+                    "personalization": personalization,
+                    "user_profile": user_profile or {},
+                    "preferences": preferences or {},
+                    "resume": resume or {},
+                    "job": job or {},
+                    "recipient": recipient or {},
+                    "outreach_type": outreach_type,
+                },
+            )
+            data = result.data
             merged = {**fallback.model_dump(), **data}
             merged["id"] = fallback.id
             merged["user_id"] = user_id
@@ -116,16 +150,111 @@ class EmailWriterService:
             merged["company_name"] = company.get("name") or fallback.company_name
             merged["outreach_type"] = outreach_type or personalization.get("outreach_type") or fallback.outreach_type
             merged["tone"] = personalization.get("tone") or fallback.tone
-            selected = merged.get("selected_variant") or "medium"
-            variants = merged.get("variants") or fallback.variants
-            variants = {key: self._sanitize_first_person(str(value)) for key, value in variants.items()}
-            merged["variants"] = variants
-            merged["body"] = self._sanitize_first_person(variants.get(selected) or merged.get("body") or fallback.body)
-            if not merged.get("subject") and merged.get("subjects"):
-                merged["subject"] = merged["subjects"][0].get("subject")
+            merged["subject"] = str(merged.get("subject") or fallback.subject).strip()
+            merged["body"] = self._sanitize_first_person(str(merged.get("body") or fallback.body))
+            metadata = merged.get("generation_metadata") if isinstance(merged.get("generation_metadata"), dict) else {}
+            context_summary = self._context_summary(company, personalization, user_profile or {}, preferences or {}, resume or {})
+            attempt = {
+                "draft_id": fallback.id,
+                "user_id": user_id,
+                "company_id": str(company.get("id") or ""),
+                "provider": result.provider,
+                "model": result.model,
+                "status": "completed",
+                "prompt_version": "email_single_v1",
+                "request_payload": result.request_payload,
+                "context_payload": result.context_payload or {},
+                "raw_response": result.raw_response,
+                "parsed_response": data,
+                "tokens_prompt": result.tokens_prompt,
+                "tokens_completion": result.tokens_completion,
+                "tokens_total": result.tokens_total,
+                "duration_ms": result.duration_ms,
+                "completed_at": datetime.utcnow().isoformat(),
+            }
+            merged["generation_metadata"] = {
+                **metadata,
+                "generated_with_ai": True,
+                "used_default_template": False,
+            }
+            merged["generation_source"] = "openai"
+            merged["generation_status"] = "completed"
+            merged["llm_provider"] = result.provider
+            merged["llm_model"] = result.model
+            merged["llm_call_id"] = result.call_id
+            merged["prompt_version"] = "email_single_v1"
+            merged["generation_context_summary"] = context_summary
+            merged["generation_attempt"] = attempt
             return GeneratedEmailDraft.model_validate(merged)
-        except (AIServiceError, ValueError, TypeError):
-            return fallback
+        except (AIServiceError, ValueError, TypeError) as exc:
+            return self._use_default_template(
+                fallback,
+                reason=f"{exc.__class__.__name__}: {exc}",
+                user_id=user_id,
+                company=company,
+                personalization=personalization,
+                use_ai=use_ai,
+            )
+
+    def _use_default_template(
+        self,
+        draft: GeneratedEmailDraft,
+        *,
+        reason: str,
+        user_id: str,
+        company: dict[str, Any],
+        personalization: dict[str, Any],
+        use_ai: bool,
+    ) -> GeneratedEmailDraft:
+        details = {
+            "user_id": user_id,
+            "company_id": company.get("id"),
+            "company_name": company.get("name"),
+            "reason": reason,
+            "ai_requested": use_ai,
+            "openai_enabled": self.ai.enabled,
+            "fit_score": personalization.get("fit_score"),
+            "draft_id": draft.id,
+        }
+        draft.generation_metadata = {
+            **(draft.generation_metadata or {}),
+            "generated_with_ai": False,
+            "used_default_template": True,
+            "default_template_notice": DEFAULT_TEMPLATE_FALLBACK_NOTICE,
+            "default_template_reason": reason,
+            "ai_requested": use_ai,
+            "openai_enabled": self.ai.enabled,
+        }
+        draft.generation_source = "default_template"
+        draft.generation_status = "fallback"
+        draft.generation_error = reason
+        draft.llm_provider = "openai" if self.ai.enabled else None
+        draft.llm_model = self.ai.model if self.ai.enabled else None
+        draft.prompt_version = "email_single_v1"
+        draft.generation_context_summary = self._context_summary(company, personalization, {}, {}, {})
+        draft.generation_attempt = {
+            "draft_id": draft.id,
+            "user_id": user_id,
+            "company_id": str(company.get("id") or ""),
+            "provider": "openai",
+            "model": self.ai.model if self.ai.enabled else None,
+            "status": "fallback",
+            "prompt_version": "email_single_v1",
+            "request_payload": {},
+            "context_payload": {
+                "company": company,
+                "personalization": personalization,
+            },
+            "parsed_response": {"subject": draft.subject, "body": draft.body},
+            "error": reason,
+            "completed_at": datetime.utcnow().isoformat(),
+        }
+        self.logger.log_loud_marker(
+            DEFAULT_TEMPLATE_FALLBACK_NOTICE,
+            details,
+            include_llm_debug=True,
+        )
+        return draft
 
     def _deterministic_email(
         self,
@@ -188,34 +317,52 @@ class EmailWriterService:
             f"If there is room for an ambitious {role} profile this summer, I would love to talk.\n\n"
             f"Best,\n{full_name}"
         )
-        variants = {
-            "short": self._sanitize_first_person(short),
-            "medium": self._sanitize_first_person(medium),
-            "bold_founder": self._sanitize_first_person(bold),
-        }
-        subjects = [
-            {"label": "Professional", "subject": f"Summer internship interest - {company_name}"},
-            {"label": "Startup-style", "subject": f"Builder interested in helping {company_name} this summer"},
-            {"label": "Curiosity-based", "subject": f"Could I support {company_name} this summer?"},
-            {"label": "Role-focused", "subject": f"{role} internship interest - {skill_line.split(',')[0]} experience"},
-        ]
+        fallback_body = self._sanitize_first_person(medium)
+        fallback_subject = f"Summer internship interest - {company_name}"
         return GeneratedEmailDraft(
             user_id=user_id,
             company_id=str(company.get("id") or ""),
             company_name=company_name,
             outreach_type=outreach_type or personalization.get("outreach_type") or "cold_email",
             tone=personalization.get("tone") or "professional_concise",
-            subject=subjects[0]["subject"],
-            body=variants["medium"],
-            variants=variants,
-            subjects=subjects,
+            subject=fallback_subject,
+            body=fallback_body,
             recipient_email=recipient.get("email"),
+            generation_source="default_template",
+            generation_status="fallback",
+            prompt_version="email_single_v1",
+            generation_context_summary=self._context_summary(company, personalization, user_profile, preferences, resume),
             generation_metadata={
                 "fit_score": personalization.get("fit_score"),
                 "strategy": personalization.get("email_strategy") or {},
                 "generated_without_openai": not self.ai.enabled,
+                "generated_with_ai": False,
             },
         )
+
+    def _context_summary(
+        self,
+        company: dict[str, Any],
+        personalization: dict[str, Any],
+        profile: dict[str, Any],
+        preferences: dict[str, Any],
+        resume: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "company": {
+                "name": company.get("name"),
+                "domain": company.get("domain"),
+                "industry": company.get("industry"),
+                "description": company.get("description") or company.get("mission"),
+            },
+            "fit_score": personalization.get("fit_score"),
+            "relevant_skills": personalization.get("relevant_skills") or [],
+            "recommended_hooks": personalization.get("recommended_hooks") or [],
+            "user_name": profile.get("full_name"),
+            "preferred_roles": preferences.get("preferred_roles") or [],
+            "employment_type": preferences.get("employment_type") or [],
+            "resume_version_id": resume.get("id"),
+        }
 
     def _education_line(self, profile: dict[str, Any], resume_text: str) -> str:
         education = profile.get("education") or []
