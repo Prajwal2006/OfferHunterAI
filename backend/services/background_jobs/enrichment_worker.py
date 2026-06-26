@@ -24,7 +24,8 @@ async def run_enrichment_worker(
         return companies
 
     enricher = CompanyEnrichmentService()
+    effective_timeout = max(timeout_seconds, min(360.0, 30.0 + (len(companies) * 3.0)))
     return await asyncio.wait_for(
-        enricher.batch_enrich(companies, profile=profile, max_concurrent=5, top_n=min(30, len(companies))),
-        timeout=timeout_seconds,
+        enricher.batch_enrich(companies, profile=profile, max_concurrent=5, top_n=len(companies)),
+        timeout=effective_timeout,
     )

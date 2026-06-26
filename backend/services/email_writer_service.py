@@ -60,7 +60,7 @@ class EmailWriterService:
         outreach_type: str | None = None,
         use_ai: bool = True,
     ) -> GeneratedEmailDraft:
-        fallback = self._deterministic_email(
+        fallback = self._safe_deterministic_email(
             user_id=user_id,
             company=company,
             personalization=personalization,
@@ -273,7 +273,8 @@ class EmailWriterService:
         role = job.get("title") or (preferences.get("preferred_roles") or ["software engineering"])[0]
         full_name = user_profile.get("full_name") or "Your Name"
         resume_text = resume.get("extracted_text") or resume.get("raw_text") or ""
-        skills = personalization.get("relevant_skills") or user_profile.get("skills") or []
+        raw_skills = personalization.get("relevant_skills") or user_profile.get("skills") or []
+        skills = [str(skill).strip() for skill in raw_skills if skill is not None and str(skill).strip()]
         projects = personalization.get("relevant_projects") or user_profile.get("projects") or []
         links = self._collect_links(user_profile, preferences, personalization)
         greeting = f"Hi {company_name} team,"
@@ -339,6 +340,70 @@ class EmailWriterService:
                 "generated_with_ai": False,
             },
         )
+
+    def _safe_deterministic_email(
+        self,
+        *,
+        user_id: str,
+        company: dict[str, Any],
+        personalization: dict[str, Any],
+        user_profile: dict[str, Any],
+        preferences: dict[str, Any],
+        resume: dict[str, Any],
+        job: dict[str, Any],
+        recipient: dict[str, Any],
+        outreach_type: str | None,
+    ) -> GeneratedEmailDraft:
+        try:
+            return self._deterministic_email(
+                user_id=user_id,
+                company=company,
+                personalization=personalization,
+                user_profile=user_profile,
+                preferences=preferences,
+                resume=resume,
+                job=job,
+                recipient=recipient,
+                outreach_type=outreach_type,
+            )
+        except Exception as exc:
+            company_name = company.get("name") or "your team"
+            self.logger.log_error(
+                error_type="deterministic_email_fallback_failed",
+                message=str(exc),
+                user_id=user_id,
+                context={"company_id": company.get("id"), "company_name": company_name},
+                severity="warning",
+            )
+            return GeneratedEmailDraft(
+                user_id=user_id,
+                company_id=str(company.get("id") or ""),
+                company_name=company_name,
+                outreach_type=outreach_type or personalization.get("outreach_type") or "cold_email",
+                tone=personalization.get("tone") or "professional_concise",
+                subject=f"Internship interest - {company_name}",
+                body=(
+                    f"Hi {company_name} team,\n\n"
+                    "I am reaching out because I would love to contribute to your team this summer. "
+                    "I am looking for an internship where I can add value quickly and learn from strong builders.\n\n"
+                    "I can share my resume, GitHub, and portfolio and would be grateful for a quick conversation "
+                    "if there is a fit for current or upcoming openings.\n\n"
+                    "Best,\n"
+                    f"{user_profile.get('full_name') or 'Candidate'}"
+                ),
+                recipient_email=recipient.get("email") if isinstance(recipient, dict) else None,
+                generation_source="default_template",
+                generation_status="fallback",
+                prompt_version="email_single_v1",
+                generation_context_summary=self._context_summary(company, personalization, user_profile, preferences, resume),
+                generation_metadata={
+                    "fit_score": personalization.get("fit_score"),
+                    "strategy": personalization.get("email_strategy") or {},
+                    "generated_without_openai": not self.ai.enabled,
+                    "generated_with_ai": False,
+                    "safe_fallback": True,
+                },
+            )
 
     def _context_summary(
         self,

@@ -225,12 +225,12 @@ export default function ReviewPage() {
     try {
       const [draftsRes, companiesRes] = await Promise.allSettled([
         fetchEmailDrafts(uid),
-        fetchDiscoveredCompanies(uid, { limit: 100 }),
+        fetchDiscoveredCompanies(uid, { limit: 1000, includeHiddenByPreferences: true }),
       ]);
       const loadedDrafts = draftsRes.status === "fulfilled" ? draftsRes.value.drafts : [];
       const loadedCompanies =
         companiesRes.status === "fulfilled"
-          ? (companiesRes.value.visible_companies ?? companiesRes.value.companies ?? [])
+          ? (companiesRes.value.companies ?? companiesRes.value.visible_companies ?? [])
           : [];
       setDrafts(loadedDrafts);
       setCompanies(loadedCompanies);

@@ -750,6 +750,7 @@ class RunAgentsRequest(BaseModel):
     resume_text: Optional[str] = None
     resume_version_id: Optional[str] = None
     user_id: Optional[str] = None
+    generate_emails_for_all_companies: bool = False
 
 
 class ExecuteAgentRequest(BaseModel):
@@ -1056,41 +1057,43 @@ async def run_agents(request: RunAgentsRequest):
             if companies and request.user_id:
                 _merge_user_company_cache(request.user_id, companies)
 
-            # 2. Personalization (per company)
-            personalization_agent = PersonalizationAgent(logger=logger)
-            profile = await supabase_client.get_parsed_profile(request.user_id) if request.user_id else {}
-            active_resume_payload = {
-                "id": resume_version_id,
-                "extracted_text": resume_text or "",
-                "extracted_skills": resume_skills,
-            }
-            for company in companies[:request.company_count]:
-                insights = await personalization_agent.run(
-                    task_id=str(uuid.uuid4()),
-                    company=company,
-                    user_id=request.user_id or "anonymous",
-                    user_profile=profile or {},
-                    preferences=preferences,
-                    resume=active_resume_payload,
-                    job={"title": request.job_title},
-                )
+            # Optional legacy behavior: generate drafts for all discovered companies.
+            # Default is disabled so outreach drafts are generated only when the user
+            # explicitly clicks "Generate Cold Email" for a selected company.
+            if request.generate_emails_for_all_companies:
+                personalization_agent = PersonalizationAgent(logger=logger)
+                profile = await supabase_client.get_parsed_profile(request.user_id) if request.user_id else {}
+                active_resume_payload = {
+                    "id": resume_version_id,
+                    "extracted_text": resume_text or "",
+                    "extracted_skills": resume_skills,
+                }
+                for company in companies[:request.company_count]:
+                    insights = await personalization_agent.run(
+                        task_id=str(uuid.uuid4()),
+                        company=company,
+                        user_id=request.user_id or "anonymous",
+                        user_profile=profile or {},
+                        preferences=preferences,
+                        resume=active_resume_payload,
+                        job={"title": request.job_title},
+                    )
 
-                # 3. Email Writer (per company)
-                email_writer = EmailWriterAgent(logger=logger)
-                await email_writer.run(
-                    task_id=str(uuid.uuid4()),
-                    company=company,
-                    skills=effective_skills,
-                    job_title=request.job_title,
-                    personalization=insights,
-                    user_id=request.user_id or "anonymous",
-                    user_profile=profile or {},
-                    preferences=preferences,
-                    resume=active_resume_payload,
-                    resume_text=resume_text,
-                    resume_skills=resume_skills,
-                    resume_version_id=resume_version_id,
-                )
+                    email_writer = EmailWriterAgent(logger=logger)
+                    await email_writer.run(
+                        task_id=str(uuid.uuid4()),
+                        company=company,
+                        skills=effective_skills,
+                        job_title=request.job_title,
+                        personalization=insights,
+                        user_id=request.user_id or "anonymous",
+                        user_profile=profile or {},
+                        preferences=preferences,
+                        resume=active_resume_payload,
+                        resume_text=resume_text,
+                        resume_skills=resume_skills,
+                        resume_version_id=resume_version_id,
+                    )
 
         except Exception as e:
             await logger.emit(
@@ -2441,6 +2444,7 @@ async def get_discovered_companies(
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     include_archived: bool = Query(False),
     include_removed: bool = Query(False),
+    include_hidden_by_preferences: bool = Query(False),
     stage: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
 ):
@@ -2470,7 +2474,7 @@ async def get_discovered_companies(
                 stage=stage,
                 source=source,
             ),
-            timeout=4.0,
+            timeout=12.0,
             fallback=[],
         )
 
@@ -2488,13 +2492,18 @@ async def get_discovered_companies(
                 companies.append(company)
 
         visible_companies, hidden_by_preferences, archived_companies = partition_workspace_companies(companies, preferences)
+        selected_companies = (
+            [*visible_companies, *hidden_by_preferences]
+            if include_hidden_by_preferences
+            else visible_companies
+        )
         if visible_companies or hidden_by_preferences or archived_companies:
             return {
-                "companies": visible_companies,
+                "companies": selected_companies,
                 "visible_companies": visible_companies,
                 "hidden_by_preferences": hidden_by_preferences,
                 "archived_companies": archived_companies,
-                "total": len(visible_companies),
+                "total": len(selected_companies),
                 "offset": offset,
                 "limit": limit,
             }
@@ -2522,12 +2531,17 @@ async def get_discovered_companies(
                 legacy.append(_hydrate_company_work_mode(c))
             if legacy:
                 visible_companies, hidden_by_preferences, archived_companies = partition_workspace_companies(legacy, preferences)
+                selected_companies = (
+                    [*visible_companies, *hidden_by_preferences]
+                    if include_hidden_by_preferences
+                    else visible_companies
+                )
                 return {
-                    "companies": visible_companies[:limit],
+                    "companies": selected_companies[:limit],
                     "visible_companies": visible_companies[:limit],
                     "hidden_by_preferences": hidden_by_preferences,
                     "archived_companies": archived_companies,
-                    "total": len(visible_companies),
+                    "total": len(selected_companies),
                     "offset": 0,
                     "limit": limit,
                 }
@@ -2538,12 +2552,17 @@ async def get_discovered_companies(
             hydrated_cached = [_hydrate_company_work_mode(c) for c in cached]
             filtered = [c for c in hydrated_cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
             visible_companies, hidden_by_preferences, archived_companies = partition_workspace_companies(filtered, preferences)
+            selected_companies = (
+                [*visible_companies, *hidden_by_preferences]
+                if include_hidden_by_preferences
+                else visible_companies
+            )
             return {
-                "companies": visible_companies[:limit],
+                "companies": selected_companies[:limit],
                 "visible_companies": visible_companies[:limit],
                 "hidden_by_preferences": hidden_by_preferences,
                 "archived_companies": archived_companies,
-                "total": len(visible_companies),
+                "total": len(selected_companies),
                 "offset": 0,
                 "limit": limit,
             }
@@ -2558,12 +2577,17 @@ async def get_discovered_companies(
             hydrated_cached = [_hydrate_company_work_mode(c) for c in cached]
             filtered = [c for c in hydrated_cached if c.get("ranking", {}).get("match_score", c.get("match_score", 1.0)) >= min_score]
             visible_companies, hidden_by_preferences, archived_companies = partition_workspace_companies(filtered, preferences)
+            selected_companies = (
+                [*visible_companies, *hidden_by_preferences]
+                if include_hidden_by_preferences
+                else visible_companies
+            )
             return {
-                "companies": visible_companies[:limit],
+                "companies": selected_companies[:limit],
                 "visible_companies": visible_companies[:limit],
                 "hidden_by_preferences": hidden_by_preferences,
                 "archived_companies": archived_companies,
-                "total": len(visible_companies),
+                "total": len(selected_companies),
             }
         return {"companies": [], "total": 0, "error": str(e)}
 

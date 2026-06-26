@@ -141,13 +141,13 @@ class PersonalizationService:
         user_skills = [str(x) for x in (profile.get("skills") or profile.get("tech_stack") or resume.get("skills") or [])]
         pref_tech = [str(x) for x in prefs.get("preferred_tech_stack") or []]
         job_requirements = [str(x) for x in job.get("requirements") or []]
-        job_text = " ".join([job.get("title", ""), job.get("description", ""), " ".join(job_requirements)]).lower()
+        job_text = " ".join([job.get("title") or "", job.get("description") or "", " ".join(job_requirements)]).lower()
         company_text = " ".join(
             [
-                company.get("name", ""),
-                company.get("industry", ""),
-                company.get("description", ""),
-                company.get("mission", ""),
+                company.get("name") or "",
+                company.get("industry") or "",
+                company.get("description") or "",
+                company.get("mission") or "",
                 " ".join(company_tech),
             ]
         ).lower()

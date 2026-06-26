@@ -279,8 +279,9 @@ export default function AgentsPage() {
       if (!userId) return;
       try {
         const result = await fetchDiscoveredCompanies(userId, {
-          limit: 100,
+          limit: 1000,
           includeArchived: true,
+          includeHiddenByPreferences: true,
         });
         setTimelineItems(
           result.companies.map((company) => ({

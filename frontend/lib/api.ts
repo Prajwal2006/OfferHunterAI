@@ -642,6 +642,7 @@ export async function fetchDiscoveredCompanies(
     minScore?: number;
     includeArchived?: boolean;
     includeRemoved?: boolean;
+    includeHiddenByPreferences?: boolean;
     stage?: string;
     source?: string;
   }
@@ -652,9 +653,10 @@ export async function fetchDiscoveredCompanies(
   if (opts?.minScore != null) params.set("min_score", String(opts.minScore));
   if (opts?.includeArchived) params.set("include_archived", "true");
   if (opts?.includeRemoved) params.set("include_removed", "true");
+  if (opts?.includeHiddenByPreferences) params.set("include_hidden_by_preferences", "true");
   if (opts?.stage) params.set("stage", opts.stage);
   if (opts?.source) params.set("source", opts.source);
-  const res = await fetchWithTimeout(`${API_URL}/company-finder/companies?${params}`, undefined, 10_000);
+  const res = await fetchWithTimeout(`${API_URL}/company-finder/companies?${params}`, undefined, 25_000);
   if (!res.ok) throw new Error("Failed to fetch companies");
   return res.json() as Promise<CompanyWorkspaceResponse>;
 }

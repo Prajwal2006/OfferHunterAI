@@ -822,6 +822,48 @@ class CompanyFinderAgent:
         try:
             await self._emit("running", task_id, "Enrichment worker running...", {"stage": "enrichment"})
             hydrated = await run_enrichment_worker(companies=hydrated, profile=profile)
+            for company in hydrated:
+                company_id = company.get("id")
+                if not company_id:
+                    continue
+                try:
+                    await supabase_client.upsert_company({
+                        "id": company_id,
+                        "name": company.get("name"),
+                        "domain": company.get("domain"),
+                        "source": company.get("source", "unknown"),
+                        "website_url": company.get("website_url"),
+                        "description": company.get("description", ""),
+                        "mission": company.get("mission", ""),
+                        "industry": company.get("industry", ""),
+                        "size": company.get("size"),
+                        "funding_stage": company.get("funding_stage"),
+                        "headquarters": company.get("headquarters"),
+                        "hiring_status": company.get("hiring_status", "unknown"),
+                        "remote_friendly": company.get("remote_friendly"),
+                        "open_positions": company.get("open_positions", []),
+                        "culture_tags": company.get("culture_tags", []),
+                        "tech_stack": company.get("tech_stack", []),
+                        "logo_url": company.get("logo_url"),
+                        "metadata": {
+                            "discovery_signals": company.get("discovery_signals", {}),
+                            "work_mode": company.get("work_mode", "unknown"),
+                            "remote_confidence": company.get("remote_confidence", 0.0),
+                            "work_mode_reasoning": company.get("work_mode_reasoning", []),
+                            "growth_signals": company.get("growth_signals", []),
+                            "hiring_signal_count": company.get("hiring_signal_count"),
+                            "engineering_role_count": company.get("engineering_role_count"),
+                            "github_org": company.get("github_org"),
+                            "github_repos": company.get("github_repos"),
+                            "github_stars": company.get("github_stars"),
+                            "github_followers": company.get("github_followers"),
+                            "ai_adoption": company.get("ai_adoption"),
+                            "enriched": company.get("enriched", True),
+                            "enrichment_version": company.get("enrichment_version", 1),
+                        },
+                    })
+                except Exception:
+                    continue
             await self._emit(
                 "running",
                 task_id,
@@ -844,28 +886,31 @@ class CompanyFinderAgent:
                 ranking = company.get("ranking") or {}
                 if not company_id:
                     continue
-                await supabase_client.upsert_user_company({
-                    "user_id": user_id,
-                    "company_id": company_id,
-                    "discovery_session_id": discovery_session_id,
-                    "source": company.get("source", "unknown"),
-                    "status": "active",
-                    "orchestration_stage": "Personalization",
-                    "ranking_score": ranking.get("match_score", company.get("relevance_score", 0)),
-                    "ranking_explanation": ranking.get("match_explanation", ""),
-                    "ranking_metadata": ranking,
-                    "metadata": {
-                        "domain": company.get("domain"),
-                        "extended_ranking": company.get("extended_ranking", {}),
-                        "discovery_signals": company.get("discovery_signals", {}),
-                    },
-                })
-                if ranking:
-                    await supabase_client.upsert_company_ranking({
+                try:
+                    await supabase_client.upsert_user_company({
                         "user_id": user_id,
                         "company_id": company_id,
-                        **ranking,
+                        "discovery_session_id": discovery_session_id,
+                        "source": company.get("source", "unknown"),
+                        "status": "active",
+                        "orchestration_stage": "Personalization",
+                        "ranking_score": ranking.get("match_score", company.get("relevance_score", 0)),
+                        "ranking_explanation": ranking.get("match_explanation", ""),
+                        "ranking_metadata": ranking,
+                        "metadata": {
+                            "domain": company.get("domain"),
+                            "extended_ranking": company.get("extended_ranking", {}),
+                            "discovery_signals": company.get("discovery_signals", {}),
+                        },
                     })
+                    if ranking:
+                        await supabase_client.upsert_company_ranking({
+                            "user_id": user_id,
+                            "company_id": company_id,
+                            **ranking,
+                        })
+                except Exception:
+                    continue
             await self._emit(
                 "running",
                 task_id,
@@ -883,15 +928,18 @@ class CompanyFinderAgent:
                 company_id = company.get("id")
                 contacts = company.get("contacts") or []
                 if company_id and contacts:
-                    await supabase_client.insert_company_contacts(company_id=company_id, contacts=contacts)
-                    await supabase_client.upsert_user_company({
-                        "user_id": user_id,
-                        "company_id": company_id,
-                        "source": company.get("source", "unknown"),
-                        "status": "active",
-                        "orchestration_stage": "Personalization",
-                        "application_strategy": self._derive_application_strategy(company, contacts),
-                    })
+                    try:
+                        await supabase_client.insert_company_contacts(company_id=company_id, contacts=contacts)
+                        await supabase_client.upsert_user_company({
+                            "user_id": user_id,
+                            "company_id": company_id,
+                            "source": company.get("source", "unknown"),
+                            "status": "active",
+                            "orchestration_stage": "Personalization",
+                            "application_strategy": self._derive_application_strategy(company, contacts),
+                        })
+                    except Exception:
+                        continue
             await self._emit(
                 "running",
                 task_id,
