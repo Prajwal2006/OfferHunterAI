@@ -1,22 +1,19 @@
 """
 PersonalizationAgent — Extracts company-specific insights for personalized outreach.
+
+Builds personalization signals from the real data already gathered during
+discovery (industry, tech stack, open roles, description) and, when an OpenAI key
+is available, distills a short, grounded summary. It never fabricates news or
+facts about a company.
 """
-import asyncio
 from typing import Any
 
 from .event_logger import AgentEventLogger
+from services.llm_client import chat_json, llm_available
 
 
 class PersonalizationAgent:
-    """
-    Analyzes company websites, blog posts, and job descriptions to extract
-    personalization signals for outreach emails.
-
-    In production, integrates with:
-    - Web scraping (BeautifulSoup / Playwright)
-    - LangChain LLM summarization
-    - LinkedIn company data
-    """
+    """Derive outreach personalization signals from real, discovered company data."""
 
     AGENT_NAME = "PersonalizationAgent"
 
@@ -36,65 +33,91 @@ class PersonalizationAgent:
             agent_name=self.AGENT_NAME,
             task_id=task_id,
             status="started",
-            message=f"Starting personalization analysis for {company_name}",
+            message=f"Building personalization signals for {company_name}",
             metadata={"company": company_name, "domain": domain},
         )
 
-        steps = [
-            f"Scraping {domain} careers page",
-            f"Analyzing {company_name} engineering blog",
-            f"Extracting tech stack from job descriptions",
-            f"Identifying recent company news and milestones",
-            f"Summarizing key personalization signals",
-        ]
+        insights = self._base_insights(company)
 
-        insights = {}
-        for i, step in enumerate(steps):
-            await self.logger.emit(
-                agent_name=self.AGENT_NAME,
-                task_id=task_id,
-                status="running",
-                message=step,
-                metadata={
-                    "company": company_name,
-                    "step": i + 1,
-                    "total_steps": len(steps),
-                },
-            )
-            await asyncio.sleep(0.4)
-
-        insights = self._simulate_insights(company)
+        llm_summary = await self._llm_summary(company)
+        if llm_summary:
+            insights.update(llm_summary)
 
         await self.logger.emit(
             agent_name=self.AGENT_NAME,
             task_id=task_id,
             status="completed",
-            message=f"Completed personalization for {company_name} — {len(insights)} signals extracted",
+            message=f"Personalization ready for {company_name} — {len(insights)} signals",
             metadata={"company": company_name, "insights": insights},
         )
 
         return insights
 
-    def _simulate_insights(self, company: dict) -> dict:
-        """Simulate extracted personalization insights."""
-        templates = {
-            "Stripe": {
-                "tech_stack": ["Go", "Ruby", "Python", "Kafka"],
-                "recent_news": "Launched Stripe Tax globally in Q3",
-                "culture_signals": ["Infrastructure at scale", "Payment reliability"],
-                "blog_topics": ["Real-time fraud detection", "ML for payments"],
-            },
-            "OpenAI": {
-                "tech_stack": ["Python", "PyTorch", "Kubernetes", "CUDA"],
-                "recent_news": "Released GPT-4o and new Assistants API",
-                "culture_signals": ["Safety-first AI", "Research-driven"],
-                "blog_topics": ["Alignment research", "RLHF", "Model evaluation"],
-            },
+    def _base_insights(self, company: dict[str, Any]) -> dict[str, Any]:
+        """Ground insights in fields already populated by the discovery sources."""
+        open_positions = company.get("open_positions") or []
+        roles = [
+            str(p.get("title", "")).strip()
+            for p in open_positions
+            if isinstance(p, dict) and p.get("title")
+        ]
+        insights: dict[str, Any] = {}
+        if company.get("tech_stack"):
+            insights["tech_stack"] = company.get("tech_stack", [])[:10]
+        if company.get("industry"):
+            insights["industry"] = company.get("industry")
+        if company.get("description"):
+            insights["about"] = company.get("description")
+        if roles:
+            insights["open_roles"] = roles[:8]
+        if company.get("culture_tags"):
+            insights["culture_signals"] = company.get("culture_tags", [])[:6]
+        if company.get("hiring_status"):
+            insights["hiring_status"] = company.get("hiring_status")
+        return insights
+
+    async def _llm_summary(self, company: dict[str, Any]) -> dict[str, Any] | None:
+        if not llm_available():
+            return None
+        name = company.get("name", "the company")
+        context = {
+            "name": name,
+            "industry": company.get("industry", ""),
+            "description": company.get("description", ""),
+            "tech_stack": company.get("tech_stack", [])[:12],
+            "open_roles": [
+                p.get("title")
+                for p in (company.get("open_positions") or [])[:6]
+                if isinstance(p, dict)
+            ],
         }
-        name = company.get("name", "")
-        return templates.get(name, {
-            "tech_stack": ["Python", "TypeScript"],
-            "recent_news": f"{name} expanding engineering team",
-            "culture_signals": ["Fast-paced", "Remote-friendly"],
-            "blog_topics": ["Engineering excellence"],
-        })
+        result = await chat_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You summarize a company for personalized job outreach. Use ONLY the "
+                        "provided facts — do not invent news, funding, or products."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Given this company data, return ONLY a JSON object with "
+                        '"talking_points" (2-3 short, specific hooks an applicant could '
+                        'reference) and "why_relevant" (one sentence). Data:\n'
+                        f"{context}"
+                    ),
+                },
+            ],
+            temperature=0.5,
+            max_tokens=400,
+        )
+        if not result:
+            return None
+        cleaned: dict[str, Any] = {}
+        if result.get("talking_points"):
+            cleaned["talking_points"] = result["talking_points"]
+        if result.get("why_relevant"):
+            cleaned["why_relevant"] = result["why_relevant"]
+        return cleaned or None

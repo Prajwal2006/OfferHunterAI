@@ -25,6 +25,12 @@ from .workatastartup import WorkAtAStartupSource
 from .wellfound import WellfoundSource
 from .yc_companies import YCCompaniesSource
 from .ai_discovery import AIDiscoverySource
+from .job_feeds import (
+    ArbeitnowSource,
+    JobicySource,
+    RemotiveSource,
+    TheMuseSource,
+)
 
 __all__ = [
     "CompanySource",
@@ -49,4 +55,8 @@ __all__ = [
     "WellfoundSource",
     "YCCompaniesSource",
     "AIDiscoverySource",
+    "ArbeitnowSource",
+    "JobicySource",
+    "RemotiveSource",
+    "TheMuseSource",
 ]

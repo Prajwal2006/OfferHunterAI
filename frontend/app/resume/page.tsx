@@ -31,9 +31,26 @@ export default function ResumePage() {
     }
   }, [userId]);
 
+  // Load on mount without a synchronous setState in the effect body: every state
+  // update below happens after an await. loadResumes() (which flips loading
+  // synchronously) is reserved for event-handler refreshes.
   useEffect(() => {
-    loadResumes();
-  }, [loadResumes]);
+    if (!userId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await fetchResumes(userId);
+        if (!cancelled) setResumes(result.resumes ?? []);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load resumes");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
 
   const onUpload = async (file: File | null) => {
     if (!file || !userId) return;

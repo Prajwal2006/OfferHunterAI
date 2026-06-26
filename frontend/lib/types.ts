@@ -296,6 +296,24 @@ export interface Email {
   resume_skills?: string[];
 }
 
+export interface ResumeSuggestions {
+  company?: string;
+  summary?: string;
+  suggested_bullets?: string[];
+  keywords_added?: string[];
+  gaps?: string[];
+  generated_by?: "llm" | "template" | string;
+  error?: string;
+}
+
+export interface CoverLetterResult {
+  company?: string;
+  role?: string;
+  cover_letter: string;
+  generated_by?: "llm" | "template" | string;
+  error?: string;
+}
+
 export interface ResumeVersion {
   id: string;
   user_id: string;

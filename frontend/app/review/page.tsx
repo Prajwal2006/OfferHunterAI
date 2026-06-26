@@ -106,13 +106,20 @@ export default function ReviewPage() {
     setExpandedId(id);
   }
 
-  function saveEdit(id: string, subject: string, body: string) {
+  async function saveEdit(id: string, subject: string, body: string) {
     setEmails((prev) =>
       prev.map((e) =>
         e.id === id ? { ...e, editedSubject: subject, editedBody: body } : e
       )
     );
     setEditingId(null);
+    try {
+      // Persist the edit so the approved/sent email uses the edited content,
+      // not the original draft. Without this, edits were lost on send/refresh.
+      await editEmail(id, { subject, body });
+    } catch {
+      // Keep optimistic UI state even if backend is in demo mode.
+    }
   }
 
   async function setResumeVersion(id: string, resumeVersionId: string) {

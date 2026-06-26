@@ -29,6 +29,7 @@ from agents.company_finder import CompanyFinderAgent
 from agents.personalization import PersonalizationAgent
 from agents.email_writer import EmailWriterAgent
 from agents.resume_tailor import ResumeTailorAgent
+from agents.cover_letter import CoverLetterAgent
 from agents.email_sender import EmailSenderAgent
 from agents.follow_up import FollowUpAgent
 from agents.response_classifier import ResponseClassifierAgent
@@ -258,6 +259,13 @@ class ContinueDiscoveryRequest(BaseModel):
 
 class WorkspaceRepairRequest(BaseModel):
     user_id: str
+
+
+class GenerateContentRequest(BaseModel):
+    user_id: str
+    job_title: Optional[str] = ""
+    tone: Optional[str] = "professional"
+    resume_version_id: Optional[str] = None
 
 
 async def _load_company_memory(user_id: str) -> dict[str, set[str]]:
@@ -1596,6 +1604,84 @@ async def handoff_to_agent(
         "target_agent": target_agent,
         "company": company.get("name"),
     }
+
+
+async def _resolve_resume_and_profile(
+    user_id: str, resume_version_id: Optional[str] = None
+) -> tuple[str, dict[str, Any]]:
+    """Resolve the resume text + parsed profile used to ground generation."""
+    resume_text = ""
+    if resume_version_id:
+        resume = await supabase_client.get_resume(resume_version_id)
+        resume_text = (resume or {}).get("extracted_text", "") or ""
+    profile = await supabase_client.get_parsed_profile(user_id) or {}
+    if not resume_text:
+        resume_text = profile.get("raw_text", "") or ""
+    if not resume_text:
+        active = await supabase_client.get_active_resume(user_id)
+        resume_text = (active or {}).get("extracted_text", "") or ""
+    return resume_text, profile
+
+
+@app.post("/company-finder/companies/{company_id}/cover-letter")
+async def generate_cover_letter(company_id: str, request: GenerateContentRequest):
+    """Generate a tailored cover letter for a company and return it synchronously."""
+    company = await supabase_client.get_company_detail(company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    resume_text, profile = await _resolve_resume_and_profile(
+        request.user_id, request.resume_version_id
+    )
+    if not resume_text:
+        raise HTTPException(
+            status_code=400,
+            detail="No resume found. Upload a resume before generating a cover letter.",
+        )
+
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
+    agent = CoverLetterAgent(logger=logger)
+    result = await agent.run(
+        task_id=str(uuid.uuid4()),
+        company=_hydrate_company_work_mode(company),
+        resume_text=resume_text,
+        user_profile=profile,
+        job_title=request.job_title or "",
+        tone=request.tone or "professional",
+    )
+    if result.get("error") == "no_resume":
+        raise HTTPException(status_code=400, detail="No resume found for this user.")
+    return {"result": result}
+
+
+@app.post("/company-finder/companies/{company_id}/resume-suggestions")
+async def generate_resume_suggestions(company_id: str, request: GenerateContentRequest):
+    """Analyze the resume against a company/role and return suggestions synchronously."""
+    company = await supabase_client.get_company_detail(company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    resume_text, profile = await _resolve_resume_and_profile(
+        request.user_id, request.resume_version_id
+    )
+    if not resume_text:
+        raise HTTPException(
+            status_code=400,
+            detail="No resume found. Upload a resume before tailoring it.",
+        )
+
+    logger = AgentEventLogger(event_queue=_broadcast_queue)
+    agent = ResumeTailorAgent(logger=logger)
+    result = await agent.run(
+        task_id=str(uuid.uuid4()),
+        company=_hydrate_company_work_mode(company),
+        resume_text=resume_text,
+        user_profile=profile,
+        job_title=request.job_title or "",
+    )
+    if result.get("error") == "no_resume":
+        raise HTTPException(status_code=400, detail="No resume found for this user.")
+    return {"result": result}
 
 
 @app.get("/company-finder/agent-runs/{user_id}")

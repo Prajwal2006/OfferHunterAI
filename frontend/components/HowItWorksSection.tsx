@@ -2,7 +2,7 @@
 
 import { motion, useInView } from "framer-motion";
 import { useRef, useState } from "react";
-import { Search, Sparkles, Mail, CheckCircle, ArrowRight, Play } from "lucide-react";
+import { Search, Sparkles, Mail, CheckCircle, ArrowRight } from "lucide-react";
 
 const steps = [
   {

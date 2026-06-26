@@ -52,33 +52,37 @@ export default function PipelinePage() {
   const [companies, setCompanies] = useState<Company[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // Load on mount/user-change without a synchronous setState in the effect body.
+  // This page only renders inside RequireAuth, so a userId is always present.
   useEffect(() => {
     const userId = session?.user?.id;
-    if (!userId) {
-      setLoading(false);
-      return;
-    }
-    const resolvedUserId = userId;
+    if (!userId) return;
+    let cancelled = false;
 
-    async function loadPipeline() {
-      setLoading(true);
+    (async () => {
       try {
-        const result = await fetchDiscoveredCompanies(resolvedUserId, {
+        const result = await fetchDiscoveredCompanies(userId, {
           limit: 200,
           includeArchived: true,
         });
-        setCompanies(
-          result.companies.map((company) => ({
-            ...company,
-            status: stageToStatus(company.workspace?.orchestration_stage),
-          }))
-        );
+        if (!cancelled) {
+          setCompanies(
+            result.companies.map((company) => ({
+              ...company,
+              status: stageToStatus(company.workspace?.orchestration_stage),
+            }))
+          );
+        }
+      } catch {
+        // leave the existing list; the empty state covers a failed load
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
-    }
+    })();
 
-    void loadPipeline();
+    return () => {
+      cancelled = true;
+    };
   }, [session?.user?.id]);
 
   const filtered = companies.filter((c) => {

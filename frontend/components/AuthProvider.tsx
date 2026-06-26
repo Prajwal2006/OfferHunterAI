@@ -14,16 +14,14 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Start "loading" only when there's a Supabase client to query; without one
+  // we're immediately settled, which avoids a synchronous setState on mount.
+  const [loading, setLoading] = useState(() => Boolean(supabase));
 
   useEffect(() => {
     let mounted = true;
 
-    if (!supabase) {
-      setSession(null);
-      setLoading(false);
-      return;
-    }
+    if (!supabase) return;
 
     supabase.auth.getSession().then(({ data }) => {
       if (!mounted) return;

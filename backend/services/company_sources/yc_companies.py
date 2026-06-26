@@ -8,6 +8,7 @@ with a static fallback list of known YC companies for common roles.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import httpx
@@ -15,11 +16,20 @@ import httpx
 from .base import CompanySource, ProgressCallback
 from .utils import DEFAULT_HEADERS, extract_domain_from_url, normalize_company, slugify_domain
 
-YC_ALGOLIA_URL = "https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries"
-YC_ALGOLIA_APP_ID = "45BWZJ1SGC"
-YC_ALGOLIA_API_KEY = (
-    "Zjk5ZmUyZjBhMmIyZDgxODRhOWMxNjZjMzg5MDZlNjFhMWM4YWViZjYxOTA1YWZiNzg2ZTU2ZGQ4Zj"
-    "kwNjVmZnJlc3RyaWN0SW5kaWNlcz1ZQ0NvbXBhbnlfcHJvZHVjdGlvbiZ2YWxpZFVudGlsPTE3NjQ0NDE0MTE="
+# YC's public site uses a time-limited Algolia "secured" API key. The bundled
+# default below expires (the validUntil timestamp is encoded in the key), after
+# which the live query returns no hits and discovery falls back to the static
+# list. Refresh without a code change by setting YC_ALGOLIA_API_KEY (and, if it
+# ever changes, YC_ALGOLIA_APP_ID) — grab the current key from the network tab
+# on ycombinator.com/companies.
+YC_ALGOLIA_APP_ID = os.getenv("YC_ALGOLIA_APP_ID", "45BWZJ1SGC")
+YC_ALGOLIA_URL = f"https://{YC_ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/*/queries"
+YC_ALGOLIA_API_KEY = os.getenv(
+    "YC_ALGOLIA_API_KEY",
+    (
+        "Zjk5ZmUyZjBhMmIyZDgxODRhOWMxNjZjMzg5MDZlNjFhMWM4YWViZjYxOTA1YWZiNzg2ZTU2ZGQ4Zj"
+        "kwNjVmZnJlc3RyaWN0SW5kaWNlcz1ZQ0NvbXBhbnlfcHJvZHVjdGlvbiZ2YWxpZFVudGlsPTE3NjQ0NDE0MTE="
+    ),
 )
 
 
@@ -130,6 +140,19 @@ class YCCompaniesSource(CompanySource):
             {"name": "Langfuse", "domain": "langfuse.com", "industry": "AI / Observability", "funding_stage": "Seed", "website_url": "https://langfuse.com", "headquarters": "Berlin, Germany", "hiring_status": "hiring"},
             {"name": "Pave Robotics", "domain": "paverobotics.com", "industry": "Robotics", "funding_stage": "YC S24", "website_url": "https://paverobotics.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
             {"name": "Salvy", "domain": "salvy.com.br", "industry": "Telecom", "funding_stage": "YC W22", "website_url": "https://salvy.com.br", "headquarters": "Sao Paulo, Brazil", "hiring_status": "hiring"},
+            {"name": "Trigo", "domain": "trigo.com", "industry": "Retail Tech", "funding_stage": "YC", "website_url": "https://trigo.com", "headquarters": "Tel Aviv, Israel", "hiring_status": "hiring"},
+            {"name": "Speak", "domain": "speak.com", "industry": "AI / EdTech", "funding_stage": "YC W17", "website_url": "https://speak.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Lago", "domain": "getlago.com", "industry": "Billing / Dev Tools", "funding_stage": "YC S21", "website_url": "https://getlago.com", "headquarters": "Remote", "hiring_status": "hiring"},
+            {"name": "Trace", "domain": "trace.space", "industry": "Hardware / PLM", "funding_stage": "YC W23", "website_url": "https://trace.space", "headquarters": "New York, NY", "hiring_status": "hiring"},
+            {"name": "Cedana", "domain": "cedana.ai", "industry": "AI Infrastructure", "funding_stage": "YC S24", "website_url": "https://cedana.ai", "headquarters": "Remote", "hiring_status": "hiring"},
+            {"name": "Lightski", "domain": "lightski.com", "industry": "AI / Analytics", "funding_stage": "YC W24", "website_url": "https://lightski.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Mirou", "domain": "mirou.io", "industry": "AI / Healthcare", "funding_stage": "YC", "website_url": "https://mirou.io", "headquarters": "Remote", "hiring_status": "hiring"},
+            {"name": "Onyx", "domain": "onyx.app", "industry": "AI / Enterprise Search", "funding_stage": "YC W24", "website_url": "https://onyx.app", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Trainy", "domain": "trainy.ai", "industry": "AI Infrastructure", "funding_stage": "YC W24", "website_url": "https://trainy.ai", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Definite", "domain": "definite.app", "industry": "Data / Analytics", "funding_stage": "YC W24", "website_url": "https://definite.app", "headquarters": "Remote", "hiring_status": "hiring"},
+            {"name": "Sweetspot", "domain": "sweetspot.so", "industry": "GovTech / AI", "funding_stage": "YC S24", "website_url": "https://sweetspot.so", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Greptile", "domain": "greptile.com", "industry": "AI / Developer Tools", "funding_stage": "YC W24", "website_url": "https://greptile.com", "headquarters": "San Francisco, CA", "hiring_status": "hiring"},
+            {"name": "Haystack", "domain": "haystackeditor.com", "industry": "Developer Tools", "funding_stage": "YC W23", "website_url": "https://haystackeditor.com", "headquarters": "Remote", "hiring_status": "hiring"},
         ]
         filtered = [
             c for c in known_yc

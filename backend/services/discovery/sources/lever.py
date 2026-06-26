@@ -9,14 +9,16 @@ import httpx
 
 from ...company_sources.utils import DEFAULT_HEADERS
 from .base import CompanySource, ProgressCallback
-from .job_board_utils import board_slugs_from_context, job_matches, normalize_job_board_company
+from .job_board_utils import board_slugs_from_context, gather_within_budget, job_matches, normalize_job_board_company
 
 
 class LeverSource(CompanySource):
     """Discover companies and roles through Lever's public postings API."""
 
     SOURCE_NAME = "Lever"
-    DEFAULT_TIMEOUT_SECONDS = 18.0
+    DEFAULT_TIMEOUT_SECONDS = 24.0
+    MAX_BOARDS = 160
+    DEFAULT_CONCURRENCY = 24
 
     async def search(
         self,
@@ -26,7 +28,7 @@ class LeverSource(CompanySource):
         progress_callback: ProgressCallback = None,
     ) -> list[dict[str, Any]]:
         await self._notify(progress_callback, "Searching Lever public postings...")
-        boards = board_slugs_from_context(profile, preferences)[:80]
+        boards = board_slugs_from_context(profile, preferences)[:self.MAX_BOARDS]
         semaphore = asyncio.Semaphore(self.DEFAULT_CONCURRENCY)
 
         async with httpx.AsyncClient(timeout=self.timeout_seconds, headers=DEFAULT_HEADERS, follow_redirects=True) as client:
@@ -66,7 +68,10 @@ class LeverSource(CompanySource):
                         source_url=f"https://jobs.lever.co/{board}",
                     )
 
-            results = await asyncio.gather(*(fetch_company(board) for board in boards), return_exceptions=True)
+            results = await gather_within_budget(
+                [lambda b=board: fetch_company(b) for board in boards],
+                budget_seconds=self.timeout_seconds - 3,
+            )
 
         companies = [r for r in results if isinstance(r, dict)]
         await self._notify(progress_callback, f"Lever found {len(companies)} companies with matching roles")
