@@ -27,6 +27,8 @@ import {
   sendCompanyFeedback,
   continueCompanyDiscovery,
   fetchDiscoverySourceLogs,
+  generateCoverLetter,
+  generateResumeSuggestions,
   buildApiUrl,
 } from "@/lib/api";
 import {
@@ -671,6 +673,22 @@ function CompanyFinderContent() {
     [userId]
   );
 
+  const onGenerateCoverLetter = useCallback(
+    async (companyId: string) => {
+      const { result } = await generateCoverLetter(companyId, { user_id: userId });
+      return result;
+    },
+    [userId]
+  );
+
+  const onGenerateResumeSuggestions = useCallback(
+    async (companyId: string) => {
+      const { result } = await generateResumeSuggestions(companyId, { user_id: userId });
+      return result;
+    },
+    [userId]
+  );
+
   const onAddManualCompany = useCallback(async () => {
     const websiteUrl = manualWebsiteUrl.trim();
     if (!websiteUrl) return;
@@ -1275,6 +1293,8 @@ function CompanyFinderContent() {
             company={selectedCompany}
             onClose={() => setSelectedCompany(null)}
             onHandoff={onHandoff}
+            onGenerateCoverLetter={onGenerateCoverLetter}
+            onGenerateResumeSuggestions={onGenerateResumeSuggestions}
           />
         )}
       </AnimatePresence>

@@ -381,6 +381,54 @@ export async function handoffToAgent(
   return res.json();
 }
 
+export async function generateCoverLetter(
+  companyId: string,
+  payload: { user_id: string; job_title?: string; tone?: string; resume_version_id?: string }
+) {
+  const res = await fetch(
+    `${API_URL}/company-finder/companies/${companyId}/cover-letter`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!res.ok) {
+    let detail = "Failed to generate cover letter";
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch {
+      /* keep fallback */
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{ result: import("./types").CoverLetterResult }>;
+}
+
+export async function generateResumeSuggestions(
+  companyId: string,
+  payload: { user_id: string; job_title?: string; resume_version_id?: string }
+) {
+  const res = await fetch(
+    `${API_URL}/company-finder/companies/${companyId}/resume-suggestions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!res.ok) {
+    let detail = "Failed to generate resume suggestions";
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch {
+      /* keep fallback */
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{ result: import("./types").ResumeSuggestions }>;
+}
+
 export async function fetchParsedProfile(userId: string) {
   const res = await fetch(
     `${API_URL}/company-finder/profile/${encodeURIComponent(userId)}`

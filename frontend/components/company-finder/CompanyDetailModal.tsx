@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   X,
@@ -17,9 +17,14 @@ import {
   Lightbulb,
   Send,
   FileText,
+  FilePlus2,
   BarChart3,
   Target,
   Building2,
+  Loader2,
+  Copy,
+  Check,
+  Download,
 } from "lucide-react";
 
 const LinkedinIcon = ({ className }: { className?: string }) => (
@@ -27,7 +32,13 @@ const LinkedinIcon = ({ className }: { className?: string }) => (
     <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
   </svg>
 );
-import { Company, CompanyContact, JobPosition } from "@/lib/types";
+import {
+  Company,
+  CompanyContact,
+  CoverLetterResult,
+  JobPosition,
+  ResumeSuggestions,
+} from "@/lib/types";
 
 interface CompanyDetailModalProps {
   company: Company;
@@ -36,6 +47,10 @@ interface CompanyDetailModalProps {
     companyId: string,
     agent: "email-writer" | "resume-tailor" | "personalizer"
   ) => void;
+  onGenerateCoverLetter?: (companyId: string) => Promise<CoverLetterResult | null>;
+  onGenerateResumeSuggestions?: (
+    companyId: string
+  ) => Promise<ResumeSuggestions | null>;
 }
 
 function ScoreBar({
@@ -166,12 +181,87 @@ function JobRow({ job }: { job: JobPosition }) {
   );
 }
 
+function CopyDownloadBar({ text, fileName }: { text: string; fileName: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(text);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          } catch {
+            /* clipboard may be blocked; ignore */
+          }
+        }}
+        className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+      >
+        {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
+        {copied ? "Copied" : "Copy"}
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = fileName;
+          a.click();
+          URL.revokeObjectURL(url);
+        }}
+        className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+      >
+        <Download className="w-3.5 h-3.5" />
+        Download
+      </button>
+    </div>
+  );
+}
+
 export default function CompanyDetailModal({
   company,
   onClose,
   onHandoff,
+  onGenerateCoverLetter,
+  onGenerateResumeSuggestions,
 }: CompanyDetailModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
+  const [generating, setGenerating] = useState<null | "cover-letter" | "resume">(null);
+  const [genError, setGenError] = useState<string | null>(null);
+  const [coverLetter, setCoverLetter] = useState<CoverLetterResult | null>(null);
+  const [suggestions, setSuggestions] = useState<ResumeSuggestions | null>(null);
+
+  async function handleCoverLetter() {
+    if (!onGenerateCoverLetter || generating) return;
+    setGenerating("cover-letter");
+    setGenError(null);
+    try {
+      const result = await onGenerateCoverLetter(company.id);
+      if (result) setCoverLetter(result);
+    } catch (err) {
+      setGenError(err instanceof Error ? err.message : "Failed to generate cover letter");
+    } finally {
+      setGenerating(null);
+    }
+  }
+
+  async function handleResumeSuggestions() {
+    if (!onGenerateResumeSuggestions || generating) return;
+    setGenerating("resume");
+    setGenError(null);
+    try {
+      const result = await onGenerateResumeSuggestions(company.id);
+      if (result) setSuggestions(result);
+    } catch (err) {
+      setGenError(err instanceof Error ? err.message : "Failed to generate suggestions");
+    } finally {
+      setGenerating(null);
+    }
+  }
+
   const ranking = company.ranking;
   const matchPct = Math.round(
     (ranking?.match_score ?? company.match_score ?? company.relevance_score ?? 0) * 100
@@ -593,10 +683,27 @@ export default function CompanyDetailModal({
                   Generate Cold Email
                 </button>
                 <button
-                  onClick={() => onHandoff(company.id, "resume-tailor")}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-secondary text-secondary-foreground text-sm font-medium hover:bg-secondary/90 transition-colors"
+                  onClick={handleCoverLetter}
+                  disabled={generating !== null}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary/15 border border-primary/30 text-primary text-sm font-medium hover:bg-primary/25 transition-colors disabled:opacity-60"
                 >
-                  <FileText className="w-4 h-4" />
+                  {generating === "cover-letter" ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <FilePlus2 className="w-4 h-4" />
+                  )}
+                  Cover Letter
+                </button>
+                <button
+                  onClick={handleResumeSuggestions}
+                  disabled={generating !== null}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-secondary text-secondary-foreground text-sm font-medium hover:bg-secondary/90 transition-colors disabled:opacity-60"
+                >
+                  {generating === "resume" ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <FileText className="w-4 h-4" />
+                  )}
                   Tailor Resume
                 </button>
                 <button
@@ -607,6 +714,106 @@ export default function CompanyDetailModal({
                   Personalize
                 </button>
               </div>
+
+              {genError && (
+                <p className="mt-3 text-xs text-red-500 flex items-center gap-1.5">
+                  <AlertCircle className="w-3.5 h-3.5" />
+                  {genError}
+                </p>
+              )}
+
+              {/* Cover letter result */}
+              {coverLetter?.cover_letter && (
+                <section className="mt-5">
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
+                      <FilePlus2 className="w-4 h-4 text-primary" />
+                      Cover Letter
+                      {coverLetter.generated_by === "template" && (
+                        <span className="text-[10px] font-normal text-muted-foreground">
+                          (starter — set OPENAI_API_KEY for a fully tailored letter)
+                        </span>
+                      )}
+                    </h3>
+                    <CopyDownloadBar
+                      text={coverLetter.cover_letter}
+                      fileName={`cover-letter-${company.name.replace(/\s+/g, "-").toLowerCase()}.txt`}
+                    />
+                  </div>
+                  <div className="bg-muted/30 rounded-xl p-4 text-sm text-foreground/90 whitespace-pre-wrap leading-relaxed border border-border max-h-72 overflow-y-auto">
+                    {coverLetter.cover_letter}
+                  </div>
+                </section>
+              )}
+
+              {/* Resume suggestions result */}
+              {suggestions && !suggestions.error && (
+                <section className="mt-5">
+                  <h3 className="text-sm font-semibold text-foreground flex items-center gap-2 mb-2">
+                    <FileText className="w-4 h-4 text-secondary" />
+                    Resume Suggestions
+                    {suggestions.generated_by === "template" && (
+                      <span className="text-[10px] font-normal text-muted-foreground">
+                        (heuristic — set OPENAI_API_KEY for tailored rewrites)
+                      </span>
+                    )}
+                  </h3>
+                  <div className="bg-muted/30 rounded-xl p-4 border border-border space-y-3">
+                    {suggestions.summary && (
+                      <p className="text-sm text-muted-foreground leading-relaxed">
+                        {suggestions.summary}
+                      </p>
+                    )}
+                    {!!suggestions.suggested_bullets?.length && (
+                      <div>
+                        <h4 className="text-xs font-semibold text-foreground uppercase tracking-wider mb-1.5">
+                          Suggested Bullets
+                        </h4>
+                        <ul className="space-y-1.5">
+                          {suggestions.suggested_bullets.map((b, i) => (
+                            <li key={i} className="flex items-start gap-1.5 text-sm text-muted-foreground">
+                              <Lightbulb className="w-3.5 h-3.5 text-blue-500 mt-0.5 shrink-0" />
+                              {b}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {!!suggestions.keywords_added?.length && (
+                      <div>
+                        <h4 className="text-xs font-semibold text-foreground uppercase tracking-wider mb-1.5">
+                          Keywords To Add
+                        </h4>
+                        <div className="flex flex-wrap gap-1.5">
+                          {suggestions.keywords_added.map((k) => (
+                            <span
+                              key={k}
+                              className="px-2 py-0.5 rounded-md text-xs bg-primary/10 text-primary border border-primary/20"
+                            >
+                              {k}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {!!suggestions.gaps?.length && (
+                      <div>
+                        <h4 className="text-xs font-semibold text-yellow-600 dark:text-yellow-400 uppercase tracking-wider mb-1.5">
+                          Gaps To Address
+                        </h4>
+                        <ul className="space-y-1">
+                          {suggestions.gaps.map((g, i) => (
+                            <li key={i} className="flex items-start gap-1.5 text-xs text-muted-foreground">
+                              <AlertCircle className="w-3.5 h-3.5 text-yellow-500 mt-0.5 shrink-0" />
+                              {g}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
             </div>
           </div>
         </motion.div>
