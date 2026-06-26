@@ -347,10 +347,18 @@ function CompanyFinderContent() {
   const esRef = useRef<EventSource | null>(null);
   const activeTaskIdRef = useRef<string | null>(null);
   const currentStageRef = useRef<string>("company_discovery");
-  const stageStartedAtRef = useRef<number>(Date.now());
+  // Initialized in a mount effect (Date.now() is impure, so it must not run
+  // during render); always re-stamped when a discovery run starts.
+  const stageStartedAtRef = useRef<number>(0);
   const repairRequestedForUserRef = useRef<string | null>(null);
-  // Track whether the running state was triggered by "Find More" (merge) vs fresh run (replace)
-  const isContinuingRef = useRef(false);
+  // Track whether the running state was triggered by "Find More" (merge) vs fresh
+  // run (replace). State (not a ref) so the skeleton-vs-merge render stays in sync.
+  const [isContinuing, setIsContinuing] = useState(false);
+
+  // Stamp the stage timer once on mount (kept out of render for purity).
+  useEffect(() => {
+    stageStartedAtRef.current = Date.now();
+  }, []);
 
   // ── Initial load ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -572,7 +580,7 @@ function CompanyFinderContent() {
           }
 
           if (data.status === "completed") {
-            isContinuingRef.current = false;
+            setIsContinuing(false);
             // Always reload from DB so persisted state is the source of truth
             fetchDiscoveredCompanies(userId, { limit: 1000 })
               .then((res) => {
@@ -592,7 +600,7 @@ function CompanyFinderContent() {
                 setStep("results");
               });
           } else if (data.status === "failed") {
-            isContinuingRef.current = false;
+            setIsContinuing(false);
             setError(data.message || "Agent failed");
             activeTaskIdRef.current = null;
             setStep("error");
@@ -607,7 +615,7 @@ function CompanyFinderContent() {
     // Fallback: if the SSE completion event is missed (e.g. connection gap), poll
     // for companies after 4 minutes and exit the running state regardless.
     const fallbackTimer = setTimeout(() => {
-      isContinuingRef.current = false;
+      setIsContinuing(false);
       fetchDiscoveredCompanies(userId, { limit: 1000 })
         .then((res) => {
           setCompanies((prev) => mergeCompanies(prev, res.companies));
@@ -788,7 +796,7 @@ function CompanyFinderContent() {
   );
 
   const onFindMoreCompanies = useCallback(async () => {
-    isContinuingRef.current = true;
+    setIsContinuing(true);
     setStep("running");
     currentStageRef.current = "company_discovery";
     stageStartedAtRef.current = Date.now();
@@ -802,7 +810,7 @@ function CompanyFinderContent() {
       });
       activeTaskIdRef.current = result.task_id;
     } catch (err) {
-      isContinuingRef.current = false;
+      setIsContinuing(false);
       activeTaskIdRef.current = null;
       setError(err instanceof Error ? err.message : "Failed to continue discovery");
       setStep("results"); // Stay on results so existing companies remain visible
@@ -930,7 +938,7 @@ function CompanyFinderContent() {
     );
   }
 
-  if (step === "running" && !isContinuingRef.current && companies.length === 0) {
+  if (step === "running" && !isContinuing && companies.length === 0) {
     // Fresh discovery with no existing results — show full skeleton screen
     return (
       <div className="max-w-3xl mx-auto py-8 px-4">
@@ -969,7 +977,7 @@ function CompanyFinderContent() {
         <AgentStatusBanner
           message={agentMessage}
           onCancel={() => {
-            isContinuingRef.current = false;
+            setIsContinuing(false);
             activeTaskIdRef.current = null;
             setStep("results");
           }}

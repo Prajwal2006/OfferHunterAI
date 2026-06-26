@@ -1,7 +1,6 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { useEffect, useState } from "react";
 import { AgentEvent } from "@/lib/types";
 
 const agentColors: Record<string, string> = {
