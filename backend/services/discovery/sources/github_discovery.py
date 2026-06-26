@@ -52,7 +52,11 @@ class GitHubDiscoverySource(CompanySource):
                 for repo in data.get("items", []) if isinstance(data, dict) else []:
                     owner = repo.get("owner") or {}
                     org = owner.get("login", "")
-                    if not org:
+                    # Only treat real GitHub Organizations as companies. Personal
+                    # accounts (owner type "User") are individual developers, not
+                    # employers, and previously polluted results with handles like
+                    # "moimikey" or "aasthas2022" that carry no open roles.
+                    if not org or owner.get("type") != "Organization":
                         continue
                     text = " ".join([repo.get("name", ""), repo.get("description", ""), term])
                     company = companies.setdefault(org.lower(), {
